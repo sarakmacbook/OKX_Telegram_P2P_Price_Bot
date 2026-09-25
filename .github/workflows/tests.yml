@@ -22,4 +22,4 @@ jobs:
       - name: Run tests
         run: python -m pytest tests -q
       - name: Byte-compile everything (catches syntax errors early)
-        run: python -m compileall -q bot.py exchanges.py adlinks.py storage.py tests
+        run: python -m compileall -q bot.py exchanges.py adlinks.py storage.py serverless.py api tests

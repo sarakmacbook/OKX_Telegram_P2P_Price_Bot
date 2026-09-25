@@ -12,7 +12,7 @@ bash install.sh
 
 
 ```bash
-wget https://raw.githubusercontent.com/sarakmacbook/OKX_Telegram_P2P_Price_Bot/refs/heads/main/uninstall.sh
+wget https://raw.githubusercontent.com/sarakmacbook/OKX_Telegram_P2P_Price_Bot/main/uninstall.sh
 
 bash uninstall.sh
 ```
@@ -67,6 +67,7 @@ Pick the installer that matches your machine — all four ask for your **bot tok
 | `install-docker.sh` | Any machine **with Docker**, incl. macOS | Docker Compose container (`restart: unless-stopped`) |
 | `install-local.sh` | **macOS / Linux without systemd / WSL** | venv + nohup + launchd (macOS) or cron `@reboot` autostart |
 | **python3 one-liner** | **Any machine with Python 3** (no curl / wget needed) | Downloads + runs `install-local.sh` in one command |
+| **Vercel** — [Option E](#option-e--vercel-serverless-nothing-to-keep-running) | **Serverless hosting, nothing to keep running** (free plan) | Webhook + Vercel Cron (`api/`, `vercel.json`), state in a KV/Redis store |
 
 > **curl or wget — your choice.** Every one-liner below is shown with both `curl` and `wget`; they are interchangeable. Inside the scripts the same applies: downloads automatically use **curl → wget → python3**, whichever exists on the box, and `git` is optional (a tarball is fetched instead when git is missing). Force a specific tool with `DOWNLOADER=wget`.
 
@@ -113,6 +114,27 @@ python3 -c "import urllib.request as u;print(u.urlopen('https://raw.githubuserco
 ```
 
 > This is the same local / no-systemd install as **Option C**, just launched by Python instead of `curl` or `wget`.
+
+### Option E — Vercel (serverless, nothing to keep running)
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot&env=BOT_TOKEN,ADMIN_IDS,KV_REST_API_URL,KV_REST_API_TOKEN&envDescription=BOT_TOKEN%20and%20ADMIN_IDS%20are%20required%3B%20KV_REST_API_URL%2FTOKEN%20come%20from%20the%20KV%20or%20Upstash%20integration&project-name=p2p-price-bot)
+
+Vercel has no long-running process, so there the bot runs in **webhook mode**:
+Telegram pushes every update to `/api/webhook` and a **Vercel Cron** calls
+`/api/tick` to post the prices — the same bot, the same panel, the same handlers.
+
+1. **Import** this repository into Vercel ([deploy button](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot) or `npx vercel`).
+2. **Add a KV/Redis store** (Vercel → Storage → *Upstash for Redis* → connect to the project) and the **environment variables** `BOT_TOKEN` + `ADMIN_IDS`.
+3. **Deploy**, then open `https://<your-app>.vercel.app/api/webhook` — that page registers the Telegram webhook and shows the status.
+4. In Telegram: `/start` → **👥 Set group** → paste a merchant URL → **🟢 Auto: ON**.
+
+> ⏰ **Free (Hobby) plan**: crons may only run **once a day** — a faster schedule
+> fails the deployment. On **Pro** set `"schedule": "* * * * *"` in
+> [`vercel.json`](vercel.json) for live prices, or keep the free plan and let an
+> external scheduler call `/api/tick` (see [VERCEL.md](VERCEL.md#5-the-cron--how-often-prices-are-checked)).
+
+Full walkthrough, environment variables, endpoints and troubleshooting:
+**[VERCEL.md](VERCEL.md)**.
 
 <details>
 <summary>No curl and no wget? (python3 / PowerShell / manual)</summary>
@@ -409,6 +431,19 @@ bash install-local.sh --update        # pull latest + restart
 bash install-local.sh --uninstall     # stop + remove autostart (keep data)
 ```
 
+**Vercel (Option E):**
+
+```bash
+npx vercel logs <deployment-url>            # live logs
+npx vercel --prod                           # redeploy (after changing env vars)
+curl -s https://<your-app>.vercel.app/api/webhook          # status page + (re)register the webhook
+curl -s -H "Authorization: Bearer $CRON_SECRET" \
+     https://<your-app>.vercel.app/api/tick                # run the cron job by hand
+```
+
+Prices are checked whenever the cron in `vercel.json` runs (once a day on the free
+plan, every minute on Pro) — details in [VERCEL.md](VERCEL.md).
+
 **Uninstall (asks: erase everything or keep your data):**
 
 ```bash
@@ -441,7 +476,12 @@ cp ~/p2p-bot-backup-*/config.json ~/p2p-bot-backup-*/data.json <install-dir>/
 | `exchanges.py` | Binance / Bybit / OKX / Bitget adapters + URL parser |
 | `adlinks.py` | Exact-ad deep-link templates (Binance / Bybit / OKX / Bitget) |
 | `storage.py` | State backends: `data.json` file, optional Upstash/Redis REST, read-only fallback |
-| `tests/` | pytest suite (links, buttons, storage) |
+| `serverless.py` | Serverless mode: ASGI glue, webhook + cron helpers, one PTB app per warm container |
+| `api/webhook.py` | Vercel function: Telegram updates (`POST`) + status page (`GET /api/webhook`) |
+| `api/tick.py` | Vercel function: the cron job that replaces the JobQueue (`/api/tick`) |
+| `vercel.json` | Vercel config: function limits + the `/api/tick` cron schedule |
+| `VERCEL.md` | Step-by-step Vercel deployment guide |
+| `tests/` | pytest suite (links, buttons, storage, serverless/webhook mode) |
 | `.github/workflows/` | CI (tests) |
 | `install.sh` | One-click installer — systemd VPS |
 | `install-docker.sh` | One-click installer — Docker Compose |

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/**/*.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{tests/**,.github/**,.venv/**,**/*.md,install*.sh,uninstall.sh,Dockerfile,docker-compose.yml,p2p-bot.service.example,*.service.example,__pycache__/**}"
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/tick",
+      "schedule": "0 0 * * *"
+    }
+  ]
+}

@@ -203,7 +203,7 @@ DEFAULT_SETTINGS = {
 }
 
 def empty_state():
-    return {"group": None, "auto": False, "merchants": {}, "last": {},
+    return {"group": None, "auto": False, "merchants": {}, "last": {}, "edits": {},
             "settings": DEFAULT_SETTINGS.copy(), "last_msg_id": None, "last_msg_time": None}
 
 
@@ -238,11 +238,39 @@ def load():
         data["last_msg_id"] = None
     if "last_msg_time" not in data:
         data["last_msg_time"] = None
+    if not isinstance(data.get("edits"), dict):
+        data["edits"] = {}
     return data
 
 def save():
     state["updated_at"] = int(time.time())
     STORE.save(state)
+
+
+def refresh_state():
+    """Re-read the shared state from the store (serverless: instances run in parallel)."""
+    fresh = load()
+    state.clear()
+    state.update(fresh)
+    return state
+
+# ── in-flight edits: "tap Edit, then send the text" is two updates ──
+# Serverless hosts (Vercel) may deliver those two updates to different processes,
+# so the flag lives in the shared state instead of PTB's in-memory user_data.
+def edits_of(u: Update) -> dict:
+    user = u.effective_user
+    return state.setdefault("edits", {}).setdefault(str(user.id if user else "0"), {})
+
+def edit_get(u: Update, key: str, default=None):
+    return edits_of(u).get(key, default)
+
+def edit_set(u: Update, key: str, value):
+    edits_of(u)[key] = value
+    save()
+
+def edit_pop(u: Update, key: str):
+    edits_of(u).pop(key, None)
+    save()
 
 
 state = load()
@@ -705,15 +733,15 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u) or u.effective_chat.type != "private": return
     txt = u.message.text.strip()
 
-    awaiting = c.user_data.get("awaiting_custom")
+    awaiting = edit_get(u, "awaiting_custom")
     if awaiting in ("header", "body", "footer"):
         if txt.lower() == "/cancel":
-            c.user_data.pop("awaiting_custom", None)
+            edit_pop(u, "awaiting_custom")
             await u.message.reply_text("❌ Cancelled.", reply_markup=panel())
             return
         state["settings"][f"custom_{awaiting}"] = txt
         save()
-        c.user_data.pop("awaiting_custom", None)
+        edit_pop(u, "awaiting_custom")
         await u.message.reply_html(f"✅ Custom {awaiting} saved:\n<code>{txt[:500]}</code>", reply_markup=panel())
         await u.message.reply_html(panel_text(), reply_markup=panel())
         return
@@ -721,19 +749,19 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if awaiting and awaiting.startswith("adlink:"):
         ex = awaiting.split(":", 1)[1]
         if txt.lower() == "/cancel":
-            c.user_data.pop("awaiting_custom", None)
+            edit_pop(u, "awaiting_custom")
             await u.message.reply_text("❌ Cancelled.", reply_markup=panel())
             return
         if ex not in EXCHANGE_NAMES:
-            c.user_data.pop("awaiting_custom", None)
+            edit_pop(u, "awaiting_custom")
             return await u.message.reply_text("❌ Unknown exchange.", reply_markup=panel())
         value = "" if txt.lower() in ("default", "reset", "-", "none") else txt
         if value and not value.startswith(("http://", "https://")):
             await u.message.reply_text("❌ The template must start with https:// — try again, or /cancel.")
             return
-        if value and "{AD_ID}" not in value and c.user_data.get("adlink_warned") != ex:
+        if value and "{AD_ID}" not in value and edit_get(u, "adlink_warned") != ex:
             # no ad id → the link will land on the market page, not one exact ad
-            c.user_data["adlink_warned"] = ex
+            edit_set(u, "adlink_warned", ex)
             await u.message.reply_html(
                 "⚠️ That template has no <code>{AD_ID}</code> placeholder, so buttons would "
                 "open the market page instead of one exact ad.\n\n"
@@ -746,8 +774,8 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             overrides.pop(ex, None)
         state["settings"]["ad_link_templates"] = overrides
         save()
-        c.user_data.pop("awaiting_custom", None)
-        c.user_data.pop("adlink_warned", None)
+        edit_pop(u, "awaiting_custom")
+        edit_pop(u, "adlink_warned")
         shown = value or AD_LINK_TEMPLATES.get(ex, "")
         sample = render_template(shown, {
             "AD_ID": "1234567890", "ASSET": ASSET, "ASSET_LOWER": ASSET.lower(),
@@ -764,7 +792,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     if awaiting in ("buy_label", "sell_label", "buy_url", "sell_url"):
         if txt.lower() == "/cancel":
-            c.user_data.pop("awaiting_custom", None)
+            edit_pop(u, "awaiting_custom")
             await u.message.reply_text("❌ Cancelled.", reply_markup=panel())
             return
         side, kind = awaiting.split("_")          # buy/sell , label/url
@@ -777,7 +805,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
         state["settings"][f"btn_{side}_{kind}"] = value
         save()
-        c.user_data.pop("awaiting_custom", None)
+        edit_pop(u, "awaiting_custom")
         icon = "🟢" if side == "buy" else "🔴"
         shown = value or ("(default)" if kind == "url" else
                           (DEFAULT_BUY_LABEL if side == "buy" else DEFAULT_SELL_LABEL) + "  (default)")
@@ -1160,7 +1188,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         ex = d.split(":", 1)[1]
         if ex not in EXCHANGE_NAMES:
             return await q.answer()
-        c.user_data["awaiting_custom"] = f"adlink:{ex}"
+        edit_set(u, "awaiting_custom", f"adlink:{ex}")
         tpl = ad_templates().get(ex, "")
         await q.answer()
         return await q.edit_message_text(
@@ -1188,7 +1216,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     elif d in ("edit_buy_label", "edit_sell_label"):
         side = "buy" if d == "edit_buy_label" else "sell"
-        c.user_data["awaiting_custom"] = f"{side}_label"
+        edit_set(u, "awaiting_custom", f"{side}_label")
         icon = "🟢" if side == "buy" else "🔴"
         default_tpl = DEFAULT_BUY_LABEL if side == "buy" else DEFAULT_SELL_LABEL
         cur = state["settings"].get(f"btn_{side}_label") or f"{default_tpl}   (default)"
@@ -1211,7 +1239,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     elif d in ("edit_buy_url", "edit_sell_url"):
         side = "buy" if d == "edit_buy_url" else "sell"
-        c.user_data["awaiting_custom"] = f"{side}_url"
+        edit_set(u, "awaiting_custom", f"{side}_url")
         icon = "🟢" if side == "buy" else "🔴"
         cur = state["settings"].get(f"btn_{side}_url") or "(merchant profile URL)"
         await q.answer()
@@ -1285,7 +1313,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
             pass
 
     elif d == "edit_header":
-        c.user_data["awaiting_custom"] = "header"
+        edit_set(u, "awaiting_custom", "header")
         await q.answer()
         return await q.edit_message_text(
             "📝 <b>Send new custom HEADER now</b>\n\n"
@@ -1301,7 +1329,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         )
 
     elif d == "edit_body":
-        c.user_data["awaiting_custom"] = "body"
+        edit_set(u, "awaiting_custom", "body")
         await q.answer()
         return await q.edit_message_text(
             "📝 <b>Send new custom BODY now</b>\n\n"
@@ -1327,7 +1355,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         )
 
     elif d == "edit_footer":
-        c.user_data["awaiting_custom"] = "footer"
+        edit_set(u, "awaiting_custom", "footer")
         await q.answer()
         return await q.edit_message_text(
             "📝 <b>Send new custom FOOTER now</b>\n\n"
@@ -1360,7 +1388,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await q.edit_message_text(custom_menu_text(), parse_mode="HTML", reply_markup=custom_menu_kb())
 
     elif d == "cancel_edit":
-        c.user_data.pop("awaiting_custom", None)
+        edit_pop(u, "awaiting_custom")
         await q.answer("Cancelled")
         return await q.edit_message_text(panel_text(), parse_mode="HTML", reply_markup=panel())
 
@@ -1395,8 +1423,8 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u): return
-    if c.user_data.get("awaiting_custom"):
-        c.user_data.pop("awaiting_custom")
+    if edit_get(u, "awaiting_custom"):
+        edit_pop(u, "awaiting_custom")
         await u.message.reply_text("❌ Editing cancelled.", reply_markup=panel())
     else:
         await u.message.reply_text("Nothing to cancel.", reply_markup=panel())
@@ -1435,9 +1463,18 @@ def register_handlers(app):
     app.add_error_handler(error_handler)
     return app
 
-def build_application() -> Application:
-    """Build the PTB application — long polling with the in-process JobQueue."""
+def build_application(polling: bool = True) -> Application:
+    """Build the PTB application.
+
+    ``polling=True``  long polling with the in-process JobQueue — the systemd,
+                      Docker and local installs.
+    ``polling=False`` serverless (Vercel): no updater and no JobQueue, because
+                      Telegram pushes the updates to /api/webhook and a Vercel
+                      Cron drives the periodic work (see serverless.py).
+    """
     builder = Application.builder().token(TOKEN).post_init(post_init)
+    if not polling:
+        builder = builder.updater(None).job_queue(None)
     return register_handlers(builder.build())
 
 def main():
