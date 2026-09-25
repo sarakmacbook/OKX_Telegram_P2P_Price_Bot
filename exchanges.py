@@ -86,6 +86,7 @@ def parse_url(url: str, asset: str, fiat: str):
 # "sell" = merchant SELLS (you buy) = best selling price ; "buy" = merchant BUYS (you sell)
 # *_ad_id is the id of the ad the price was taken from — it powers the
 # "open the exact ad" Buy/Sell buttons (see adlinks.py).
+# HTTP errors (e.g. 451 when the server IP is geo-blocked) land in "error".
 async def fetch(c: httpx.AsyncClient, m: Merchant) -> dict:
     try:
         fn = {"binance": _binance, "bybit": _bybit, "okx": _okx, "bitget": _bitget}[m.exchange]
@@ -123,6 +124,7 @@ async def _binance(c, m, side):
     for page in (1, 2, 3):
         r = await c.post("https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
                          json={"asset": m.asset, "fiat": m.fiat, "tradeType": tt, "page": page, "rows": 20, "payTypes": []})
+        r.raise_for_status()   # e.g. HTTP 451 when the server IP is in a geo-blocked region (US)
         data = r.json().get("data") or []
         for a in data:
             if a["advertiser"]["userNo"] == m.merchant_id:
@@ -147,6 +149,7 @@ async def _bybit(c, m, side):
     r = await c.post("https://api2.bybit.com/fiat/otc/item/online",
                      json={"userId": m.merchant_id, "tokenId": m.asset, "currencyId": m.fiat, "payment": [],
                            "side": "1" if side == "sell" else "0", "size": "50", "page": "1", "amount": ""})
+    r.raise_for_status()   # geo-blocked regions answer 403 here instead of prices
     raw = (r.json().get("result") or {}).get("items") or []
     items = []
     for it in raw:
@@ -169,6 +172,7 @@ async def _okx(c, m, side):
     r = await c.get("https://www.okx.com/v3/c2c/tradingOrders/books",
                     params={"quoteCurrency": m.fiat, "baseCurrency": m.asset, "side": side, "paymentMethod": "all",
                             "userType": "all", "showTrade": "false", "receivingAds": "false"})
+    r.raise_for_status()   # geo-blocked regions are refused here instead of served prices
     ads = [a for a in (r.json().get("data") or {}).get(side, []) if a.get("publicUserId") == m.merchant_id]
     items = []
     for a in ads:
@@ -191,6 +195,7 @@ async def _bitget(c, m, side):
     r = await c.post("https://www.bitget.com/v1/p2p/pub/adv/queryAdvList",
                      json={"side": 1 if side == "sell" else 2, "pageNo": 1, "pageSize": 50,
                            "coinCode": m.asset, "fiatCode": m.fiat, "languageType": 6})
+    r.raise_for_status()   # geo-blocked regions are refused here instead of served prices
     raw = (r.json().get("data") or {}).get("dataList", []) or []
     ads = [a for a in raw if str(a.get("userId")) == m.merchant_id or str(a.get("merchantId")) == m.merchant_id or m.merchant_id in str(a.get("userId",""))]
     # fallback if filter too strict: try all if none matched but merchant present in list structure that uses id differently

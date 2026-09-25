@@ -827,6 +827,8 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             extra += f"\nSell liq: {fmt_amount(r['sell_amount'])} {m.asset}"
         if r.get("buy_amount") is not None:
             extra += f"\nBuy liq: {fmt_amount(r['buy_amount'])} {m.asset}"
+    if r.get("error"):
+        extra += f"\n⚠️ {r['error']}"
     await msg.edit_text(f"✅ Added {ICON[m.exchange]} {m.exchange.title()} · {m.nickname or m.merchant_id}\n"
                         f"Sell: {fmt(r['sell'])} · Buy: {fmt(r['buy'])}{extra}")
     await u.message.reply_html(panel_text(), reply_markup=panel())
