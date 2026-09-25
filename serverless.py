@@ -409,6 +409,44 @@ async def _lifespan(receive, send) -> None:
             return
 
 
+CONFIG_HINT = ("Set BOT_TOKEN, ADMIN_IDS and a KV/Redis store "
+               "(KV_REST_API_URL + KV_REST_API_TOKEN) in the project's environment "
+               "variables, then redeploy.")
+
+SETUP_STEPS = [
+    "1. Vercel dashboard → your project → Settings → Environment Variables: set BOT_TOKEN "
+    "(from @BotFather) and ADMIN_IDS (your Telegram id, from @userinfobot).",
+    "2. Storage → add Upstash for Redis (or Vercel KV) → Connect to this project — this sets "
+    "KV_REST_API_URL + KV_REST_API_TOKEN so the bot remembers its group and merchants.",
+    "3. Redeploy (Deployments → ⋯ → Redeploy — changed variables only apply to new deploys), "
+    "then reopen this page: it registers the Telegram webhook by itself.",
+]
+
+
+def config_error_response(request: Request, message: str) -> Response:
+    """A broken deployment: JSON for scripts, a setup guide for browsers."""
+    if request.wants_html:
+        return Response.html(
+            page("⚙️ Setup needed · P2P Price Bot",
+                 [("What happened", message), ("Fix", CONFIG_HINT)],
+                 notes=SETUP_STEPS),
+            status=500)
+    return Response.json({"ok": False, "error": message, "hint": CONFIG_HINT}, 500)
+
+
+def internal_error_response(request: Request, message: str) -> Response:
+    """An unexpected crash: JSON for scripts, a readable page for browsers."""
+    if request.wants_html:
+        return Response.html(
+            page("❌ Something went wrong · P2P Price Bot",
+                 [("Error", message)],
+                 notes=["Check the Runtime Logs (Vercel dashboard → your project → Logs) for the "
+                        "traceback, then open /api/webhook again — it re-registers the webhook "
+                        "by itself."]),
+            status=500)
+    return Response.json({"ok": False, "error": message}, 500)
+
+
 async def asgi_dispatch(scope, receive, send, handler: Handler) -> None:
     """Glue between Vercel's ASGI runtime and a per-endpoint ``handle()``."""
     if scope.get("type") == "lifespan":
@@ -418,17 +456,18 @@ async def asgi_dispatch(scope, receive, send, handler: Handler) -> None:
         await send_response(send, Response.json({"ok": False, "error": "unsupported request type"}, 400))
         return
     try:
-        response = await handler(Request(scope, await read_body(receive)))
+        body = await read_body(receive)
+    except Exception:
+        body = b""
+    request = Request(scope, body)
+    try:
+        response = await handler(request)
     except ConfigError as exc:
         log.error("configuration error: %s", exc)
-        response = Response.json(
-            {"ok": False, "error": str(exc),
-             "hint": ("Set BOT_TOKEN, ADMIN_IDS and a KV/Redis store "
-                      "(KV_REST_API_URL + KV_REST_API_TOKEN) in the project's environment "
-                      "variables, then redeploy.")}, 500)
+        response = config_error_response(request, str(exc))
     except Exception as exc:                      # pragma: no cover - defensive
         log.exception("unhandled error on %s %s", scope.get("method"), scope.get("path"))
-        response = Response.json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+        response = internal_error_response(request, f"{type(exc).__name__}: {exc}")
     await send_response(send, response)
 
 
@@ -446,7 +485,7 @@ def page(title: str, rows: list[tuple[str, Any]], notes: list[str] | None = None
     body = "\n".join(
         f"    <tr><th>{html.escape(str(name))}</th><td>{cell(value)}</td></tr>"
         for name, value in rows)
-    warn = "".join(f'\n    <p class="warn">{html.escape(w)}</p>' for w in warnings or [])
+    warn = "".join(f'\n    <p class="warn">⚠️ {html.escape(w)}</p>' for w in warnings or [])
     extra = "".join(f"\n    <p>{html.escape(n)}</p>" for n in notes or [])
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -461,11 +500,11 @@ def page(title: str, rows: list[tuple[str, Any]], notes: list[str] | None = None
   th, td {{ text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #8883; vertical-align: top; }}
   th {{ width: 12rem; font-weight: 600; opacity: .75; }}
   code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
-  .warn {{ border-left: 4px solid #d97706; padding-left: .7rem; }}
+  .warn {{ border-left: 4px solid #d97706; background: #d9770622; padding: .5rem .7rem; border-radius: 0 .4rem .4rem 0; }}
 </style>
-<h1>{html.escape(title)}</h1>
+<h1>{html.escape(title)}</h1>{warn}
 <table>
 {body}
-</table>{warn}{extra}
+</table>{extra}
 </html>
 """

@@ -3,9 +3,17 @@
   "functions": {
     "api/**/*.py": {
       "maxDuration": 60,
+      "regions": ["fra1"],
       "excludeFiles": "{tests/**,.github/**,.venv/**,**/*.md,install*.sh,uninstall.sh,Dockerfile,docker-compose.yml,p2p-bot.service.example,*.service.example,__pycache__/**}"
     }
   },
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/api/webhook",
+      "permanent": false
+    }
+  ],
   "crons": [
     {
       "path": "/api/tick",

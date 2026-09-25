@@ -125,9 +125,13 @@ Telegram pushes every update to `/api/webhook` and a **Vercel Cron** calls
 
 1. **Import** this repository into Vercel ([deploy button](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot) or `npx vercel`).
 2. **Add a KV/Redis store** (Vercel → Storage → *Upstash for Redis* → connect to the project) and the **environment variables** `BOT_TOKEN` + `ADMIN_IDS`.
-3. **Deploy**, then open `https://<your-app>.vercel.app/api/webhook` — that page registers the Telegram webhook and shows the status.
+3. **Deploy**, then open `https://<your-app>.vercel.app/` — the status page (registers the Telegram webhook by itself and shows the health of the deployment).
 4. In Telegram: `/start` → **👥 Set group** → paste a merchant URL → **🟢 Auto: ON**.
 
+> 🌍 The functions run in `fra1` (EU): the exchange P2P APIs geo-block US IPs
+> (Binance answers HTTP 451 there), so Vercel's default US region serves no
+> prices. [`vercel.json`](vercel.json) already sets this for you.
+>
 > ⏰ **Free (Hobby) plan**: crons may only run **once a day** — a faster schedule
 > fails the deployment. On **Pro** set `"schedule": "* * * * *"` in
 > [`vercel.json`](vercel.json) for live prices, or keep the free plan and let an

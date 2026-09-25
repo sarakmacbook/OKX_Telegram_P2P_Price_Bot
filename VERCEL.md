@@ -67,9 +67,10 @@ decides how often prices are checked.
 
 ## 3. Register the webhook (one click)
 
-Open your deployment in a browser:
+Open your deployment in a browser (the root URL redirects there, so either works):
 
 ```
+https://<your-app>.vercel.app/
 https://<your-app>.vercel.app/api/webhook
 ```
 
@@ -161,8 +162,10 @@ in the dashboard).
 
 | Path | Method | Purpose |
 |---|---|---|
+| `/` | `GET` | redirects to `/api/webhook`, so the deployment URL itself opens the status page |
 | `/api/webhook` | `POST` | Telegram updates — verified with `X-Telegram-Bot-Api-Secret-Token` (or `?secret=…`, handy for manual tests); everything else is rejected with 403 |
 | `/api/webhook` | `GET` | status page (JSON for scripts, HTML in a browser); registers the webhook, `?register=1` forces it, `?register=0` only reports |
+| `/api/webhook?check=1` | `GET` | status page + a live price fetch for every merchant — open this when prices are empty to see the per-merchant error |
 | `/api/tick` | `GET` | one cron round: keep the webhook registered → post prices if they changed → delete stale group messages |
 
 ## 8. How it works under the hood
@@ -185,12 +188,24 @@ in the dashboard).
   different instances. See `refresh_state` / `edit_get` / `edit_set` in `bot.py`.
 * **`config.json` is not used** on Vercel (read-only filesystem): the bot builds
   its configuration from the environment variables.
+* **Region**: the functions run in `fra1` (EU — `"regions"` in `vercel.json`).
+  Vercel's default region is `iad1` (US), and the exchange P2P APIs geo-block US
+  IPs — Binance answers HTTP 451 there — so from the default region every price
+  fetch fails and the bot posts nothing. A single region keeps the free Hobby
+  plan working; the status page shows the region it actually runs in. If prices
+  ever go empty after touching regions, `/api/webhook?check=1` names the cause
+  (look for 451 / restricted / forbidden).
+* **HTTP errors are visible**: a refused exchange request (451, 403, …) is stored
+  as the merchant's ⚠️ error instead of a silent `—` — in the group post, in the
+  add-merchant reply and in `?check=1`.
 
 ## 9. Troubleshooting
 
 | Symptom | Cause & fix |
 |---|---|
-| Page shows `bot.py refused to start` / a 500 with a *hint* | `BOT_TOKEN`/`ADMIN_IDS` missing or added **after** the last deploy → set them and redeploy |
+| Page shows ⚙️ *Setup needed* (or a 500 JSON with a *hint*) | `BOT_TOKEN`/`ADMIN_IDS`/KV missing or added **after** the last deploy → follow the steps on the page, then redeploy |
+| Prices are `—`, or `⚠️ …451…` / *restricted* / *forbidden* | the exchange geo-blocks the function's region → keep `"regions": ["fra1"]` in `vercel.json` (EU) and redeploy; diagnose with `/api/webhook?check=1` |
+| Deployment URL shows a Vercel 404 | only `/` (redirects to the status page) and `/api/*` exist — check the URL |
 | `State store: file — NOT persistent ❌` | no KV store connected → add the integration, redeploy |
 | `webhook not registered: Cannot tell where this deployment is reachable` | neither `VERCEL_PROJECT_PRODUCTION_URL`/`VERCEL_URL` nor `PUBLIC_URL` is set (e.g. running the file outside Vercel) → set `PUBLIC_URL` |
 | Bot answers nothing in Telegram | open `/api/webhook` — it re-registers and shows the last webhook error from Telegram; make sure the group was set and **Auto** is ON |

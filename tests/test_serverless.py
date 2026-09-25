@@ -517,3 +517,135 @@ def test_state_status_flags_a_non_persistent_store(serverless):
     assert status["backend"] in ("file", "redis", "none")
     if status["backend"] != "redis":
         assert "warning" in status and "KV_REST_API_URL" in status["warning"]
+
+
+# ── the deployment must explain itself (browser errors & diagnostics) ──────
+def test_broken_configuration_renders_a_setup_guide_for_browsers(serverless, webhook, monkeypatch):
+    def broken():
+        raise serverless.ConfigError("BOT_TOKEN is missing")
+
+    monkeypatch.setattr(webhook, "get_bot", broken)
+    status, headers, payload, _ = asgi_call(webhook.app, method="GET",
+                                            headers={"Accept": "text/html"})
+    text = payload.decode()
+    assert status == 500 and headers["content-type"].startswith("text/html")
+    assert "Setup needed" in text and "BOT_TOKEN" in text
+    assert "Redeploy" in text and "KV_REST_API_URL" in text
+
+
+def test_broken_configuration_stays_json_for_scripts(serverless, webhook, monkeypatch):
+    def broken():
+        raise serverless.ConfigError("BOT_TOKEN is missing")
+
+    monkeypatch.setattr(webhook, "get_bot", broken)
+    status, headers, payload, _ = asgi_call(webhook.app, method="GET")
+    assert status == 500 and headers["content-type"].startswith("application/json")
+    assert "hint" in json.loads(payload)
+
+
+def test_tick_crash_is_readable_in_browsers_too(serverless, tick, monkeypatch):
+    def broken():
+        raise serverless.ConfigError("Cannot tell where this deployment is reachable")
+
+    monkeypatch.setattr(tick, "run_tick", broken)
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+    status, headers, payload, _ = asgi_call(tick.app, method="GET",
+                                            headers={"Accept": "text/html"})
+    assert status == 500 and headers["content-type"].startswith("text/html")
+    assert "Setup needed" in payload.decode()
+
+
+def test_warnings_come_before_the_table(serverless, webhook, monkeypatch):
+    monkeypatch.setattr(webhook, "ensure_webhook",
+                        Recorder(result={"url": "https://bot.vercel.app/api/webhook",
+                                         "pending_updates": 0}))
+    status, headers, payload, _ = asgi_call(webhook.app, method="GET",
+                                            headers={"Accept": "text/html"})
+    text = payload.decode()
+    assert "NOT persistent" in text                      # the test store is a file, not KV
+    assert text.index('class="warn"') < text.index("<table>")
+
+
+def test_status_reports_the_vercel_region(serverless, webhook, monkeypatch):
+    monkeypatch.setattr(webhook, "ensure_webhook",
+                        Recorder(result={"url": "", "pending_updates": 0}))
+    monkeypatch.setenv("VERCEL_REGION", "fra1")
+    status, data = asgi_json(webhook.app, method="GET", params={"register": "0"})
+    assert status == 200 and data["region"] == "fra1"
+
+
+def _seed_merchant(bot_module):
+    """One merchant in memory AND in the store (the status page refreshes first)."""
+    from dataclasses import asdict
+
+    from exchanges import Merchant
+    m = Merchant("okx", "0dec824eed", "Fast_sonic", "USDT", "USD",
+                 "https://www.okx.com/p2p-markets/usd/buy-usdt?publicUserId=0dec824eed")
+    old = dict(bot_module.state.get("merchants") or {})
+    bot_module.state["merchants"] = {m.key: asdict(m)}
+    bot_module.save()
+    return m, old
+
+
+def _unseed_merchant(bot_module, old):
+    bot_module.state["merchants"] = old
+    bot_module.save()
+
+
+def test_price_check_fetches_every_merchant_once(serverless, webhook, monkeypatch):
+    import bot as bot_module
+
+    m, old = _seed_merchant(bot_module)
+    prices = {m.key: {"sell": 0.999, "sell_amount": 10.0, "sell_ad_id": "1",
+                      "buy": 1.001, "buy_amount": 20.0, "buy_ad_id": "2", "error": None}}
+    monkeypatch.setattr(webhook, "ensure_webhook",
+                        Recorder(result={"url": "", "pending_updates": 0}))
+
+    async def fake_get_prices():
+        return prices
+
+    monkeypatch.setattr(bot_module, "get_prices", fake_get_prices)
+    try:
+        status, data = asgi_json(webhook.app, method="GET",
+                                 params={"register": "0", "check": "1"})
+        assert status == 200
+        assert data["prices"][m.key]["sell"] == 0.999
+        assert data["prices"][m.key]["nick"] == "Fast_sonic"
+
+        _, headers, payload, _ = asgi_call(webhook.app, method="GET",
+                                           headers={"Accept": "text/html"},
+                                           params={"register": "0", "check": "1"})
+        text = payload.decode()
+        assert "Fast_sonic" in text and "0.999" in text
+    finally:
+        _unseed_merchant(bot_module, old)
+
+
+def test_price_check_explains_a_geo_blocked_region(serverless, webhook, monkeypatch):
+    import bot as bot_module
+
+    m, old = _seed_merchant(bot_module)
+    error = ("Client error '451 Unavailable For Legal Reasons' "
+             "for url 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search'")
+    prices = {m.key: {"sell": None, "sell_amount": None, "sell_ad_id": None,
+                      "buy": None, "buy_amount": None, "buy_ad_id": None, "error": error}}
+    monkeypatch.setattr(webhook, "ensure_webhook",
+                        Recorder(result={"url": "", "pending_updates": 0}))
+    monkeypatch.setenv("VERCEL_REGION", "iad1")
+
+    async def fake_get_prices():
+        return prices
+
+    monkeypatch.setattr(bot_module, "get_prices", fake_get_prices)
+    try:
+        status, data = asgi_json(webhook.app, method="GET",
+                                 params={"register": "0", "check": "1"})
+        assert "451" in data["prices"][m.key]["error"]
+
+        _, _, payload, _ = asgi_call(webhook.app, method="GET",
+                                     headers={"Accept": "text/html"},
+                                     params={"register": "0", "check": "1"})
+        text = payload.decode()
+        assert "fra1" in text and "geo-block" in text
+    finally:
+        _unseed_merchant(bot_module, old)
