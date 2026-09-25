@@ -182,5 +182,11 @@ def build_store(base_dir: str | Path, default_name: str = "data.json"):
         else:                                                      # pragma: no cover
             store = NullStore()
             log.warning("No writable state location found — state will not persist")
+    if store.backend != "redis" and os.getenv("VERCEL"):
+        log.error("Vercel gives every request an ephemeral filesystem %s: the group, the "
+                  "merchants and the prices will not be shared between instances and are lost "
+                  "on the next cold start. Connect a Redis/KV REST store (KV_REST_API_URL + "
+                  "KV_REST_API_TOKEN — e.g. the Upstash or Vercel KV integration).",
+                  "(/tmp on this deployment)" if store.backend == "file" else "")
     log.info("State backend: %s", store.describe())
     return store
