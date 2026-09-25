@@ -481,9 +481,11 @@ cp ~/p2p-bot-backup-*/config.json ~/p2p-bot-backup-*/data.json <install-dir>/
 | `adlinks.py` | Exact-ad deep-link templates (Binance / Bybit / OKX / Bitget) |
 | `storage.py` | State backends: `data.json` file, optional Upstash/Redis REST, read-only fallback |
 | `serverless.py` | Serverless mode: ASGI glue, webhook + cron helpers, one PTB app per warm container |
-| `api/webhook.py` | Vercel function: Telegram updates (`POST`) + status page (`GET /api/webhook`) |
-| `api/tick.py` | Vercel function: the cron job that replaces the JobQueue (`/api/tick`) |
+| `api/app.py` | Vercel entry point: one ASGI app that routes `/api/webhook`, `/api/tick` and `/` |
+| `api/webhook.py` | Telegram updates (`POST`) + status page (`GET /api/webhook`) |
+| `api/tick.py` | The cron round that replaces the JobQueue (`/api/tick`) |
 | `vercel.json` | Vercel config: function limits + the `/api/tick` cron schedule |
+| `pyproject.toml` | Vercel build config: the Python entry point + dependencies (mirrors `requirements.txt`) |
 | `VERCEL.md` | Step-by-step Vercel deployment guide |
 | `tests/` | pytest suite (links, buttons, storage, serverless/webhook mode) |
 | `.github/workflows/` | CI (tests) |

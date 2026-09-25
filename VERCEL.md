@@ -167,12 +167,32 @@ in the dashboard).
 | `/api/webhook` | `GET` | status page (JSON for scripts, HTML in a browser); registers the webhook, `?register=1` forces it, `?register=0` only reports |
 | `/api/webhook?check=1` | `GET` | status page + a live price fetch for every merchant — open this when prices are empty to see the per-merchant error |
 | `/api/tick` | `GET` | one cron round: keep the webhook registered → post prices if they changed → delete stale group messages |
+| anything else | – | `404` (JSON) — the deployment is one catch-all function, so the router answers what the platform's 404 used to |
 
 ## 8. How it works under the hood
 
-* **`api/webhook.py`** and **`api/tick.py`** export `async def app(scope, receive, send)`.
-  Vercel's Python runtime loads the top-level `app` and detects ASGI by that
-  exact signature (three required positional parameters).
+* **One function, one entry point**: Vercel's Python runtime builds a Python
+  project as a **single application** — it loads one top-level `app` and rewrites
+  *every* request to it (files in `api/` are no longer functions of their own).
+  `api/app.py` is that entry point and does the routing the platform used to do:
+  `/api/webhook` → `api/webhook.py`, `/api/tick` → `api/tick.py`, `/` → the status
+  page, anything else → 404. `pyproject.toml` declares it:
+
+  ```toml
+  [tool.vercel]
+  entrypoint = "api.app:app"
+  ```
+
+  Without that declaration (or a file named `app.py`/`index.py`/… in the project
+  root, `src/`, `app/` or `api/`) the build stops with
+  `No python entrypoint found in default locations`.
+* **`pyproject.toml` also carries the dependencies** — it takes precedence over
+  `requirements.txt` on Vercel, so both lists must stay identical (a test fails
+  when they drift). `requirements.txt` remains the source for the VPS, Docker and
+  local installs, which never read `pyproject.toml`.
+* **`api/webhook.py`** and **`api/tick.py`** still export their own
+  `async def app(scope, receive, send)` (Vercel detects ASGI by that exact
+  signature), so each endpoint also runs standalone — `uvicorn api.webhook:app`.
 * **`serverless.py`** glues the two worlds together: it imports `bot.py`, builds a
   PTB `Application` with `updater(None)` and `job_queue(None)` (no polling, no
   in-process scheduler), initializes it once per warm container and hands it each
@@ -203,6 +223,8 @@ in the dashboard).
 
 | Symptom | Cause & fix |
 |---|---|
+| `vercel build` fails with *No python entrypoint found in default locations* | the entry point moved, or `pyproject.toml` lost its `[tool.vercel] entrypoint = "api.app:app"` → restore it (the file must be `api/app.py` and export a top-level `app`), then redeploy |
+| `vercel build` installs nothing / `ModuleNotFoundError: telegram` | `pyproject.toml` outranks `requirements.txt` on Vercel — the two dependency lists must match (see §8) |
 | Page shows ⚙️ *Setup needed* (or a 500 JSON with a *hint*) | `BOT_TOKEN`/`ADMIN_IDS`/KV missing or added **after** the last deploy → follow the steps on the page, then redeploy |
 | Prices are `—`, or `⚠️ …451…` / *restricted* / *forbidden* | the exchange geo-blocks the function's region → keep `"regions": ["fra1"]` in `vercel.json` (EU) and redeploy; diagnose with `/api/webhook?check=1` |
 | Deployment URL shows a Vercel 404 | only `/` (redirects to the status page) and `/api/*` exist — check the URL |
