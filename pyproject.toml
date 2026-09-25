@@ -1,0 +1,23 @@
+# Vercel's Python runtime reads this file for two things:
+#
+#   1. the entry point — since @vercel/python 17 a Python project is built as ONE
+#      application, and "vercel build" fails with "No python entrypoint found in
+#      default locations" unless it is declared (or lives in app.py/index.py/…):
+#          [tool.vercel] entrypoint = "api.app:app"
+#   2. the dependencies — a pyproject.toml TAKES PRECEDENCE over requirements.txt,
+#      so the list below must mirror requirements.txt (tests/test_vercel_build.py
+#      fails when the two drift apart). requirements.txt stays the source for the
+#      VPS/Docker/local installs, which never look at this file.
+
+[project]
+name = "okx-telegram-p2p-price-bot"
+version = "1.0.0"
+description = "P2P price bot for Telegram — serverless (Vercel) deployment"
+requires-python = ">=3.10"
+dependencies = [
+    "python-telegram-bot[job-queue]==21.6",
+    "httpx==0.27.2",
+]
+
+[tool.vercel]
+entrypoint = "api.app:app"
