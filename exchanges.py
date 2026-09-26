@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 import httpx
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36",
@@ -11,6 +11,19 @@ class Merchant:
     exchange: str; merchant_id: str; nickname: str = ""; asset: str = "USDT"; fiat: str = "USD"; url: str = ""
     @property
     def key(self): return f"{self.exchange}:{self.merchant_id}:{self.asset}:{self.fiat}"
+
+    @property
+    def profile_url(self) -> str:
+        """Public profile, not a marketplace URL with a merchant-id hint.
+
+        Build OKX's profile route from the same publicUserId used to fetch
+        prices. This also fixes older saved marketplace links without changing
+        the merchant identity or overwriting the URL originally pasted.
+        """
+        if self.exchange.lower() == "okx" and self.merchant_id:
+            public_id = quote(str(self.merchant_id), safe="")
+            return f"https://www.okx.com/p2p/ads-merchant?publicUserId={public_id}"
+        return self.url or ""
 
 # ---------- URL -> Merchant (paste any public merchant profile link) ----------
 def parse_url(url: str, asset: str, fiat: str):

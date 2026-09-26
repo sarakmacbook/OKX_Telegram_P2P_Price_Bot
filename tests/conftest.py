@@ -27,19 +27,18 @@ import pytest  # noqa: E402
 @pytest.fixture()
 def bot():
     import bot as bot_module
-    bot_module.state.update({"group": None, "auto": False, "merchants": {},
-                             "last": {}, "last_msg_id": None, "last_msg_time": None})
-    bot_module.state["settings"] = bot_module.DEFAULT_SETTINGS.copy()
+    bot_module.state.clear()
+    bot_module.state.update(bot_module.empty_state())
     yield bot_module
-    bot_module.state["merchants"] = {}
-    bot_module.state["settings"] = bot_module.DEFAULT_SETTINGS.copy()
+    bot_module.state.clear()
+    bot_module.state.update(bot_module.empty_state())
 
 
 @pytest.fixture()
 def merchant():
     from exchanges import Merchant
     return Merchant("okx", "0dec824eed", "Fast_sonic", "USDT", "USD",
-                    "https://www.okx.com/p2p-markets/usd/buy-usdt?publicUserId=0dec824eed")
+                    "https://www.okx.com/p2p/ads-merchant?publicUserId=0dec824eed")
 
 
 @pytest.fixture()

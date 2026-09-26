@@ -49,3 +49,42 @@ def test_successful_fetch_still_parses_prices_and_ad_ids():
     assert result["sell_amount"] == 10645.56
     assert result["sell_ad_id"] == "1122334455"
     assert merchant.nickname == "Fast_sonic"
+
+
+def test_okx_profile_url_uses_public_merchant_id():
+    from urllib.parse import parse_qs, urlparse
+
+    urls = (
+        "",
+        "https://www.okx.com/p2p/market?publicUserId=0dec824eed",
+        "https://www.okx.com/p2p-markets/usd/buy-usdt?publicUserId=0dec824eed",
+        "https://www.okx.com/p2p/ads-merchant?publicUserId=0dec824eed",
+    )
+    for url in urls:
+        merchant = Merchant("okx", "0dec824eed", url=url)
+        assert merchant.profile_url == "https://www.okx.com/p2p/ads-merchant?publicUserId=0dec824eed"
+        assert merchant.url == url  # keep the original input; do not rewrite saved data
+
+    merchant = Merchant("okx", "id&adId=other/#")
+    parsed = urlparse(merchant.profile_url)
+    assert parse_qs(parsed.query) == {"publicUserId": [merchant.merchant_id]}
+    assert parsed.fragment == ""
+
+
+def test_parsed_okx_merchant_links_to_profile():
+    from exchanges import parse_url
+
+    merchant = parse_url("https://www.okx.com/p2p/market?publicUserId=0dec824eed", "USDT", "USD")
+    assert merchant.merchant_id == "0dec824eed"
+    assert merchant.profile_url == "https://www.okx.com/p2p/ads-merchant?publicUserId=0dec824eed"
+
+
+def test_other_exchanges_keep_the_saved_profile_url():
+    for exchange in ("binance", "bybit", "bitget"):
+        url = f"https://www.{exchange}.com/profile/123"
+        assert Merchant(exchange, "123", url=url).profile_url == url
+        assert Merchant(exchange, "123").profile_url == ""
+
+
+def test_okx_without_identity_does_not_generate_an_empty_profile_link():
+    assert Merchant("okx", "").profile_url == ""
