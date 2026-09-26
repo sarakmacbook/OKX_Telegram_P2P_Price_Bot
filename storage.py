@@ -19,7 +19,10 @@ Redis is configured by any of::
     REDIS_REST_URL       + REDIS_REST_TOKEN
 
 Nothing here ever raises: a failed write is logged and the in-memory state
-stays the source of truth for the running process.
+stays the source of truth for the running process.  That also means a database
+that went *away* looks exactly like an empty one, so every store answers
+:func:`probe_store` — the check the setup page uses to show that a configured
+database is genuinely unreachable instead of silently forgetting the group.
 
 This module is also the single source of the "connect a database" link the bot
 panel, the setup page and the status page show when no shared database is
@@ -140,15 +143,31 @@ class RedisStore:
         self.url, self.token, self.key, self.timeout = url, token, key, timeout
 
     # -- low level ---------------------------------------------------------
-    def _command(self, *args):
+    def _command(self, *args, timeout: float | None = None):
         import httpx
-        r = httpx.post(self.url, json=list(args), timeout=self.timeout,
+        r = httpx.post(self.url, json=list(args),
+                       timeout=self.timeout if timeout is None else timeout,
                        headers={"Authorization": f"Bearer {self.token}",
                                 "Content-Type": "application/json"})
         r.raise_for_status()
         return r.json().get("result")
 
     # -- api ---------------------------------------------------------------
+    def probe(self, timeout: float | None = None) -> tuple[bool, str]:
+        """Whether this database actually answers.
+
+        ``load()`` swallows every error and returns ``None``, which the bot
+        reads as "nothing saved yet" — so a database that went away (deleted
+        Upstash database, rotated token, wrong region) looks exactly like a
+        brand-new bot instead of an outage.  This is the check that tells the
+        two apart; it never raises, so a page can always be rendered.
+        """
+        try:
+            self._command("PING", timeout=timeout)
+            return True, "the database answered"
+        except Exception as exc:                                  # pragma: no cover - network
+            return False, f"{type(exc).__name__}: {exc}"
+
     def load(self) -> dict | None:
         try:
             raw = self._command("GET", self.key)
@@ -184,6 +203,12 @@ class FileStore:
         self.path = Path(path)
 
     # -- api ---------------------------------------------------------------
+    def probe(self, timeout: float | None = None) -> tuple[bool, str]:
+        """A file store is healthy when it can be written to."""
+        if writable(self.path):
+            return True, "the state file is writable"
+        return False, f"{self.path} cannot be written — the bot forgets everything"
+
     def load(self) -> dict | None:
         try:
             if not self.path.exists():
@@ -225,8 +250,28 @@ class NullStore:
     def save(self, data: dict) -> None:                            # pragma: no cover
         pass
 
+    def probe(self, timeout: float | None = None) -> tuple[bool, str]:
+        return False, self.reason or "nothing is persisted"
+
     def describe(self) -> str:
         return f"none ({self.reason})"
+
+
+def probe_store(store, timeout: float | None = None) -> tuple[bool, str]:
+    """``(reachable, detail)`` for a store, whatever its backend.
+
+    Used by the setup checklist to tell "nothing is saved yet" apart from
+    "the database is gone": the second one is an outage the owner can only fix
+    by changing the credentials, so it has to be visible.  Never raises.
+    """
+    probe = getattr(store, "probe", None)
+    if probe is None:                                             # pragma: no cover
+        return True, "no health check for this store"
+    try:
+        reachable, detail = probe(timeout=timeout)
+    except Exception as exc:                                      # pragma: no cover
+        return False, f"{type(exc).__name__}: {exc}"
+    return bool(reachable), str(detail or "")
 
 
 def writable(path: Path) -> bool:

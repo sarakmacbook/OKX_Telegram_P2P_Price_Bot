@@ -359,3 +359,26 @@ def test_database_command_is_admin_only_and_sends_the_screen(bot, monkeypatch):
     asyncio.run(bot.database_cmd(admin, SimpleNamespace()))
     message.reply_html.assert_awaited()
     assert "Connect database" in str(message.reply_html.await_args.kwargs["reply_markup"].inline_keyboard[0][0].text)
+
+
+def test_database_screen_reports_a_store_that_stopped_answering(bot, monkeypatch):
+    """A configured-but-dead database must not masquerade as a healthy one."""
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: True)
+    monkeypatch.setattr(bot, "db_health", lambda force=False: (False, "ConnectError: refused"))
+
+    text = bot.database_text()
+
+    assert "NOT answering" in text
+    assert "ConnectError: refused" in text
+    assert "forgets the group" in text
+    assert "connected ✅" not in text
+
+
+def test_database_screen_stays_quiet_when_the_store_answers(bot, monkeypatch):
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: True)
+    monkeypatch.setattr(bot, "db_health", lambda force=False: (True, "the database answered"))
+
+    text = bot.database_text()
+
+    assert "connected ✅" in text
+    assert "NOT answering" not in text
