@@ -901,6 +901,7 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
     needs_secret = bool(status.get("setup_secret")) or bool(status["ready"])
     selected_backend = str(values.get("P2P_STATE_BACKEND") or
                            runtime.get("state_backend") or storage.state_backend())
+    redis_connected = bool(storage.redis_config())
 
     if status["ready"] and not status.get("setup_secret"):
         return (
@@ -921,22 +922,30 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
                value=values.get("ADMIN_IDS", ""), placeholder="123456789",
                stored=masked.get("ADMIN_IDS", "")),
     ]
-    fields += [
-        _select_field(
-            "P2P_STATE_BACKEND", "State database",
-            "Auto chooses Redis when credentials exist, otherwise data.json. File always uses data.json; Redis requires the URL and token below.",
-            (("auto", "Auto — Redis when configured, otherwise file"),
-             ("file", "File — always use local data.json"),
-             ("redis", "Redis / KV — shared persistent database")),
-            selected_backend),
-        _field("KV_REST_API_URL", "KV / Redis REST URL",
-               "Required when Redis is selected. Upstash for Redis → REST API → endpoint.",
-               value=values.get("KV_REST_API_URL", ""),
-               placeholder="https://eu1-….upstash.io"),
-        _field("KV_REST_API_TOKEN", "KV / Redis REST token",
-               "The token that belongs to the URL above.", secret=True,
-               placeholder="A…"),
-    ]
+    fields.append(_select_field(
+        "P2P_STATE_BACKEND", "State database",
+        ("A Redis / KV database is already connected; no credentials need to be entered."
+         if redis_connected else
+         "Auto chooses Redis when credentials exist, otherwise data.json. File always uses data.json; Redis requires the URL and token below."),
+        (("auto", "Auto — Redis when configured, otherwise file"),
+         ("file", "File — always use local data.json"),
+         ("redis", "Redis / KV — shared persistent database")),
+        selected_backend))
+    if redis_connected:
+        fields.append(
+            '<p class="where">✓ A KV / Redis database is already connected through the '
+            'deployment environment. The bot will use it automatically; no database '
+            'URL or token input is needed.</p>')
+    else:
+        fields += [
+            _field("KV_REST_API_URL", "KV / Redis REST URL",
+                   "Required when Redis is selected. Upstash for Redis → REST API → endpoint.",
+                   value=values.get("KV_REST_API_URL", ""),
+                   placeholder="https://eu1-….upstash.io"),
+            _field("KV_REST_API_TOKEN", "KV / Redis REST token",
+                   "The token that belongs to the URL above.", secret=True,
+                   placeholder="A…"),
+        ]
     advanced = "".join([
         _field("ASSET", "Asset", "What is traded.", value=values.get("ASSET", ""),
                placeholder="USDT"),
@@ -1046,10 +1055,11 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     the very same store), and the deployment's environment variables — the only
     option for ``CRON_SECRET``, which Vercel's cron reads from there.
 
-    A "How to insert the database" panel sits under the form and walks through
-    getting the KV/Redis pair: create an Upstash database and paste its REST
-    URL + token into the form, or connect the storage in the Vercel dashboard
-    (which writes ``KV_REST_API_URL`` + ``KV_REST_API_TOKEN`` by itself).
+    When no KV/Redis credentials are connected, a "How to insert the database"
+    panel walks through getting the pair: create an Upstash database and paste
+    its REST URL + token into the form, or connect storage in the Vercel dashboard
+    (which writes ``KV_REST_API_URL`` + ``KV_REST_API_TOKEN`` by itself). When a
+    complete pair is already present, the form skips those inputs and the guide.
 
     Secrets are accepted over HTTPS and stored in the deployment's own state
     store; they are never echoed back, and the form closes (or requires
@@ -1078,7 +1088,7 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     checks_markup = "\n".join(cards)
     banner_markup = _banner(banner)
     form_markup = _setup_form(status, form_values)
-    db_guide_markup = _db_guide_panel()
+    db_guide_markup = "" if storage.redis_config() else _db_guide_panel()
     terminal_markup = _terminal_panel(status)
     missing = status.get("missing") or "the required environment variables"
     deployment_note = (
