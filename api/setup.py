@@ -39,8 +39,10 @@ def _headline(result: dict) -> str:
         return " · ".join(result["errors"])
     saved = ", ".join(result["saved"]) or "the KV/Redis connection"
     missing = result["status"].get("missing") or ""
-    if missing:
-        return f"Saved {saved}. Still missing: {missing}."
+    if not result["status"]["ready"]:
+        return (f"Saved {saved}, but setup is not complete. "
+                f"Still missing: {missing or 'required configuration'}. "
+                "Complete the checklist below before registering the Telegram webhook.")
     return (f"Saved {saved} — the bot can start now. Open {WEBHOOK_PATH} to register the "
             "Telegram webhook.")
 
@@ -73,7 +75,8 @@ async def handle(request: Request) -> Response:
     if request.wants_html:
         status = result["status"]
         message = status["message"] or "Everything the bot needs is present."
-        banner = ("ok" if result["ok"] else "error",
+        banner = (("ok" if status["ready"] and not result["warnings"] else "info")
+                  if result["ok"] else "error",
                   headline + "".join(f" ⚠️ {item}" for item in result["warnings"]))
         # Non-secret fields are echoed back so a rejected form is not a dead end;
         # the token and the KV token are never sent to the browser again.

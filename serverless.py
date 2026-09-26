@@ -823,10 +823,17 @@ def save_setup_values(values: dict, verify: bool = True) -> dict:
     for name in shadowed:
         warnings.append(f"{name} is also set in the deployment environment — other instances keep "
                         f"using that value until you change or remove it there.")
-    if store_before["backend"] != "redis" and _looks_like_vercel():
-        warnings.append("No KV/Redis is connected, so these settings live in this instance's "
-                        "temporary storage only: connect a store (form field above, or "
-                        "Vercel → Storage → Upstash for Redis) and redeploy to keep them.")
+    if _looks_like_vercel():
+        if kv_url and kv_token:
+            warnings.append("The Redis connection entered here applies only to this instance. "
+                            "Add KV_REST_API_URL and KV_REST_API_TOKEN to the Vercel project "
+                            "environment and redeploy so every instance can load the settings.")
+        elif not runtime_config.describe(ROOT)["persistent"]:
+            warnings.append("These settings are in temporary storage and will be lost on a "
+                            "cold start. Connect Upstash for Redis in Vercel → Storage, add "
+                            "KV_REST_API_URL and KV_REST_API_TOKEN to the project environment, "
+                            "select auto or redis (not file), then redeploy and save the "
+                            "settings again.")
 
     status = setup_status()
     return _save_report(True, errors=[], warnings=warnings, notes=notes,
