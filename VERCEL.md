@@ -61,7 +61,7 @@ environment-only (Vercel's cron sends it from there).
 
 ### Option 1 — the dashboard
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot&env=BOT_TOKEN,ADMIN_IDS,KV_REST_API_URL,KV_REST_API_TOKEN&envDescription=BOT_TOKEN%20and%20ADMIN_IDS%20are%20required%3B%20KV_REST_API_URL%2FTOKEN%20come%20from%20the%20KV%20or%20Upstash%20integration&project-name=p2p-price-bot)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot&env=BOT_TOKEN,ADMIN_IDS&envDescription=BOT_TOKEN%20and%20ADMIN_IDS%20are%20required%3B%20connect%20Upstash%20for%20Redis%20or%20Vercel%20KV%20after%20creating%20the%20project&project-name=p2p-price-bot)
 
 1. **Import** the repository into Vercel.
 2. **Connect storage** — [**Storage**](https://vercel.com/dashboard/stores) →

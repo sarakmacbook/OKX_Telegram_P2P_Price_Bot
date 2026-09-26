@@ -156,8 +156,23 @@ def push_to_vercel_env(values: dict, target: str = "production") -> list[str]:
     never as an exception, because the store already has the values by then.
     """
     lines: list[str] = []
+    # ``vercel env add`` rejects duplicates. Integrations commonly create
+    # KV_REST_API_URL/TOKEN before this wizard runs, so discover existing names
+    # and leave their values untouched instead of turning a successful setup
+    # into a confusing error.
+    existing: set[str] = set()
+    try:
+        listing = subprocess.run(["vercel", "env", "ls", target],
+                                 capture_output=True, timeout=60)
+        output = (listing.stdout + listing.stderr).decode(errors="replace")
+        existing = {name for name in PUSHABLE if name in output}
+    except Exception:
+        pass
     for name, value in values.items():
         if name not in PUSHABLE or not value:
+            continue
+        if name in existing:
+            lines.append(f"↷ {name} already exists on Vercel ({target}); left unchanged")
             continue
         try:
             done = subprocess.run(["vercel", "env", "add", name, target],

@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # repo root (b
 
 from serverless import (                                          # noqa: E402
     SETUP_PATH, WEBHOOK_PATH, Request, Response, _setup_page, asgi_dispatch,
-    save_setup_values, setup_status, setup_write_allowed,
+    save_setup_values, setup_status, setup_write_allowed, env, matches,
 )
 
 log = logging.getLogger("p2p-bot.serverless.setup")
@@ -50,6 +50,14 @@ def _headline(result: dict) -> str:
 async def handle(request: Request) -> Response:
     if request.method == "GET":
         status = setup_status()
+        # A secret-bearing link is a convenient way to open the reconfiguration
+        # form.  Do not mark the deployment globally; this authorization is only
+        # used to render this response and is validated again on POST.
+        secret = request.query.get("secret", "")
+        configured_secret = env("SETUP_SECRET")
+        if configured_secret and matches(secret, configured_secret):
+            status["edit_authorized"] = True
+            status["edit_secret"] = secret
         message = status["message"] or "Everything the bot needs is present."
         return Response.html(_setup_page(message, status))
 

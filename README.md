@@ -170,7 +170,7 @@ python3 -c "import urllib.request as u;print(u.urlopen('https://raw.githubuserco
 
 ### Option E — Vercel (serverless, nothing to keep running)
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot&env=BOT_TOKEN,ADMIN_IDS,KV_REST_API_URL,KV_REST_API_TOKEN&envDescription=BOT_TOKEN%20and%20ADMIN_IDS%20are%20required%3B%20KV_REST_API_URL%2FTOKEN%20come%20from%20the%20KV%20or%20Upstash%20integration&project-name=p2p-price-bot)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot&env=BOT_TOKEN,ADMIN_IDS&envDescription=BOT_TOKEN%20and%20ADMIN_IDS%20are%20required%3B%20connect%20Upstash%20for%20Redis%20or%20Vercel%20KV%20after%20creating%20the%20project&project-name=p2p-price-bot)
 
 Vercel has no long-running process, so there the bot runs in **webhook mode**:
 Telegram pushes every update to `/api/webhook` and a **Vercel Cron** calls
