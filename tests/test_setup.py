@@ -229,6 +229,34 @@ def test_the_setup_page_offers_the_form(unconfigured):
     assert "SUPERSECRET" not in text
 
 
+def test_setup_page_does_not_ask_for_database_credentials_when_vercel_kv_is_connected(
+        unconfigured, monkeypatch):
+    """A connected Vercel KV/Upstash integration supplies both credentials in env."""
+    monkeypatch.setenv("KV_REST_API_URL", "https://example.upstash.io")
+    monkeypatch.setenv("KV_REST_API_TOKEN", "private-test-token")
+
+    class RedisReply:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"result": None}
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: RedisReply())
+
+    status, _, payload = call()
+    text = payload.decode()
+
+    assert status == 200
+    assert 'name="KV_REST_API_URL"' not in text
+    assert 'name="KV_REST_API_TOKEN"' not in text
+    assert "database is already connected" in text
+    assert "no database" in text
+    assert "How to insert the database" not in text
+    assert "private-test-token" not in text
+
+
 def test_the_first_run_page_on_the_webhook_endpoint_has_the_form_too(unconfigured):
     """``GET /api/webhook`` renders the same page while the bot cannot start."""
     status, headers, payload = call(path="/api/webhook", headers={"accept": "text/html"})
