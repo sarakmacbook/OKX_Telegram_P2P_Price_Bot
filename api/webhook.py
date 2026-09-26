@@ -1,9 +1,11 @@
 """Telegram webhook — ``POST /api/webhook`` (Vercel serverless function).
 
 Telegram delivers every update here, and the payload is handed to the same
-handlers the polling bot uses (``bot.register_handlers``).  ``GET`` is the status
-page you open right after deploying: it registers the webhook when it is
-missing and shows what the bot knows — state store, group, merchants, cron note.
+handlers the polling bot uses (``bot.register_handlers``).  ``GET`` is the
+first-start setup UI when the deployment is missing its credentials or KV store;
+once configured it becomes the status page you open after deploying. It
+registers the webhook when it is missing and shows what the bot knows — state
+store, group, merchants, cron note.
 ``GET ?check=1`` additionally fetches every merchant once, so empty or broken
 prices can be diagnosed (geo-blocked regions, stale merchant links).
 
@@ -21,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # repo root (b
 
 from serverless import (                                          # noqa: E402
     TELEGRAM_SECRET_HEADER, Request, Response, asgi_dispatch, ensure_webhook,
-    env, get_bot, matches, page, process_update, state_status, webhook_secret,
+    _local_config_has_credentials, config_error_response, env, get_bot, matches,
+    page, process_update, setup_status, state_status, webhook_secret,
     webhook_secret_note,
 )
 
@@ -57,6 +60,14 @@ async def handle(request: Request) -> Response:
 
 # ── GET /api/webhook — status page (and one-click webhook registration) ────
 async def _status(request: Request) -> Response:
+    # Do this preflight before importing bot.py.  A polling install can exit on
+    # missing configuration, but the first browser request on Vercel should get
+    # an actionable setup UI rather than an opaque platform error page.
+    setup = setup_status()
+    if not setup["ready"] and not (not setup["serverless"] and
+                                     _local_config_has_credentials()):
+        return config_error_response(request, setup["message"], setup)
+
     bot_module = get_bot()
     bot_module.refresh_state()
 

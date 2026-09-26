@@ -31,10 +31,12 @@ Vercel Cron ─► https://<your-app>.vercel.app/api/tick      (post prices, cle
   project**. Vercel then sets `KV_REST_API_URL` + `KV_REST_API_TOKEN` for you.
   Just clicking *Create* is enough — the bot only stores one small JSON document.
 
-> ⚠️ Without a KV store the bot still deploys, but every request may land in a
-> different instance with an empty local disk, so it "forgets" the group, the
-> merchants and the prices. `/api/webhook` shows
-> **State store: file — NOT persistent ❌** when that is the case.
+> ⚠️ KV/Redis is required for a Vercel deployment. If `BOT_TOKEN`, `ADMIN_IDS`,
+> or the KV pair is missing, opening `/api/webhook` shows a first-start setup UI
+> with a redacted environment checklist and the exact Vercel steps. Once the
+> variables are present, redeploy and reopen the page; it registers the webhook
+> automatically. A local file store is still supported for VPS/Docker installs,
+> but it cannot be used as persistent state on Vercel.
 
 ## 2. Deploy
 
@@ -43,9 +45,12 @@ Vercel Cron ─► https://<your-app>.vercel.app/api/tick      (post prices, cle
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot&env=BOT_TOKEN,ADMIN_IDS,KV_REST_API_URL,KV_REST_API_TOKEN&envDescription=BOT_TOKEN%20and%20ADMIN_IDS%20are%20required%3B%20KV_REST_API_URL%2FTOKEN%20come%20from%20the%20KV%20or%20Upstash%20integration&project-name=p2p-price-bot)
 
 1. **Import** the repository into Vercel.
-2. **Environment variables**: `BOT_TOKEN`, `ADMIN_IDS` (and the two `KV_*` values,
-   if the KV store is not connected yet).
-3. **Deploy**.
+2. **Connect storage** from **Storage → Upstash for Redis** (or Vercel KV) →
+   **Connect to this project**, then confirm `KV_REST_API_URL` and
+   `KV_REST_API_TOKEN` exist in the project's environment variables.
+3. Set `BOT_TOKEN` and `ADMIN_IDS` in **Settings → Environment Variables**.
+4. **Deploy**. If anything is missing, the deployment URL opens the first-start
+   web UI and tells you which redacted checklist item still needs attention.
 
 ### Option 2 — the Vercel CLI
 
@@ -164,7 +169,7 @@ in the dashboard).
 |---|---|---|
 | `/` | `GET` | redirects to `/api/webhook`, so the deployment URL itself opens the status page |
 | `/api/webhook` | `POST` | Telegram updates — verified with `X-Telegram-Bot-Api-Secret-Token` (or `?secret=…`, handy for manual tests); everything else is rejected with 403 |
-| `/api/webhook` | `GET` | status page (JSON for scripts, HTML in a browser); registers the webhook, `?register=1` forces it, `?register=0` only reports |
+| `/api/webhook` | `GET` | first-start setup UI when `BOT_TOKEN`/`ADMIN_IDS`/KV are missing; otherwise the health page (JSON for scripts, HTML in a browser) that registers the webhook; `?register=1` forces it, `?register=0` only reports |
 | `/api/webhook?check=1` | `GET` | status page + a live price fetch for every merchant — open this when prices are empty to see the per-merchant error |
 | `/api/tick` | `GET` | one cron round: keep the webhook registered → post prices if they changed → delete stale group messages |
 | anything else | – | `404` (JSON) — the deployment is one catch-all function, so the router answers what the platform's 404 used to |
@@ -228,7 +233,7 @@ in the dashboard).
 | Page shows ⚙️ *Setup needed* (or a 500 JSON with a *hint*) | `BOT_TOKEN`/`ADMIN_IDS`/KV missing or added **after** the last deploy → follow the steps on the page, then redeploy |
 | Prices are `—`, or `⚠️ …451…` / *restricted* / *forbidden* | the exchange geo-blocks the function's region → keep `"regions": ["fra1"]` in `vercel.json` (EU) and redeploy; diagnose with `/api/webhook?check=1` |
 | Deployment URL shows a Vercel 404 | only `/` (redirects to the status page) and `/api/*` exist — check the URL |
-| `State store: file — NOT persistent ❌` | no KV store connected → add the integration, redeploy |
+| Setup UI says the state store is missing (or an older deployment shows `State store: file — NOT persistent ❌`) | add/connect the Upstash or Vercel KV integration, confirm `KV_REST_API_URL` + `KV_REST_API_TOKEN`, then redeploy |
 | `webhook not registered: Cannot tell where this deployment is reachable` | neither `VERCEL_PROJECT_PRODUCTION_URL`/`VERCEL_URL` nor `PUBLIC_URL` is set (e.g. running the file outside Vercel) → set `PUBLIC_URL` |
 | Bot answers nothing in Telegram | open `/api/webhook` — it re-registers and shows the last webhook error from Telegram; make sure the group was set and **Auto** is ON |
 | Prices only once a day | free Hobby plan → Pro cron or an external scheduler calling `/api/tick` (see §5) |
