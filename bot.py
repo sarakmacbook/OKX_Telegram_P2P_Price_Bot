@@ -8,7 +8,8 @@ from dataclasses import asdict
 from urllib.parse import urlsplit
 from pathlib import Path
 import httpx
-from telegram import Update, InlineKeyboardButton as _TelegramButton, InlineKeyboardMarkup as KB
+from telegram import (Update, ChatPermissions, InlineKeyboardButton as _TelegramButton,
+                      InlineKeyboardMarkup as KB)
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, ChatMemberHandler, ContextTypes, filters)
 from exchanges import Merchant, parse_url, fetch, HEADERS
@@ -208,6 +209,68 @@ MAX_EXTRA_BUTTONS = 8
 MAX_REPORT_BUTTONS = 100
 PROFILE_BUTTON_URLS = ("{URL}", "{PROFILE_URL}")
 
+# ── destinations: the price post goes to every chat that is set ─────────────
+# "group" is the classic group/supergroup; "channel" is an optional extra
+# channel the bot posts the same report into.  Both keep their own last message
+# id (auto-delete / cleanup) and their own change snapshot.
+DESTINATIONS = ("group", "channel")
+LAST_ID = {"group": "last_msg_id", "channel": "channel_last_msg_id"}
+LAST_TIME = {"group": "last_msg_time", "channel": "channel_last_msg_time"}
+SNAPSHOT = {"group": "last", "channel": "channel_last"}
+CHAT_ID = {"group": "group", "channel": "channel"}
+CHAT_TITLE = {"group": "group_title", "channel": "channel_title"}
+
+# ── auto-forward: repost what an admin sends in the private chat ────────────
+FORWARD_TARGETS = ("off", "group", "channel", "both")
+FORWARD_LABELS = {"off": "OFF", "group": "GROUP", "channel": "CHANNEL", "both": "GROUP + CHANNEL"}
+MAX_FORWARD_HISTORY = 20          # how many 📤 Undo buttons stay valid
+FORWARD_HISTORY_TTL = 48 * 3600   # …and for how long (seconds)
+MAX_CAPTCHA_LENGTH = 1000         # the custom anti-scam challenge text
+
+# ── anti-scam verification (captcha) ────────────────────────────────────────
+# A new member is muted and has to type a random word.  While pending they may
+# only send plain text (no links, media or stickers), so a scammer cannot post
+# anything useful even before the bot removes them.
+CAPTCHA_ATTEMPT_CHOICES = (1, 2, 3, 5, 10)
+CAPTCHA_TIMEOUT_CHOICES = (1, 2, 5, 10, 30)        # minutes
+CAPTCHA_ACTIONS = ("restrict", "kick", "ban")
+CAPTCHA_ACTION_TITLES = {"restrict": "mute until I approve 🔇",
+                         "kick": "kick (they can rejoin) 👢",
+                         "ban": "ban permanently 🚫"}
+CAPTCHA_ACTION_SHORT = {"restrict": "Mute", "kick": "Kick", "ban": "Ban"}
+CAPTCHA_LOCK_TTL = 48 * 3600      # how long a failed record stays for the admin
+DEFAULT_CAPTCHA_MESSAGE = (
+    "🛡 <b>Anti-scam check</b>\\n\\n"
+    "{MENTION} welcome to <b>{GROUP}</b>! Scammer bots are everywhere, so type this word "
+    "to unlock the group:\\n\\n"
+    "<code>{WORD}</code>\\n\\n"
+    "⏳ You have {MINUTES} minutes · {LEFT} attempts left."
+)
+# Short, unambiguous words: the challenge must be easy to type on a phone.
+CAPTCHA_WORDS = (
+    "amber", "anchor", "apple", "beacon", "bison", "blossom", "bridge", "canyon",
+    "cedar", "cobalt", "comet", "coral", "crystal", "dahlia", "delta", "desert",
+    "ember", "falcon", "fjord", "forest", "garden", "glacier", "harbor", "hazel",
+    "horizon", "iris", "ivory", "jade", "jungle", "kettle", "lagoon", "lantern",
+    "lilac", "meadow", "mesa", "mint", "moss", "nectar", "nimbus", "ocean",
+    "olive", "onyx", "orchid", "panda", "pebble", "pepper", "petal", "pine",
+    "prairie", "quartz", "quiver", "raven", "reef", "river", "saffron", "sage",
+    "savanna", "scarlet", "sierra", "silver", "summit", "sunset", "thunder",
+    "tiger", "topaz", "tulip", "tundra", "valley", "velvet", "willow", "zephyr",
+)
+
+# Chat permissions used by the anti-scam check.  ``PENDING`` deliberately keeps
+# plain text enabled — Telegram mutes *everything* when can_send_messages is
+# False, and then nobody could ever type the word.
+PENDING_PERMISSIONS = ChatPermissions(can_send_messages=True)
+MUTED_PERMISSIONS = ChatPermissions.no_permissions()
+MEMBER_PERMISSIONS = ChatPermissions(
+    can_send_messages=True, can_send_audios=True, can_send_documents=True,
+    can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+    can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+    can_add_web_page_previews=True, can_invite_users=True,
+)
+
 DEFAULT_SETTINGS = {
     "show_liquidity": False,
     "show_buttons": True,
@@ -233,6 +296,14 @@ DEFAULT_SETTINGS = {
     # ── look of the buttons and the post ──
     "button_icons": {},            # {"🟢": {"icon": "<custom emoji id>", "style": "success"}}
     "post_photo": "",              # banner for the group post: file_id or https URL
+    # ── reposting what the admin sends in the private chat ──
+    "forward_target": "group",     # "off" | "group" | "channel" | "both"
+    # ── anti-scam verification for new members ──
+    "captcha_enabled": True,       # mute new members until they type a random word
+    "captcha_message": "",         # empty = DEFAULT_CAPTCHA_MESSAGE
+    "captcha_attempts": 3,         # wrong words before the member is muted/removed
+    "captcha_timeout": 5,          # minutes before a pending challenge expires
+    "captcha_action": "restrict",  # what happens then: "restrict" | "kick" | "ban"
 }
 
 def clean_extra_button_label(value) -> str:
@@ -453,6 +524,135 @@ def post_banner() -> str:
     return clean_banner(get_settings().get("post_photo"))
 
 
+# ── destinations: the group and the optional channel ────────────────────────
+def chat_of(kind: str):
+    """The chat id set for a destination (``"group"`` / ``"channel"``), or None."""
+    return state.get(CHAT_ID.get(kind, "group"))
+
+def chat_title_of(kind: str) -> str:
+    return state.get(CHAT_TITLE.get(kind, "group_title")) or ""
+
+def post_targets() -> list[tuple[str, int]]:
+    """Every chat the price report is posted to, in order."""
+    out = []
+    for kind in DESTINATIONS:
+        chat_id = chat_of(kind)
+        # a group and its linked channel share nothing here: both are posted to
+        if isinstance(chat_id, int) and chat_id not in [c for _, c in out]:
+            out.append((kind, chat_id))
+    return out
+
+def destination_label(kind: str) -> str:
+    """A human name for a destination, e.g. ``"channel @p2p_rates"``."""
+    title = chat_title_of(kind)
+    return f"{kind} {title}" if title else kind
+
+
+# ── auto-forward: where an admin's private message is reposted ───────────────
+def forward_target() -> str:
+    target = get_settings().get("forward_target")
+    return target if target in FORWARD_TARGETS else DEFAULT_SETTINGS["forward_target"]
+
+def cycle_forward_target() -> str:
+    """📤 Auto-forward button: group → channel → both → off."""
+    order = ("group", "channel", "both", "off")
+    chosen = order[(order.index(forward_target()) + 1) % len(order)]
+    state["settings"]["forward_target"] = chosen
+    save()
+    return chosen
+
+def forward_targets() -> list[tuple[str, int]]:
+    """Where a forwarded admin message goes (empty = forwarding is off)."""
+    target = forward_target()
+    wanted = {"group": ("group",), "channel": ("channel",), "both": DESTINATIONS}.get(target, ())
+    return [(kind, chat_id) for kind, chat_id in post_targets() if kind in wanted]
+
+def forward_label() -> str:
+    return FORWARD_LABELS[forward_target()]
+
+def remember_forward(token: str, messages: list[dict]) -> None:
+    """Keep what a 📤 repost created so 🗑 Undo can delete it again."""
+    history = state.setdefault("forwards", {})
+    if not isinstance(history, dict):
+        history = {}
+    history[token] = {"messages": messages, "ts": int(time.time())}
+    for old in sorted(history, key=lambda k: history[k].get("ts") or 0)[:-MAX_FORWARD_HISTORY]:
+        history.pop(old, None)
+    state["forwards"] = history
+
+
+# ── anti-scam verification (captcha) settings ───────────────────────────────
+def clean_captcha_message(value) -> str:
+    """The custom challenge text: plain HTML Telegram can send, or \"\" = default."""
+    text = str(value or "").strip()
+    if not text or len(text) > MAX_CAPTCHA_LENGTH:
+        return ""
+    return text
+
+def _clean_choice(value, choices, default):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number in choices else default
+
+def captcha_message() -> str:
+    return clean_captcha_message(get_settings().get("captcha_message")) or DEFAULT_CAPTCHA_MESSAGE
+
+def captcha_attempts() -> int:
+    return _clean_choice(get_settings().get("captcha_attempts"),
+                         CAPTCHA_ATTEMPT_CHOICES, DEFAULT_SETTINGS["captcha_attempts"])
+
+def captcha_timeout() -> int:
+    """Minutes a new member gets to type the word."""
+    return _clean_choice(get_settings().get("captcha_timeout"),
+                         CAPTCHA_TIMEOUT_CHOICES, DEFAULT_SETTINGS["captcha_timeout"])
+
+def captcha_action() -> str:
+    action = get_settings().get("captcha_action")
+    return action if action in CAPTCHA_ACTIONS else DEFAULT_SETTINGS["captcha_action"]
+
+def captcha_enabled() -> bool:
+    return get_settings().get("captcha_enabled", True) is not False
+
+def new_captcha_word() -> str:
+    """A random, easy-to-type word, e.g. ``"tiger4821"``."""
+    return f"{secrets.choice(CAPTCHA_WORDS)}{secrets.randbelow(9000) + 1000}"
+
+def captcha_key(chat_id, user_id) -> str:
+    return f"{int(chat_id)}:{int(user_id)}"
+
+def pending_captchas() -> dict:
+    records = state.get("captcha")
+    return records if isinstance(records, dict) else {}
+
+def pending_captcha(chat_id, user_id) -> dict | None:
+    record = pending_captchas().get(captcha_key(chat_id, user_id))
+    return record if isinstance(record, dict) else None
+
+def captcha_word_matches(answer: str, word: str) -> bool:
+    """Case- and punctuation-insensitive: phones capitalise and add spaces."""
+    def normalise(text):
+        return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+    return bool(word) and normalise(answer) == normalise(word)
+
+def render_captcha(tpl: str, *, word: str, name: str, user_id, group: str,
+                   minutes: int, left: int) -> str:
+    """Fill the challenge template. Single pass — inserted text is not re-scanned."""
+    mapping = {
+        "WORD": word, "word": word.lower(),
+        "NAME": html_escape(name), "name": name,
+        "MENTION": f'<a href="tg://user?id={int(user_id)}">{html_escape(name)}</a>',
+        "USER_ID": str(int(user_id)),
+        "GROUP": html_escape(group or "the group"), "group": html_escape(group or "the group"),
+        "MINUTES": str(minutes), "minutes": str(minutes),
+        "ATTEMPTS": str(captcha_attempts()), "LEFT": str(max(left, 0)), "left": str(max(left, 0)),
+    }
+    keys = sorted(mapping, key=len, reverse=True)
+    pattern = re.compile(r"\{(" + "|".join(re.escape(k) for k in keys) + r")\}")
+    return apply_template(pattern.sub(lambda m: mapping[m.group(1)], tpl))
+
+
 def custom_emoji_id(message) -> str:
     """The custom emoji id inside a message: text, caption, or emoji sticker.
 
@@ -507,9 +707,15 @@ async def send_report(bot, chat_id, text, kb, rebuild=None):
 
 
 def empty_state():
-    return {"group": None, "auto": False, "merchants": {}, "last": {}, "edits": {},
+    return {"group": None, "group_title": "", "channel": None, "channel_title": "",
+            "auto": False, "merchants": {}, "last": {}, "channel_last": {}, "edits": {},
             "settings": deepcopy(DEFAULT_SETTINGS), "link_target_version": LINK_TARGET_VERSION,
-            "last_msg_id": None, "last_msg_time": None}
+            "last_msg_id": None, "last_msg_time": None,
+            "channel_last_msg_id": None, "channel_last_msg_time": None,
+            # anti-scam: {chat_id:user_id → {word, tries, msg_id, expires, …}}
+            "captcha": {},
+            # 📤 Undo for messages the admin had reposted to the group/channel
+            "forwards": {}}
 
 
 def load():
@@ -544,20 +750,55 @@ def load():
     data["settings"]["post_photo"] = clean_banner(data["settings"].get("post_photo"))
     if data["settings"].get("btn_link_mode") not in ("ad", "profile"):
         data["settings"]["btn_link_mode"] = DEFAULT_SETTINGS["btn_link_mode"]
+    # ── destinations, auto-forward and the anti-scam check ──
+    if data["settings"].get("forward_target") not in FORWARD_TARGETS:
+        data["settings"]["forward_target"] = DEFAULT_SETTINGS["forward_target"]
+    data["settings"]["captcha_message"] = clean_captcha_message(data["settings"].get("captcha_message"))
+    data["settings"]["captcha_attempts"] = _clean_choice(
+        data["settings"].get("captcha_attempts"),
+        CAPTCHA_ATTEMPT_CHOICES, DEFAULT_SETTINGS["captcha_attempts"])
+    data["settings"]["captcha_timeout"] = _clean_choice(
+        data["settings"].get("captcha_timeout"),
+        CAPTCHA_TIMEOUT_CHOICES, DEFAULT_SETTINGS["captcha_timeout"])
+    if data["settings"].get("captcha_action") not in CAPTCHA_ACTIONS:
+        data["settings"]["captcha_action"] = DEFAULT_SETTINGS["captcha_action"]
+    if not isinstance(data["settings"].get("captcha_enabled"), bool):
+        data["settings"]["captcha_enabled"] = DEFAULT_SETTINGS["captcha_enabled"]
     if "last" not in data:
         data["last"] = {}
+    if "channel_last" not in data or not isinstance(data.get("channel_last"), dict):
+        data["channel_last"] = {}
     if "merchants" not in data:
         data["merchants"] = {}
     if "auto" not in data:
         data["auto"] = False
     if "group" not in data:
         data["group"] = None
+    if "group_title" not in data:
+        data["group_title"] = ""
+    if "channel" not in data:
+        data["channel"] = None
+    if "channel_title" not in data:
+        data["channel_title"] = ""
     if "last_msg_id" not in data:
         data["last_msg_id"] = None
     if "last_msg_time" not in data:
         data["last_msg_time"] = None
+    if "channel_last_msg_id" not in data:
+        data["channel_last_msg_id"] = None
+    if "channel_last_msg_time" not in data:
+        data["channel_last_msg_time"] = None
     if not isinstance(data.get("edits"), dict):
         data["edits"] = {}
+    # Drop anything malformed: a stale record would lock a member out forever.
+    clean = {}
+    for key, record in (data.get("captcha") or {}).items() if isinstance(data.get("captcha"), dict) else ():
+        if (isinstance(record, dict) and isinstance(key, str)
+                and re.fullmatch(r"-?\d+:\d+", key) and record.get("word")):
+            clean[key] = record
+    data["captcha"] = clean
+    if not isinstance(data.get("forwards"), dict):
+        data["forwards"] = {}
     return data
 
 def save():
@@ -731,6 +972,19 @@ def set_group_button():
         return B(label, url=f"https://t.me/{BOT_USERNAME}?startgroup=setgroup")
     return B(label, callback_data="setgroup_help")
 
+def set_channel_button():
+    """Deep link that adds the bot to a channel with the rights it needs.
+
+    A bot cannot be invited to a channel by hand from the chat itself — the
+    ``startchannel`` link asks Telegram to add it *and* to grant the
+    post/delete permissions the price post needs.
+    """
+    label = "📢 Change channel" if state["channel"] else "📢 Set channel"
+    if BOT_USERNAME:
+        return B(label, url=f"https://t.me/{BOT_USERNAME}?startchannel=setchannel"
+                            "&admin=post_messages+edit_messages+delete_messages")
+    return B(label, callback_data="setchannel_help")
+
 def database_button():
     """The link to the page where a database is connected (Vercel → Storage)."""
     return B("🔌 Connect database ↗", url=database_link())
@@ -743,6 +997,7 @@ def panel():
         [B("📊 Post prices now", callback_data="post"),
          B(f"{'🟢' if a else '🔴'} Auto: {'ON' if a else 'OFF'}", callback_data="auto")],
         [B("📋 Merchants", callback_data="list"), set_group_button()],
+        [set_channel_button(), B("🛡 Anti-scam", callback_data="antiscam")],
         [B("⚙️ Settings", callback_data="settings"), B("📝 Custom Msg", callback_data="custom_menu")],
         [B(f"{liq_icon} Liquidity: {'ON' if s.get('show_liquidity') else 'OFF'}", callback_data="toggle_liquidity"),
          B(f"🔘 Buttons: {'ON' if s.get('show_buttons') else 'OFF'}", callback_data="toggle_buttons")],
@@ -772,6 +1027,8 @@ def settings_kb():
         [B(f"🗄 Database: {'connected ✅' if db_is_persistent() else 'connect ⚠️'}", callback_data="database")],
         [B("🖼 Button icons", callback_data="button_icons"),
          B("🖼 Post banner", callback_data="banner_menu")],
+        [set_channel_button(), B("🛡 Anti-scam", callback_data="antiscam")],
+        [B(f"📤 Auto-forward: {forward_label()}", callback_data="toggle_forward_target")],
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="panel")]
     ])
 
@@ -928,13 +1185,64 @@ def on_vercel() -> bool:
     return bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV") or os.getenv("VERCEL_URL")
                 or os.getenv("VERCEL_PROJECT_PRODUCTION_URL"))
 
+
+# ── 🛡 Anti-scam verification ───────────────────────────────────────────────
+# New members are muted the moment they join and have to type a random word.
+# Two details make this work with Telegram's permission model:
+#   • can_send_messages=False mutes *everything*, so a pending member keeps text
+#     enabled and is blocked from links, media and stickers instead — the bot
+#     deletes every wrong word straight away.
+#   • a failed/expired challenge is decided by the admin (mute / kick / ban),
+#     never automatically, so a real user who mistyped is not thrown out.
+def antiscam_text():
+    pending = [r for r in pending_captchas().values() if not r.get("locked")]
+    locked = [r for r in pending_captchas().values() if r.get("locked")]
+    custom = bool(clean_captcha_message(get_settings().get("captcha_message")))
+    message = captcha_message()
+    shown = message if len(message) <= 300 else message[:299] + "…"
+    return (
+        f"🛡 <b>Anti-scam verification</b>\n\n"
+        f"When somebody joins the group, the bot mutes them and asks for a random word. "
+        f"Only after they type it can they post links, photos or stickers.\n\n"
+        f"Verification: <b>{'ON ✅' if captcha_enabled() else 'OFF ❌'}</b>\n"
+        f"Wrong words allowed: <b>{captcha_attempts()}</b> · time limit: "
+        f"<b>{captcha_timeout()} min</b>\n"
+        f"On failure: <b>{CAPTCHA_ACTION_TITLES[captcha_action()]}</b>\n"
+        f"Waiting now: <b>{len(pending)}</b> · waiting for you: <b>{len(locked)}</b>\n\n"
+        f"<b>Challenge message</b> ({'custom' if custom else 'default'}):\n"
+        f"<code>{html_escape(shown)}</code>\n\n"
+        f"Placeholders: <code>{{WORD}}</code> <code>{{MENTION}}</code> <code>{{NAME}}</code> "
+        f"<code>{{GROUP}}</code> <code>{{MINUTES}}</code> <code>{{LEFT}}</code> "
+        f"<code>{{ASSET}}</code> <code>{{FIAT}}</code>\n"
+        f"<code>{{WORD}}</code> is required — without it nobody could ever pass.\n\n"
+        f"ℹ️ The bot needs to be a group admin with <b>Restrict members</b> and "
+        f"<b>Delete messages</b>; without them it simply skips the check."
+    )
+
+def antiscam_kb():
+    return KB([
+        [B(f"🛡 Verification: {'ON ✅' if captcha_enabled() else 'OFF ❌'}",
+           callback_data="captcha_toggle")],
+        [B("📝 Edit challenge message", callback_data="captcha_edit"),
+         B("♻️ Reset message", callback_data="captcha_reset")],
+        [B(f"🔢 Attempts: {captcha_attempts()}", callback_data="captcha_attempts"),
+         B(f"⏰ Timeout: {captcha_timeout()} min", callback_data="captcha_timeout")],
+        [B(f"🚫 On failure: {CAPTCHA_ACTION_SHORT[captcha_action()]}",
+           callback_data="captcha_action")],
+        [B("👁 Preview challenge", callback_data="captcha_preview")],
+        [B("⬅️ Back", callback_data="panel")],
+    ])
+
 # ── 🖼 Button icons & post banner (admin screens) ───────────────────────────
 # The labels of these two screens themselves.  They are listed here instead of
 # reading their keyboards: those screens are built from this list, so building
 # them here would recurse.
 ICON_SCREEN_LABELS = ("🖼 Button icons", "🖼 Post banner", "👁 Send a test",
                       "📤 Send a photo", "🔗 Use an image URL", "🗑 Remove banner",
-                      "🖼 Set / replace icon", "🎨 Colour: green 🟢", "🗑 Remove icon")
+                      "🖼 Set / replace icon", "🎨 Colour: green 🟢", "🗑 Remove icon",
+                      "🛡 Anti-scam", "📢 Set channel", "📢 Change channel",
+                      "📝 Edit challenge message", "♻️ Reset message",
+                      "👁 Preview challenge", "✅ Approve", "🚫 Kick")
 
 
 def button_labels() -> list[str]:
@@ -946,7 +1254,7 @@ def button_labels() -> list[str]:
     labels = [buy_label_tpl(), sell_label_tpl()]
     labels += [button["label"] for button in extra_buttons()]
     for builder in (panel, settings_kb, buttons_menu_kb, extra_buttons_kb, adlink_menu_kb,
-                    custom_menu_kb, database_kb, list_kb):
+                    custom_menu_kb, database_kb, list_kb, antiscam_kb):
         try:
             keyboard = builder()
         except Exception as e:                        # pragma: no cover - defensive
@@ -1142,6 +1450,11 @@ def group_label():
     t = state.get("group_title")
     return f"{t} ({state['group']})" if t else str(state["group"])
 
+def channel_label():
+    if not state["channel"]: return None
+    t = state.get("channel_title")
+    return f"{t} ({state['channel']})" if t else str(state["channel"])
+
 def panel_text():
     g = group_label() or "not set — tap 👥 Set group below"
     s = get_settings()
@@ -1156,21 +1469,30 @@ def panel_text():
     body_short = (body[:60] + "…") if len(body) > 60 else body
     footer_short = (footer[:60] + "…") if len(footer) > 60 else footer
     last_msg = f"Last msg: {state.get('last_msg_id')}" if state.get('last_msg_id') else "No group msg yet"
+    pending = len([r for r in pending_captchas().values() if not r.get("locked")])
+    locked = len([r for r in pending_captchas().values() if r.get("locked")])
     return (
         f"🤖 <b>P2P Price Bot</b>\n"
         f"Group: <code>{g}</code>\n"
+        f"Channel: <code>{channel_label() or 'not set — tap 📢 Set channel'}</code>\n"
         f"Merchants: {len(state['merchants'])} · Pair: {ASSET}/{FIAT} · every {INTERVAL}s\n"
         f"🗄 Database: <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>"
         f"{'' if db_is_persistent() else ' — tap 🔌 Connect database'}\n"
         f"💧 Liquidity: <b>{liq}</b> · 🔘 Buttons: <b>{btns}</b> · 🗑 AutoDel: <b>{autodel}</b>\n"
         f"🔄 Btn order: <b>{order_label()}</b> · 🎯 Links: <b>{'EXACT AD' if link_mode() == 'ad' else 'PROFILE'}</b>\n"
         f"🚪 Del Join/Left msgs: <b>{joinleft}</b>\n"
+        f"📤 Auto-forward: <b>{forward_label()}</b> · 🛡 Verification: "
+        f"<b>{'ON' if captcha_enabled() else 'OFF'}</b>"
+        f"{f' ({pending} waiting' + (f', {locked} for you' if locked else '') + ')' if pending or locked else ''}\n"
         f"📝 Header: <code>{header_short}</code>\n"
         f"📝 Body: <code>{body_short}</code>\n"
         f"📝 Footer: <code>{footer_short}</code>\n"
         f"{last_msg}\n\n"
         f"➕ <b>Paste a merchant's public URL here to add it.</b>\n"
-        f"Use ⚙️ Settings to toggle options and 📝 Custom Msg to customize the full post (header, body, footer)."
+        + ("📤 Anything else you send here is reposted to <b>{0}</b> "
+           "(📤 Auto-forward in ⚙️ Settings).\n".format(forward_label())
+           if forward_target() != "off" else "")
+        + "Use ⚙️ Settings to toggle options and 📝 Custom Msg to customize the full post (header, body, footer)."
     )
 
 def settings_text():
@@ -1208,6 +1530,18 @@ def settings_text():
         f"   When ON, the bot deletes Telegram's \"user joined the group\" and\n"
         f"   \"user left the group\" service messages in your group.\n"
         f"   ⚠️ Bot must be a group admin with 'Delete messages' permission.\n\n"
+        f"📢 Channel: <b>{html_escape(channel_label() or 'not set')}</b>\n"
+        f"   The price post also goes to a channel when one is set — the group and\n"
+        f"   the channel each keep their own last message and auto-delete.\n\n"
+        f"📤 Auto-forward: <b>{forward_label()}</b>\n"
+        f"   Anything you send here (text, photo, video, sticker, file…) is reposted\n"
+        f"   to that chat, with a 🗑 Undo button. Tap it to cycle:\n"
+        f"   GROUP → CHANNEL → GROUP + CHANNEL → OFF.\n\n"
+        f"🛡 Anti-scam verification: <b>{'ON ✅' if captcha_enabled() else 'OFF ❌'}</b>\n"
+        f"   New members must type a random word before they can post links or media\n"
+        f"   ({captcha_attempts()} attempts, {captcha_timeout()} min, then "
+        f"{CAPTCHA_ACTION_TITLES[captcha_action()]}).\n"
+        f"   Tap 🛡 Anti-scam to change it and to write your own challenge message.\n\n"
         f"🗄 Database (state store): <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>\n"
         f"   <code>{html_escape(STORE.describe())}</code>\n"
         f"   Tap 🗄 Database for the connection link and what to do with it.\n\n"
@@ -1303,19 +1637,50 @@ def _set_group(chat):
     state["last"] = {}  # force a fresh post to the new group
     save()
 
-async def notify_admins(bot, text):
+def _set_channel(chat):
+    state["channel"] = chat.id
+    state["channel_title"] = chat.title or ""
+    state["channel_last"] = {}  # only the channel has to be posted to again
+    save()
+
+def _set_destination(kind: str, chat) -> bool:
+    """Register a group or a channel; False when it was already the current one."""
+    if chat_of(kind) == chat.id:
+        return False
+    (_set_group if kind == "group" else _set_channel)(chat)
+    return True
+
+def trusted(u) -> bool:
+    """Only bot admins may drive the bot — but a channel post has no sender.
+
+    Telegram (and PTB) report no ``from_user`` for channel posts, so a command
+    typed inside a channel cannot be attributed to anybody.  Only channel admins
+    can post there in the first place, which is the same level of trust.
+    """
+    user = u.effective_user
+    return True if user is None else user.id in ADMINS
+
+async def notify_admins(bot, text, reply_markup=None):
     for a in ADMINS:
-        try: await bot.send_message(a, text, parse_mode="HTML", reply_markup=panel())
+        try:
+            await bot.send_message(a, text, parse_mode="HTML",
+                                   reply_markup=panel() if reply_markup is None else reply_markup)
         except Exception: pass
 
 async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat = u.effective_chat
-    if chat.type in ("group", "supergroup"):
-        if c.args and c.args[0] == "setgroup":
-            if not is_admin(u): return
-            _set_group(chat)
-            await u.message.reply_text(f"✅ <b>{chat.title}</b> will receive price updates.", parse_mode="HTML")
-            await notify_admins(c.bot, f"✅ Group set to <b>{chat.title}</b>")
+    if chat.type in ("group", "supergroup", "channel"):
+        wanted = {"group": "setgroup", "supergroup": "setgroup", "channel": "setchannel"}[chat.type]
+        if c.args and c.args[0] == wanted:
+            if not trusted(u): return
+            kind = "channel" if chat.type == "channel" else "group"
+            _set_destination(kind, chat)
+            # a channel post has no message to reply to — sending is enough there
+            if u.effective_message:
+                await u.effective_message.reply_text(
+                    f"✅ <b>{chat.title}</b> will receive price updates.", parse_mode="HTML")
+            await notify_admins(c.bot, f"✅ {'Channel' if kind == 'channel' else 'Group'} set to "
+                                       f"<b>{html_escape(chat.title or '')}</b>")
         return
     if is_admin(u): await u.message.reply_html(panel_text(), reply_markup=panel())
     else: await u.message.reply_text("⛔ You are not authorized. Ask the bot admin to add your ID.")
@@ -1325,44 +1690,353 @@ async def setgroup(u: Update, c):
     if u.effective_chat.type == "private":
         return await u.message.reply_html("Use the 👥 <b>Set group</b> button, or send /setgroup inside your group.",
                                           reply_markup=panel())
+    if u.effective_chat.type == "channel":
+        return await u.message.reply_html("This is a channel — use /setchannel (or the 📢 Set channel button).",
+                                          reply_markup=panel())
     _set_group(u.effective_chat)
     await u.message.reply_text("✅ This group will receive price updates.")
+
+async def setchannel(u: Update, c):
+    """/setchannel — post the prices into this channel as well."""
+    chat = u.effective_chat
+    if chat.type == "private":
+        if not is_admin(u): return
+        return await u.message.reply_html(
+            "Use the 📢 <b>Set channel</b> button, or send /setchannel inside your channel.",
+            reply_markup=panel())
+    if chat.type != "channel":
+        return await u.message.reply_text("This chat is not a channel — use /setgroup here.")
+    if not trusted(u):
+        return
+    _set_channel(chat)
+    try:
+        await u.effective_message.reply_text("✅ This channel will receive price updates.")
+    except Exception:
+        pass
+    await notify_admins(c.bot, f"✅ Channel set to <b>{html_escape(chat.title or '')}</b>")
 
 async def on_my_chat_member(u: Update, c):
     m = u.my_chat_member
     chat = m.chat
-    if chat.type not in ("group", "supergroup"): return
+    if chat.type not in ("group", "supergroup", "channel"): return
+    kind = "channel" if chat.type == "channel" else "group"
     was, now = m.old_chat_member.status, m.new_chat_member.status
     joined = was in ("left", "kicked") and now in ("member", "administrator")
-    if joined and m.from_user and m.from_user.id in ADMINS and state["group"] != chat.id:
-        _set_group(chat)
+    if joined and m.from_user and m.from_user.id in ADMINS and _set_destination(kind, chat):
         try: await c.bot.send_message(chat.id, f"✅ <b>{chat.title}</b> will receive price updates.", parse_mode="HTML")
         except Exception: pass
-        await notify_admins(c.bot, f"✅ Group set to <b>{chat.title}</b>")
-    elif now in ("left", "kicked") and state["group"] == chat.id:
-        state["group"] = None; state["group_title"] = ""; save()
-        await notify_admins(c.bot, f"⚠️ Bot was removed from <b>{chat.title}</b> — group unset.")
+        await notify_admins(c.bot, f"✅ {'Channel' if kind == 'channel' else 'Group'} set to "
+                                   f"<b>{html_escape(chat.title or '')}</b>")
+    elif now in ("left", "kicked") and chat_of(kind) == chat.id:
+        state[CHAT_ID[kind]] = None
+        state[CHAT_TITLE[kind]] = ""
+        state[LAST_ID[kind]] = None
+        state[LAST_TIME[kind]] = None
+        state[SNAPSHOT[kind]] = {}
+        forget_captchas(chat.id)
+        save()
+        await notify_admins(c.bot, f"⚠️ Bot was removed from <b>{html_escape(chat.title or '')}</b> "
+                                   f"— {kind} unset.")
 
-# ── delete "X joined / left the group" service messages ──
+
+# ── 🛡 anti-scam verification ───────────────────────────────────────────────
+def forget_captchas(chat_id=None, user_id=None) -> int:
+    """Drop pending/failed records — of one chat, one member, or all of them."""
+    records = pending_captchas()
+    if chat_id is None and user_id is None:
+        removed = len(records)
+        state["captcha"] = {}
+        return removed
+    prefix = f"{int(chat_id)}:" if chat_id is not None else ""
+    keys = [key for key in records
+            if key.startswith(prefix) and (user_id is None or key == captcha_key(chat_id, user_id))]
+    for key in keys:
+        records.pop(key, None)
+    return len(keys)
+
+async def _safe(coroutine, *args, **kwargs):
+    """One Telegram call that must never take the bot down with it."""
+    try:
+        return await coroutine(*args, **kwargs)
+    except Exception as e:
+        log.debug("Anti-scam call failed: %s", e)
+        return None
+
+async def captcha_challenge(bot, chat, user) -> bool:
+    """Mute a new member and ask them for a word.  True = a challenge is pending."""
+    if getattr(user, "is_bot", False) or user.id in ADMINS:
+        return False
+    word = new_captcha_word()
+    try:
+        # text-only: everything a scammer posts (links, media, stickers) is off
+        await bot.restrict_chat_member(chat.id, user.id, PENDING_PERMISSIONS)
+    except Exception as e:
+        log.warning("Cannot restrict %s in %s (%s) — make the bot an admin with "
+                    "'Restrict members'; skipping the anti-scam check for them", user.id, chat.id, e)
+        return False
+    name = getattr(user, "full_name", None) or getattr(user, "first_name", None) or str(user.id)
+    # a re-join while a challenge is still open replaces it (and its message)
+    previous = pending_captcha(chat.id, user.id)
+    if previous:
+        await _safe(bot.delete_message, chat.id, previous.get("msg_id"))
+    text = render_captcha(captcha_message(), word=word, name=name, user_id=user.id,
+                          group=chat.title or "", minutes=captcha_timeout(),
+                          left=captcha_attempts())
+    record = {"word": word, "tries": 0, "name": name, "chat_title": chat.title or "",
+              "expires": int(time.time()) + captcha_timeout() * 60, "msg_id": None}
+    try:
+        sent = await bot.send_message(chat.id, text, parse_mode="HTML",
+                                      disable_web_page_preview=True)
+        record["msg_id"] = sent.message_id
+    except Exception as e:
+        log.warning("Could not send the anti-scam challenge in %s: %s", chat.id, e)
+        await _safe(bot.restrict_chat_member, chat.id, user.id, MEMBER_PERMISSIONS)
+        return False
+    state.setdefault("captcha", {})[captcha_key(chat.id, user.id)] = record
+    save()
+    log.info("Anti-scam challenge sent to %s (%s) in %s", name, user.id, chat.id)
+    return True
+
+async def captcha_pass(bot, chat, user, record, message=None):
+    """Correct word: unmute, clean up the challenge, welcome the member."""
+    key = captcha_key(chat.id, user.id)
+    state.get("captcha", {}).pop(key, None)
+    await _safe(bot.restrict_chat_member, chat.id, user.id, MEMBER_PERMISSIONS)
+    await _safe(bot.delete_message, chat.id, record.get("msg_id"))
+    if message is not None:
+        await _safe(message.delete)
+    note = await _safe(bot.send_message, chat.id,
+                       f"✅ <b>{html_escape(record.get('name') or 'Welcome')}</b> verified — "
+                       f"welcome to {html_escape(record.get('chat_title') or 'the group')}!",
+                       parse_mode="HTML")
+    save()
+    log.info("%s (%s) passed the anti-scam check in %s", record.get("name"), user.id, chat.id)
+    return note
+
+async def captcha_lock(bot, chat_id, user_id, reason: str):
+    """Out of attempts or out of time — apply what the admin configured."""
+    record = pending_captcha(chat_id, user_id)
+    if not record or record.get("locked"):
+        return False
+    record["locked"] = True
+    record["locked_at"] = int(time.time())
+    record["reason"] = reason
+    action = captcha_action()
+    if action == "kick":
+        await _safe(bot.ban_chat_member, chat_id, user_id)
+        await _safe(bot.unban_chat_member, chat_id, user_id)
+    elif action == "ban":
+        await _safe(bot.ban_chat_member, chat_id, user_id)
+    else:
+        await _safe(bot.restrict_chat_member, chat_id, user_id, MUTED_PERMISSIONS)
+    # replace the challenge with a short notice, so the group sees what happens
+    await _safe(bot.delete_message, chat_id, record.get("msg_id"))
+    record["msg_id"] = None
+    await notify_admins(bot, captcha_lock_text(record, chat_id, user_id),
+                        reply_markup=captcha_decision_kb(chat_id, user_id))
+    save()
+    log.info("Anti-scam check failed for %s (%s) in %s: %s → %s",
+             record.get("name"), user_id, chat_id, reason, action)
+    return True
+
+def captcha_lock_text(record: dict, chat_id, user_id) -> str:
+    name = html_escape(record.get("name") or "A new member")
+    where = html_escape(record.get("chat_title") or f"chat {chat_id}")
+    why = ("ran out of attempts" if record.get("reason") == "attempts"
+           else f"did not answer within {captcha_timeout()} minutes")
+    action = CAPTCHA_ACTION_TITLES[captcha_action()]
+    decision = ("They are <b>muted</b> in the group until you decide."
+                if captcha_action() == "restrict" else f"Action taken: <b>{action}</b>.")
+    return (f"🛡 <b>Anti-scam: {name}</b> {why} in <b>{where}</b>.\n\n"
+            f"{decision}\n"
+            f"{'Approve' if captcha_action() == 'restrict' else 'Unban'} them only if you "
+            f"are sure they are a real user.")
+
+def captcha_decision_kb(chat_id, user_id):
+    approve = "✅ Approve" if captcha_action() == "restrict" else "✅ Unban"
+    return KB([[B(approve, callback_data=f"cap_approve:{chat_id}:{user_id}"),
+                B("🚫 Kick", callback_data=f"cap_kick:{chat_id}:{user_id}")]])
+
+async def captcha_approve(bot, chat_id, user_id) -> str:
+    """Admin says yes: full member rights again."""
+    record = pending_captcha(chat_id, user_id) or {}
+    if captcha_action() == "ban":
+        await _safe(bot.unban_chat_member, chat_id, user_id)
+    await _safe(bot.restrict_chat_member, chat_id, user_id, MEMBER_PERMISSIONS)
+    await _safe(bot.delete_message, chat_id, record.get("msg_id"))
+    forget_captchas(chat_id, user_id)
+    save()
+    return html_escape(record.get("name") or "The member")
+
+async def captcha_kick(bot, chat_id, user_id) -> str:
+    """Admin says no: remove them from the group (they may rejoin)."""
+    record = pending_captcha(chat_id, user_id) or {}
+    await _safe(bot.delete_message, chat_id, record.get("msg_id"))
+    await _safe(bot.ban_chat_member, chat_id, user_id)
+    await _safe(bot.unban_chat_member, chat_id, user_id)
+    forget_captchas(chat_id, user_id)
+    save()
+    return html_escape(record.get("name") or "The member")
+
+async def captcha_fail_attempt(bot, chat, user, record, message) -> bool:
+    """A wrong word: delete it, count it, lock the member when they run out."""
+    record["tries"] = int(record.get("tries") or 0) + 1
+    if message is not None:
+        await _safe(message.delete)          # a scammer's message never stays up
+    left = captcha_attempts() - record["tries"]
+    if left <= 0:
+        await captcha_lock(bot, chat.id, user.id, "attempts")
+        return True
+    save()
+    # refresh the challenge so the member knows how many tries are left
+    try:
+        await bot.edit_message_text(
+            render_captcha(captcha_message(), word=record["word"],
+                           name=record.get("name") or "", user_id=user.id,
+                           group=record.get("chat_title") or "",
+                           minutes=captcha_timeout(), left=left),
+            chat_id=chat.id, message_id=record.get("msg_id"), parse_mode="HTML",
+            disable_web_page_preview=True)
+    except Exception as e:
+        log.debug("Could not refresh the challenge in %s: %s", chat.id, e)
+    return False
+
+async def sweep_captcha(bot) -> int:
+    """Expire timed-out challenges and forget ancient ones (no JobQueue needed)."""
+    now, changed, locked = int(time.time()), False, 0
+    for key, record in list(pending_captchas().items()):
+        if not isinstance(record, dict):                       # pragma: no cover - load() cleans
+            state["captcha"].pop(key, None); changed = True; continue
+        age = now - int(record.get("locked_at") or record.get("expires") or now)
+        if record.get("locked"):
+            if age > CAPTCHA_LOCK_TTL:
+                state["captcha"].pop(key, None); changed = True
+            continue
+        if now < int(record.get("expires") or 0):
+            continue
+        try:
+            chat_id, user_id = (int(part) for part in key.split(":", 1))
+        except ValueError:                                     # pragma: no cover - defensive
+            state["captcha"].pop(key, None); changed = True; continue
+        if await captcha_lock(bot, chat_id, user_id, "timeout"):
+            locked += 1
+        changed = True
+    if changed:
+        save()
+    return locked
+
+# ── 📤 auto-forward: repost what the admin sends here ───────────────────────
+def message_of(u):
+    """The message of an update — ``channel_post`` included (via effective_message)."""
+    return getattr(u, "effective_message", None) or getattr(u, "message", None)
+
+async def forward_to_targets(u, c) -> bool:
+    """Copy an admin's private message into the group / channel.
+
+    Returns True when it was reposted.  Anything the menus did not consume ends
+    up here, so a message sent to the bot reaches the group in one tap.
+    """
+    msg, chat = message_of(u), u.effective_chat
+    if not is_admin(u) or not msg or chat.type != "private":
+        return False
+    targets = forward_targets()
+    if not targets:
+        return False
+    sent, failed = [], []
+    for kind, chat_id in targets:
+        try:
+            copied = await c.bot.copy_message(chat_id=chat_id, from_chat_id=chat.id,
+                                              message_id=msg.message_id)
+            sent.append({"kind": kind, "chat_id": chat_id, "message_id": copied.message_id})
+        except Exception as e:
+            log.info("copy_message to %s failed (%s) — trying a real forward", kind, e)
+            try:
+                forwarded = await c.bot.forward_message(chat_id=chat_id, from_chat_id=chat.id,
+                                                        message_id=msg.message_id)
+                sent.append({"kind": kind, "chat_id": chat_id, "message_id": forwarded.message_id})
+            except Exception as e2:
+                log.warning("Could not forward the message to %s %s: %s", kind, chat_id, e2)
+                failed.append(f"{kind} ({e2})")
+    if not sent:
+        await msg.reply_text("⚠️ Nothing was sent — check that the bot can still post in the "
+                             f"{' and the '.join(k for k, _ in targets)}.\n" + "\n".join(failed))
+        return True      # the message was meant for the group; do not re-use it
+    token = secrets.token_hex(4)
+    remember_forward(token, sent)
+    names = " + ".join(dict.fromkeys(destination_label(item["kind"]) for item in sent))
+    extra = "" if not failed else "\n\n⚠️ Not sent to: " + html_escape(", ".join(failed))
+    await msg.reply_html(f"📤 Sent to <b>{html_escape(names)}</b>.{extra}",
+                         reply_markup=KB([[B("🗑 Undo", callback_data=f"fwd_undo:{token}")]]))
+    log.info("Forwarded message %s from admin %s to %s", msg.message_id, u.effective_user.id, names)
+    return True
+
+async def on_private_media(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Anything else an admin sends privately → 📤 repost it to group/channel."""
+    await forward_to_targets(u, c)
+
+async def undo_forward(u, c, token: str) -> bool:
+    """🗑 Undo — delete what a 📤 repost created in the group / channel."""
+    history = state.get("forwards") or {}
+    entry = history.get(token) if isinstance(history, dict) else None
+    if not isinstance(entry, dict):
+        return False
+    for item in entry.get("messages") or []:
+        try:
+            await c.bot.delete_message(chat_id=item.get("chat_id"), message_id=item.get("message_id"))
+        except Exception as e:
+            log.debug("Could not delete forwarded message %s: %s", item.get("message_id"), e)
+    history.pop(token, None)
+    state["forwards"] = history
+    save()
+    return True
+
+# ── delete "X joined / left the group" service messages + run the check ─────
 async def on_join_left(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Auto-delete Telegram's join/leave service messages in the group."""
-    if not get_settings().get("delete_join_left", DEFAULT_SETTINGS["delete_join_left"]):
-        return
-    msg, chat = u.effective_message, u.effective_chat
+    """Auto-delete Telegram's join/leave service messages and verify newcomers."""
+    msg, chat = message_of(u), u.effective_chat
     if not msg or not chat or chat.type not in ("group", "supergroup"):
         return
     # only in the registered group (if one is set)
     if state.get("group") and chat.id != state["group"]:
         return
-    try:
-        await msg.delete()
-        kind = "joined" if msg.new_chat_members else "left"
-        member = msg.new_chat_members[0] if msg.new_chat_members else msg.left_chat_member
-        log.info("Deleted '%s the group' service message for %s in %s",
-                 kind, getattr(member, "full_name", "?"), chat.id)
-    except Exception as e:
-        log.warning("Could not delete join/left msg in %s: %s "
-                    "(make the bot a group admin with 'Delete messages' permission)", chat.id, e)
+    if get_settings().get("delete_join_left", DEFAULT_SETTINGS["delete_join_left"]):
+        try:
+            await msg.delete()
+            kind = "joined" if msg.new_chat_members else "left"
+            member = msg.new_chat_members[0] if msg.new_chat_members else msg.left_chat_member
+            log.info("Deleted '%s the group' service message for %s in %s",
+                     kind, getattr(member, "full_name", "?"), chat.id)
+        except Exception as e:
+            log.warning("Could not delete join/left msg in %s: %s "
+                        "(make the bot a group admin with 'Delete messages' permission)", chat.id, e)
+    left = getattr(msg, "left_chat_member", None)
+    if left is not None:
+        # they gave up: drop the pending record and its challenge message
+        record = pending_captcha(chat.id, left.id)
+        if record:
+            forget_captchas(chat.id, left.id)
+            await _safe(c.bot.delete_message, chat.id, record.get("msg_id"))
+            save()
+        return
+    await sweep_captcha(c.bot)
+    if not captcha_enabled():
+        return
+    for member in getattr(msg, "new_chat_members", None) or []:
+        await captcha_challenge(c.bot, chat, member)
+
+async def on_group_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """A message in the group: is it somebody answering their anti-scam check?"""
+    msg, chat, user = message_of(u), u.effective_chat, u.effective_user
+    if not msg or not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+    await sweep_captcha(c.bot)
+    record = pending_captcha(chat.id, user.id)
+    if not record or record.get("locked"):
+        return
+    if captcha_word_matches((msg.text or msg.caption or ""), record["word"]):
+        await captcha_pass(c.bot, chat, user, record, msg)
+    else:
+        await captcha_fail_attempt(c.bot, chat, user, record, msg)
 
 # ── custom message helpers ──
 def apply_template(text: str) -> str:
@@ -1432,9 +2106,11 @@ def icon_saved_reply(key: str, emoji_id: str):
 
 
 async def on_photo(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """An admin sends a photo → the post banner (private chat, only when asked)."""
+    """An admin sends a photo → the post banner, or 📤 a repost to the group."""
     if not is_admin(u) or u.effective_chat.type != "private": return
-    if edit_get(u, "awaiting_custom") != "banner_photo": return
+    if edit_get(u, "awaiting_custom") != "banner_photo":
+        await forward_to_targets(u, c)
+        return
     photos = u.message.photo or []
     if not photos: return
     state["settings"]["post_photo"] = photos[-1].file_id       # largest size Telegram sent
@@ -1447,7 +2123,9 @@ async def on_sticker(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """A premium emoji sticker is exactly what a button icon is — accept one."""
     if not is_admin(u) or u.effective_chat.type != "private": return
     awaiting = edit_get(u, "awaiting_custom")
-    if not isinstance(awaiting, str) or not awaiting.startswith("icon:"): return
+    if not isinstance(awaiting, str) or not awaiting.startswith("icon:"):
+        await forward_to_targets(u, c)   # not an icon → 📤 repost it instead
+        return
     key = icon_key(awaiting.split(":", 1)[1])
     emoji_id = custom_emoji_id(u.message)
     if not key or not emoji_id:
@@ -1551,6 +2229,26 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await u.message.reply_html("✅ Button saved.\n\n" + extra_button_text(button),
                                            reply_markup=extra_button_kb(button["id"]))
 
+    if awaiting == "captcha_message":
+        if txt.lower() == "/cancel":
+            edit_pop(u, "awaiting_custom")
+            return await u.message.reply_text("❌ Cancelled.", reply_markup=antiscam_kb())
+        value = "" if txt.lower() in ("default", "reset", "-", "none") else txt
+        if value and "{WORD}" not in value:
+            # without the word nobody could ever pass the check
+            return await u.message.reply_html(
+                "❌ The challenge must contain <code>{WORD}</code> — that is the random word "
+                "the member has to type. Try again, or /cancel.")
+        if len(value) > MAX_CAPTCHA_LENGTH:
+            return await u.message.reply_text(
+                f"❌ Too long (max {MAX_CAPTCHA_LENGTH} characters). Try again, or /cancel.")
+        state["settings"]["captcha_message"] = clean_captcha_message(value)
+        save()
+        edit_pop(u, "awaiting_custom")
+        await u.message.reply_html("✅ Challenge message saved.\\n\\n" + antiscam_text(),
+                                   reply_markup=antiscam_kb())
+        return
+
     if awaiting in ("header", "body", "footer"):
         if txt.lower() == "/cancel":
             edit_pop(u, "awaiting_custom")
@@ -1632,7 +2330,12 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     m = parse_url(txt, ASSET, FIAT)
     if not m:
-        return await u.message.reply_text("❌ Not a supported merchant URL (Binance / Bybit / OKX / Bitget).   /start")
+        # not a merchant URL — 📤 repost it to the group / channel when that is on
+        if await forward_to_targets(u, c):
+            return
+        return await u.message.reply_text(
+            "❌ Not a supported merchant URL (Binance / Bybit / OKX / Bitget).   /start\n"
+            "📤 Turn on auto-forward in ⚙️ Settings to repost messages like this one instead.")
     msg = await u.message.reply_text("⏳ Checking merchant…")
     async with httpx.AsyncClient(headers=HEADERS, timeout=15) as cl:
         r = await fetch(cl, m)
@@ -1815,31 +2518,37 @@ def report_keyboard(prices):
     return KB(rows) if rows else None
 
 # ── deletion helpers ──
-async def delete_last_group_message(bot):
-    """Delete previous price message in group if exists"""
-    gid = state.get("group")
-    mid = state.get("last_msg_id")
-    if not gid or not mid:
+async def delete_last_message(bot, kind: str = "group"):
+    """Delete the previous price message in a destination (group or channel)."""
+    chat_id = chat_of(kind)
+    mid = state.get(LAST_ID[kind])
+    if not chat_id or not mid:
         return False
     try:
-        await bot.delete_message(chat_id=gid, message_id=mid)
-        log.info(f"Deleted previous group message {mid} in {gid}")
-        state["last_msg_id"] = None
-        state["last_msg_time"] = None
+        await bot.delete_message(chat_id=chat_id, message_id=mid)
+        log.info("Deleted previous %s message %s in %s", kind, mid, chat_id)
+        state[LAST_ID[kind]] = None
+        state[LAST_TIME[kind]] = None
         save()
         return True
     except Exception as e:
         # message may already be deleted or bot not admin
-        log.debug(f"Could not delete msg {mid}: {e}")
+        log.debug("Could not delete msg %s: %s", mid, e)
         # if message not found, clear state to avoid repeated attempts
         if "not found" in str(e).lower() or "message to delete not found" in str(e).lower() or "BadRequest" in str(type(e)):
-            state["last_msg_id"] = None
-            state["last_msg_time"] = None
+            state[LAST_ID[kind]] = None
+            state[LAST_TIME[kind]] = None
             save()
         return False
 
+async def delete_last_group_message(bot):
+    """Delete the previous price message in the group (the classic behaviour)."""
+    return await delete_last_message(bot, "group")
+
 async def post(bot, force=False):
-    if not state["group"] or not state["merchants"]: return False
+    if not state["merchants"]: return False
+    targets = post_targets()
+    if not targets: return False
     prices = await get_prices()
     s = get_settings()
     # the ad id is part of the snapshot: when the cheapest/most expensive ad of a
@@ -1868,30 +2577,38 @@ async def post(bot, force=False):
     snap["_price_links"] = bool(s.get("price_links", True))
     snap["_photo"] = post_banner()      # changing the banner must repost too
     snap["_button_icons"] = button_icons()
-    if not force and snap == state["last"]: return False
-    state["last"] = snap; save()
-
-    # Delete previous message if auto_delete enabled (refresh button or update time)
-    if s.get("auto_delete", True):
-        await delete_last_group_message(bot)
+    # The group and the channel each keep their own copy of the snapshot, so a
+    # channel added later gets its own post without reposting to the group.
+    due = [kind for kind, _ in targets
+           if force or snap != state.get(SNAPSHOT[kind])]
+    if not due: return False
 
     text = report(prices)
     kb = report_keyboard(prices)
-    try:
-        # send_report adds the banner photo when one is configured and the report
-        # fits in a caption (see CAPTION_LIMIT); rebuild() lets it retry with
-        # plain buttons if Telegram refuses the icons
-        sent = await send_report(bot, state["group"], text, kb,
-                                 rebuild=lambda: report_keyboard(prices))
-        # store new message id and time
-        state["last_msg_id"] = sent.message_id
-        state["last_msg_time"] = int(time.time())
+    ok = False
+    for kind, chat_id in targets:
+        if kind not in due:
+            continue
+        state[SNAPSHOT[kind]] = deepcopy(snap)
         save()
-        log.info(f"Posted new price message {sent.message_id} to group {state['group']}")
-    except Exception as e:
-        log.warning(f"Failed to post to group: {e}")
-        return False
-    return True
+        # Delete previous message if auto_delete enabled (refresh button or update time)
+        if s.get("auto_delete", True):
+            await delete_last_message(bot, kind)
+        try:
+            # send_report adds the banner photo when one is configured and the
+            # report fits in a caption (see CAPTION_LIMIT); rebuild() lets it
+            # retry with plain buttons if Telegram refuses the icons
+            sent = await send_report(bot, chat_id, text, kb,
+                                     rebuild=lambda: report_keyboard(prices))
+            # store new message id and time
+            state[LAST_ID[kind]] = sent.message_id
+            state[LAST_TIME[kind]] = int(time.time())
+            save()
+            log.info("Posted new price message %s to %s %s", sent.message_id, kind, chat_id)
+            ok = True
+        except Exception as e:
+            log.warning("Failed to post to %s %s: %s", kind, chat_id, e)
+    return ok
 
 async def auto_post_task(bot) -> bool:
     """Post prices when auto mode is on (and the snapshot changed)."""
@@ -1900,32 +2617,34 @@ async def auto_post_task(bot) -> bool:
     return bool(await post(bot))
 
 async def cleanup_task(bot) -> bool:
-    """Delete the group message once it is older than delete_after_hours."""
+    """Delete group/channel messages once they are older than delete_after_hours."""
     s = get_settings()
     hours = s.get("delete_after_hours", 24)
     if hours <= 0:
         return False  # disabled
-    last_time = state.get("last_msg_time")
-    if not last_time or not state.get("last_msg_id") or not state.get("group"):
-        return False
-    now = int(time.time())
-    if now - last_time < hours * 3600:
-        return False
-    log.info(f"Message {state['last_msg_id']} is older than {hours}h, auto-deleting")
-    try:
-        await bot.delete_message(chat_id=state["group"], message_id=state["last_msg_id"])
-        state["last_msg_id"] = None
-        state["last_msg_time"] = None
-        save()
-        return True
-    except Exception as e:
-        log.debug(f"Cleanup delete failed: {e}")
-        # clear if not found
-        if "not found" in str(e).lower():
-            state["last_msg_id"] = None
-            state["last_msg_time"] = None
+    now, done = int(time.time()), False
+    for kind in DESTINATIONS:
+        chat_id, last_time = chat_of(kind), state.get(LAST_TIME[kind])
+        if not chat_id or not last_time or not state.get(LAST_ID[kind]):
+            continue
+        if now - last_time < hours * 3600:
+            continue
+        log.info("%s message %s is older than %sh, auto-deleting",
+                 kind.capitalize(), state[LAST_ID[kind]], hours)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=state[LAST_ID[kind]])
+            state[LAST_ID[kind]] = None
+            state[LAST_TIME[kind]] = None
             save()
-        return False
+            done = True
+        except Exception as e:
+            log.debug("Cleanup delete failed: %s", e)
+            # clear if not found
+            if "not found" in str(e).lower():
+                state[LAST_ID[kind]] = None
+                state[LAST_TIME[kind]] = None
+                save()
+    return done
 
 # ── scheduled work ──
 async def job(c: ContextTypes.DEFAULT_TYPE):
@@ -1936,11 +2655,15 @@ async def job(c: ContextTypes.DEFAULT_TYPE):
         log.warning("auto post failed: %s", e)
 
 async def cleanup_job(c: ContextTypes.DEFAULT_TYPE):
-    """PTB JobQueue callback — deletes stale group messages."""
+    """PTB JobQueue callback — deletes stale posts, expires anti-scam checks."""
     try:
         await cleanup_task(c.bot)
     except Exception as e:
         log.warning("cleanup failed: %s", e)
+    try:
+        await sweep_captcha(c.bot)
+    except Exception as e:
+        log.warning("anti-scam sweep failed: %s", e)
 
 # ── buttons ──
 def list_kb():
@@ -1955,13 +2678,116 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     if d == "post":
         ok = await post(c.bot, force=True)
-        await q.answer("✅ Posted!" if ok else "⚠️ Set group (/setgroup) and add merchants first", show_alert=not ok)
+        await q.answer("✅ Posted!" if ok else "⚠️ Set a group/channel and add merchants first",
+                       show_alert=not ok)
 
     elif d == "auto":
         state["auto"] = not state["auto"]; save(); await q.answer(f"Auto {'ON' if state['auto'] else 'OFF'}")
 
     elif d == "setgroup_help":
         return await q.answer("Add the bot to your group, then send /setgroup there.", show_alert=True)
+
+    elif d == "setchannel_help":
+        return await q.answer("Add the bot to your channel as an admin (it needs the right to "
+                              "post and delete messages), then send /setchannel there.",
+                              show_alert=True)
+
+    elif d == "antiscam":
+        if edit_get(u, "awaiting_custom"):
+            edit_pop(u, "awaiting_custom")
+        await q.answer()
+        return await q.edit_message_text(antiscam_text(), parse_mode="HTML", reply_markup=antiscam_kb())
+
+    elif d == "captcha_toggle":
+        state["settings"]["captcha_enabled"] = not captcha_enabled()
+        save()
+        await q.answer(f"Verification {'ON' if captcha_enabled() else 'OFF'}")
+        return await q.edit_message_text(antiscam_text(), parse_mode="HTML", reply_markup=antiscam_kb())
+
+    elif d == "captcha_edit":
+        edit_set(u, "awaiting_custom", "captcha_message")
+        await q.answer()
+        return await q.edit_message_text(
+            "🛡 <b>Send the challenge message</b>\n\n"
+            "Shown to every new member while they are muted. It <b>must</b> contain "
+            "<code>{WORD}</code> — that is where the random word goes.\n\n"
+            "Placeholders: <code>{WORD}</code> <code>{MENTION}</code> <code>{NAME}</code> "
+            "<code>{GROUP}</code> <code>{MINUTES}</code> <code>{LEFT}</code> "
+            "<code>{ASSET}</code> <code>{FIAT}</code> <code>{PAIR}</code>\n"
+            "HTML allowed: &lt;b&gt; &lt;i&gt; &lt;code&gt; &lt;a&gt;\n\n"
+            "Example:\n"
+            "<code>🛡 {MENTION} type <b>{WORD}</b> to join {GROUP} — {MINUTES} min</code>\n\n"
+            "Send /cancel to abort; send <code>default</code> to go back to the built-in text.",
+            parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="antiscam")]]))
+
+    elif d == "captcha_reset":
+        state["settings"]["captcha_message"] = ""
+        save()
+        await q.answer("♻️ Challenge message reset")
+        return await q.edit_message_text(antiscam_text(), parse_mode="HTML", reply_markup=antiscam_kb())
+
+    elif d == "captcha_attempts":
+        choices = CAPTCHA_ATTEMPT_CHOICES
+        state["settings"]["captcha_attempts"] = choices[
+            (choices.index(captcha_attempts()) + 1) % len(choices)]
+        save()
+        await q.answer(f"Attempts: {captcha_attempts()}")
+        return await q.edit_message_text(antiscam_text(), parse_mode="HTML", reply_markup=antiscam_kb())
+
+    elif d == "captcha_timeout":
+        choices = CAPTCHA_TIMEOUT_CHOICES
+        state["settings"]["captcha_timeout"] = choices[
+            (choices.index(captcha_timeout()) + 1) % len(choices)]
+        save()
+        await q.answer(f"Timeout: {captcha_timeout()} min")
+        return await q.edit_message_text(antiscam_text(), parse_mode="HTML", reply_markup=antiscam_kb())
+
+    elif d == "captcha_action":
+        state["settings"]["captcha_action"] = CAPTCHA_ACTIONS[
+            (CAPTCHA_ACTIONS.index(captcha_action()) + 1) % len(CAPTCHA_ACTIONS)]
+        save()
+        await q.answer(f"On failure: {CAPTCHA_ACTION_SHORT[captcha_action()]}")
+        return await q.edit_message_text(antiscam_text(), parse_mode="HTML", reply_markup=antiscam_kb())
+
+    elif d == "captcha_preview":
+        await q.answer("Sending a preview…")
+        return await captcha_preview(u, c)
+
+    elif d == "toggle_forward_target":
+        chosen = cycle_forward_target()
+        await q.answer(f"📤 Auto-forward: {FORWARD_LABELS[chosen]}")
+        try:
+            return await q.edit_message_text(settings_text(), parse_mode="HTML", reply_markup=settings_kb())
+        except Exception:
+            pass
+
+    elif d.startswith("fwd_undo:"):
+        done = await undo_forward(u, c, d.split(":", 1)[1])
+        await q.answer("🗑 Deleted" if done else "Already gone")
+        if done:
+            try:
+                return await q.edit_message_text("🗑 Deleted — the message is gone from the "
+                                                 "group/channel.", parse_mode="HTML")
+            except Exception:
+                pass
+        return
+
+    elif d.startswith("cap_approve:") or d.startswith("cap_kick:"):
+        approve = d.startswith("cap_approve:")
+        _, chat_id, user_id = d.split(":")
+        try:
+            chat_id, user_id = int(chat_id), int(user_id)
+        except ValueError:
+            return await q.answer("Bad request", show_alert=True)
+        who = (await captcha_approve(c.bot, chat_id, user_id) if approve
+               else await captcha_kick(c.bot, chat_id, user_id))
+        await q.answer("✅ Approved" if approve else "🚫 Removed", show_alert=True)
+        try:
+            verb = "approved" if approve else "kicked"
+            return await q.edit_message_text(f"{'✅' if approve else '🚫'} <b>{who}</b> {verb}.",
+                                             parse_mode="HTML")
+        except Exception:
+            pass
 
     elif d == "list":
         await q.answer()
@@ -1970,7 +2796,10 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
                                          parse_mode="HTML", reply_markup=list_kb())
 
     elif d.startswith("del:"):
-        state["merchants"].pop(d[4:], None); state["last"].pop(d[4:], None); save()
+        state["merchants"].pop(d[4:], None)
+        for key in SNAPSHOT.values():            # group and channel both repost
+            state[key].pop(d[4:], None)
+        save()
         await q.answer("🗑 Removed")
         return await q.edit_message_text("📋 <b>Merchants</b> — tap to remove" if state["merchants"]
                                          else "📋 No merchants yet.",
@@ -2469,6 +3298,23 @@ async def preview_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await send_report(c.bot, u.effective_chat.id, text, kb)
 
 
+async def captcha_preview(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Send the admin the anti-scam challenge with a sample word."""
+    chat_id = u.effective_user.id
+    word = new_captcha_word()
+    text = render_captcha(captcha_message(), word=word, name="New Member", user_id=chat_id,
+                          group=state.get("group_title") or "your group",
+                          minutes=captcha_timeout(), left=captcha_attempts())
+    await c.bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+    await c.bot.send_message(
+        chat_id,
+        "👆 That is what a new member sees in the group while they are muted "
+        "(the word is different every time).\n"
+        f"After <b>{captcha_attempts()}</b> wrong words or <b>{captcha_timeout()} minutes</b> "
+        f"the bot <b>{CAPTCHA_ACTION_TITLES[captcha_action()]}</b> and asks you what to do.",
+        parse_mode="HTML", reply_markup=antiscam_kb())
+
+
 async def banner_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Send the admin the post exactly as the group receives it, banner included."""
     if state["merchants"]:
@@ -2496,8 +3342,13 @@ async def post_init(application):
     log.info("Logged in as @%s", BOT_USERNAME)
 
 def register_handlers(app):
-    app.add_handler(CommandHandler("start", start))
+    # A command handler only listens to *messages* by default, and a channel
+    # post is not one — the /start and /setchannel that arrive when the bot is
+    # added to a channel would never be seen without this filter.
+    with_channel_posts = filters.UpdateType.MESSAGES | filters.UpdateType.CHANNEL_POSTS
+    app.add_handler(CommandHandler("start", start, filters=with_channel_posts))
     app.add_handler(CommandHandler("setgroup", setgroup))
+    app.add_handler(CommandHandler("setchannel", setchannel, filters=with_channel_posts))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("preview", preview_cmd))
     app.add_handler(CommandHandler(["database", "db"], database_cmd))
@@ -2505,10 +3356,22 @@ def register_handlers(app):
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS
                                    | filters.StatusUpdate.LEFT_CHAT_MEMBER, on_join_left))
+    # the group: answers to the 🛡 anti-scam challenge
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT
+                                   & ~filters.COMMAND, on_group_text))
     # banner photos and premium-emoji stickers (the two image inputs)
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.Sticker.ALL, on_sticker))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # private chat: merchant URLs, menu answers and 📤 auto-forward
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT
+                                   & ~filters.COMMAND, on_text))
+    # 📤 auto-forward for everything else an admin sends (video, file, voice…)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND
+                                   & (filters.VIDEO | filters.Document.ALL | filters.AUDIO
+                                      | filters.VOICE | filters.VIDEO_NOTE | filters.ANIMATION
+                                      | filters.CONTACT | filters.LOCATION | filters.POLL
+                                      | filters.Dice.ALL | filters.VENUE | filters.GAME),
+                                   on_private_media))
     app.add_error_handler(error_handler)
     return app
 
@@ -2537,11 +3400,14 @@ def main():
     app.job_queue.run_repeating(cleanup_job, interval=600, first=60)
     print(f"🚀 Bot running · {ASSET}/{FIAT} · every {INTERVAL}s · Ctrl+C to stop")
     print(f"   Admins: {', '.join(map(str, ADMINS))} · Group: {state['group'] or 'not set'} · Merchants: {len(state['merchants'])}")
+    print(f"   Channel: {state['channel'] or 'not set'} · 📤 Auto-forward: {forward_label()}")
+    print(f"   🛡 Anti-scam: {'ON' if captcha_enabled() else 'OFF'}"
+          f" ({captcha_attempts()} attempts, {captcha_timeout()} min → {captcha_action()})")
     print(f"   State: {STORE.describe()}")
     print(f"   Buttons: {'exact ad 🎯' if link_mode() == 'ad' else 'merchant profile 👤'}"
           f" · clickable prices: {'ON' if get_settings().get('price_links', True) else 'OFF'}")
-    if not state["group"]:
-        print("   → Open the bot in Telegram, /start, tap 👥 Set group")
+    if not state["group"] and not state["channel"]:
+        print("   → Open the bot in Telegram, /start, tap 👥 Set group (and 📢 Set channel)")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

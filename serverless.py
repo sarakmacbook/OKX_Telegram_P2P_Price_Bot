@@ -334,8 +334,11 @@ async def run_tick() -> dict:
             result["webhook"] = {"error": str(exc)}
         result["posted"] = bool(await bot_module.auto_post_task(app.bot))
         result["deleted_stale_message"] = bool(await bot_module.cleanup_task(app.bot))
+        # serverless has no JobQueue: expired anti-scam checks are swept here
+        result["captcha_expired"] = int(await bot_module.sweep_captcha(app.bot))
         result["auto"] = bool(bot_module.state.get("auto"))
         result["group"] = bot_module.state.get("group")
+        result["channel"] = bot_module.state.get("channel")
         result["merchants"] = len(bot_module.state.get("merchants") or {})
     result["state"] = state_status()
     return result
