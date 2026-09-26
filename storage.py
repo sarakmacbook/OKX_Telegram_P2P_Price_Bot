@@ -1,18 +1,22 @@
 """State persistence for the P2P price bot.
 
-Two backends, chosen automatically from the environment:
+Choose the state backend with ``P2P_STATE_BACKEND`` (``P2P_STORAGE_BACKEND`` is
+accepted as an alias):
 
-``redis``  a Redis-compatible REST API (e.g. Upstash) — for hosts without a
-           writable disk, or when several bot instances share one state.
-           Enabled by any of::
+``auto``   the default.  Use Redis when a complete Redis REST credential pair is
+           available; otherwise use the JSON file.
+``redis``  require a Redis-compatible REST API (for example Upstash or Vercel
+           KV).  A missing credential pair leaves state in memory rather than
+           silently writing it to a different database.
+``file``   always use the classic JSON ``data.json`` file, even when Redis
+           credentials happen to be present.  This is useful for a local or
+           Docker installation that should not share its data with another bot.
 
-               KV_REST_API_URL      + KV_REST_API_TOKEN
-               UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN
-               REDIS_REST_URL       + REDIS_REST_TOKEN
+Redis is configured by any of::
 
-``file``   the classic ``data.json`` next to the bot — default for
-           systemd / Docker / local installs.  If the directory is not
-           writable the store falls back to ``$TMPDIR`` and says so.
+    KV_REST_API_URL      + KV_REST_API_TOKEN
+    UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN
+    REDIS_REST_URL       + REDIS_REST_TOKEN
 
 Nothing here ever raises: a failed write is logged and the in-memory state
 stays the source of truth for the running process.
@@ -29,11 +33,49 @@ from pathlib import Path
 log = logging.getLogger("p2p-bot.store")
 
 DEFAULT_KEY = "p2p-price-bot:state"
+BACKENDS = ("auto", "file", "redis")
+_BACKEND_ALIASES = {
+    "auto": "auto",
+    "file": "file",
+    "json": "file",
+    "redis": "redis",
+    "kv": "redis",
+    "upstash": "redis",
+}
 REDIS_ENV_PAIRS = (
     ("KV_REST_API_URL", "KV_REST_API_TOKEN"),
     ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
     ("REDIS_REST_URL", "REDIS_REST_TOKEN"),
 )
+
+
+def normalize_backend(value: str | None) -> str | None:
+    """Return the canonical backend name, or ``None`` for an invalid value.
+
+    ``json``, ``kv`` and ``upstash`` are friendly aliases for values users tend
+    to type in a command line or a setup form.  The public configuration and UI
+    always write the canonical names.
+    """
+    return _BACKEND_ALIASES.get(str(value or "").strip().lower())
+
+
+def state_backend() -> str:
+    """Configured backend, canonicalised; invalid/missing values mean ``auto``.
+
+    ``P2P_STATE_BACKEND`` wins over the older, more generic
+    ``P2P_STORAGE_BACKEND`` alias.  Logging is done by :func:`build_store` so
+    callers such as the setup page can inspect the preference without producing
+    a warning on every request.
+    """
+    raw = os.getenv("P2P_STATE_BACKEND")
+    if raw is None or not raw.strip():
+        raw = os.getenv("P2P_STORAGE_BACKEND", "")
+    return normalize_backend(raw) or "auto"
+
+
+def configured_backend_value() -> str:
+    """The raw configured value, useful for an actionable invalid-value warning."""
+    return (os.getenv("P2P_STATE_BACKEND") or os.getenv("P2P_STORAGE_BACKEND") or "").strip()
 
 
 def redis_config() -> tuple[str, str] | None:
@@ -131,9 +173,12 @@ class FileStore:
 
 
 class NullStore:
-    """Read-only, nothing persisted — used when no location is writable."""
+    """Read-only, nothing persisted — used when no selected location is usable."""
 
     backend = "none"
+
+    def __init__(self, reason: str = "state lives only in memory"):
+        self.reason = reason
 
     def load(self) -> dict | None:
         return None
@@ -142,7 +187,7 @@ class NullStore:
         pass
 
     def describe(self) -> str:
-        return "none (state lives only in memory)"
+        return f"none ({self.reason})"
 
 
 def writable(path: Path) -> bool:
@@ -157,16 +202,8 @@ def writable(path: Path) -> bool:
         return False
 
 
-def build_store(base_dir: str | Path, default_name: str = "data.json"):
-    """Pick the best available backend for this environment."""
-    key = (os.getenv("P2P_STATE_KEY") or DEFAULT_KEY).strip() or DEFAULT_KEY
-
-    redis = redis_config()
-    if redis:
-        store = RedisStore(redis[0], redis[1], key=key)
-        log.info("State backend: %s", store.describe())
-        return store
-
+def _file_store(base_dir: str | Path, default_name: str):
+    """Build the file backend, including the old writable-directory fallback."""
     explicit = (os.getenv("P2P_STATE_FILE") or "").strip()
     data_dir = (os.getenv("P2P_DATA_DIR") or "").strip()
     if explicit:
@@ -177,22 +214,57 @@ def build_store(base_dir: str | Path, default_name: str = "data.json"):
         path = Path(base_dir) / default_name
 
     if writable(path):
-        store = FileStore(path)
-    else:
-        fallback = Path(tempfile.gettempdir()) / default_name
-        store = FileStore(fallback)
-        if writable(fallback):
-            log.warning("State file %s is not writable — falling back to %s "
-                        "(ephemeral: add KV_REST_API_URL / UPSTASH_REDIS_REST_URL for "
-                        "persistent state)", path, fallback)
-        else:                                                      # pragma: no cover
-            store = NullStore()
-            log.warning("No writable state location found — state will not persist")
+        return FileStore(path)
+
+    fallback = Path(tempfile.gettempdir()) / default_name
+    store = FileStore(fallback)
+    if writable(fallback):
+        log.warning("State file %s is not writable — falling back to %s "
+                    "(ephemeral: add KV_REST_API_URL / UPSTASH_REDIS_REST_URL for "
+                    "persistent state)", path, fallback)
+        return store
+    log.warning("No writable state location found — state will not persist")
+    return NullStore()
+
+
+def build_store(base_dir: str | Path, default_name: str = "data.json"):
+    """Build the explicitly selected state backend.
+
+    ``auto`` preserves the historical behaviour: Redis wins whenever a complete
+    credential pair exists, otherwise the JSON file is used.  An explicit
+    ``redis`` choice never falls back to the file database; that prevents an
+    outage or typo from splitting a bot's state across two stores.
+    """
+    key = (os.getenv("P2P_STATE_KEY") or DEFAULT_KEY).strip() or DEFAULT_KEY
+    raw_choice = configured_backend_value()
+    choice = state_backend()
+    if raw_choice and normalize_backend(raw_choice) is None:
+        log.warning("Unknown P2P_STATE_BACKEND=%r; using auto (choose: %s)",
+                    raw_choice, ", ".join(BACKENDS))
+
+    redis = redis_config()
+    if choice == "redis":
+        if redis:
+            store = RedisStore(redis[0], redis[1], key=key)
+            log.info("State backend (selected redis): %s", store.describe())
+            return store
+        log.error("P2P_STATE_BACKEND=redis but no complete Redis credential pair was found "
+                  "(set KV_REST_API_URL + KV_REST_API_TOKEN, or choose file/auto)")
+        return NullStore("Redis was selected but is not configured")
+
+    if choice == "auto" and redis:
+        store = RedisStore(redis[0], redis[1], key=key)
+        log.info("State backend (auto): %s", store.describe())
+        return store
+
+    # ``file`` deliberately reaches this branch even if Redis credentials exist.
+    store = _file_store(base_dir, default_name)
     if store.backend != "redis" and os.getenv("VERCEL"):
         log.error("Vercel gives every request an ephemeral filesystem %s: the group, the "
                   "merchants and the prices will not be shared between instances and are lost "
-                  "on the next cold start. Connect a Redis/KV REST store (KV_REST_API_URL + "
-                  "KV_REST_API_TOKEN — e.g. the Upstash or Vercel KV integration).",
+                  "on the next cold start. Select Redis and connect a KV REST store "
+                  "(KV_REST_API_URL + KV_REST_API_TOKEN — e.g. the Upstash or Vercel KV "
+                  "integration).",
                   "(/tmp on this deployment)" if store.backend == "file" else "")
-    log.info("State backend: %s", store.describe())
+    log.info("State backend (%s): %s", choice, store.describe())
     return store

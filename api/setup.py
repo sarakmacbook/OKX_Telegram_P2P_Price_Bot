@@ -78,7 +78,8 @@ async def handle(request: Request) -> Response:
         # Non-secret fields are echoed back so a rejected form is not a dead end;
         # the token and the KV token are never sent to the browser again.
         echo = {name: value for name, value in values.items()
-                if name in ("ADMIN_IDS", "ASSET", "FIAT", "INTERVAL", "KV_REST_API_URL")}
+                if name in ("ADMIN_IDS", "ASSET", "FIAT", "INTERVAL", "P2P_STATE_BACKEND",
+                            "KV_REST_API_URL")}
         return Response.html(_setup_page(message, status, banner=banner,
                                          form_values=None if result["ok"] else echo),
                              status=200 if result["ok"] else 400)

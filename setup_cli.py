@@ -6,6 +6,8 @@
     python setup_cli.py --show          what is stored (redacted), and where
     python setup_cli.py --clear         forget the stored settings
     python setup_cli.py --token 123:ABC --admins 123456789 --yes     no prompts
+    python setup_cli.py --state-backend file                           use data.json
+    python setup_cli.py --state-backend redis --kv-url URL --kv-token TOKEN
 
 Every answer is optional: **press Enter on any question to skip it** and add it
 later in the browser, on the first-start page (``/api/setup``) — the wizard
@@ -41,7 +43,7 @@ import storage                                            # noqa: E402
 SETUP_PATH = "/api/setup"
 ENV_ONLY = ("CRON_SECRET",)                # Vercel's cron reads these from the deployment
 PUSHABLE = ("BOT_TOKEN", "ADMIN_IDS", "ASSET", "FIAT", "INTERVAL",
-            "KV_REST_API_URL", "KV_REST_API_TOKEN", "CRON_SECRET")
+            "P2P_STATE_BACKEND", "KV_REST_API_URL", "KV_REST_API_TOKEN", "CRON_SECRET")
 
 
 def env(*names: str, default: str = "") -> str:
@@ -240,6 +242,12 @@ def wizard(args: argparse.Namespace) -> int:
                                           current=env("INTERVAL", default="60"),
                                           check=interval_check)
 
+    # Database selection is intentionally a flag rather than an extra prompt,
+    # preserving the quick Enter-to-skip wizard flow.  The setup page exposes
+    # the same choice as a select control.
+    if args.state_backend:
+        answers["P2P_STATE_BACKEND"] = args.state_backend
+
     kv_url, kv_token = args.kv_url, args.kv_token
     if not storage.redis_config() and not args.yes:
         print("\n  State store — needed on Vercel, optional on a VPS/Docker install.")
@@ -262,6 +270,11 @@ def wizard(args: argparse.Namespace) -> int:
     if errors:
         for error in errors:
             print(f"  ❌ {error}")
+        return 1
+
+    if (cleaned.get("P2P_STATE_BACKEND") == "redis"
+            and not (storage.redis_config() or (kv_url and kv_token))):
+        print("  ❌ Redis was selected as the state database, but no KV/Redis REST URL and token were supplied.")
         return 1
 
     if cleaned.get("BOT_TOKEN") and not args.no_verify:
@@ -335,6 +348,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--asset", help="Asset, e.g. USDT")
     parser.add_argument("--fiat", help="Fiat, e.g. USD")
     parser.add_argument("--interval", help="Check interval in seconds")
+    parser.add_argument("--state-backend", choices=storage.BACKENDS,
+                        help="State database: auto (default), file, or redis")
     parser.add_argument("--kv-url", dest="kv_url", help="KV/Redis REST URL")
     parser.add_argument("--kv-token", dest="kv_token", help="KV/Redis REST token")
     parser.add_argument("--yes", "-y", action="store_true",

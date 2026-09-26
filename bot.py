@@ -22,8 +22,18 @@ CONFIG = Path(os.getenv("P2P_CONFIG_FILE") or (BASE_DIR / "config.json"))
 DB = BASE_DIR / "data.json"
 
 # ── state store ──
-# data.json next to the bot by default; an optional Redis REST backend can be
-# enabled with KV_REST_API_URL (see storage.py).
+# Apply settings saved by the setup page before selecting a backend.  In
+# particular, this lets a stored P2P_STATE_BACKEND choice take effect in polling
+# installs as well as in the serverless entry points (which already apply the
+# runtime settings before importing this module).
+try:
+    import runtime_config
+    runtime_config.apply(BASE_DIR)
+except Exception as e:                            # setup storage must never stop the bot
+    logging.getLogger("p2p-bot").warning("Stored settings unavailable before state setup: %s", e)
+
+# data.json is the default; P2P_STATE_BACKEND can explicitly select file,
+# Redis, or auto detection (see storage.py).
 STORE = build_store(BASE_DIR)
 
 ICON = {"binance": "🟡", "bybit": "🟣", "okx": "⚫", "bitget": "🔵"}

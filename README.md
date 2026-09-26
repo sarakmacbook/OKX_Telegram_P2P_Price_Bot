@@ -71,6 +71,34 @@ Pick the installer that matches your machine — all four ask for your **bot tok
 
 > **curl or wget — your choice.** Every one-liner below is shown with both `curl` and `wget`; they are interchangeable. Inside the scripts the same applies: downloads automatically use **curl → wget → python3**, whichever exists on the box, and `git` is optional (a tarball is fetched instead when git is missing). Force a specific tool with `DOWNLOADER=wget`.
 
+### Choose the state database
+
+Set `P2P_STATE_BACKEND` in `.env` (or as an environment variable) to choose where
+**groups, merchants, settings and last prices** are stored:
+
+| Value | Behaviour | Best for |
+|---|---|---|
+| `auto` (default) | Uses Redis/KV when a complete REST URL + token is configured; otherwise uses `data.json`. | Most installs; keeps backwards-compatible automatic selection. |
+| `file` | Always uses the local `data.json`, even if Redis credentials exist. | A single VPS/Docker bot that must stay local. |
+| `redis` | Requires a Redis-compatible REST store (Vercel KV or Upstash). It does **not** fall back to a separate file if credentials are missing. | Vercel, multiple bot instances, or shared durable state. |
+
+```env
+# Local / Docker JSON file
+P2P_STATE_BACKEND=file
+P2P_DATA_DIR=/var/lib/p2p-bot
+
+# Or a shared Vercel KV / Upstash Redis store
+P2P_STATE_BACKEND=redis
+KV_REST_API_URL=https://your-store.upstash.io
+KV_REST_API_TOKEN=your-token
+```
+
+The setup page has the same **State database** selector. From a terminal use
+`python setup_cli.py --state-backend file` or
+`python setup_cli.py --state-backend redis --kv-url https://… --kv-token …`.
+`P2P_STORAGE_BACKEND` is accepted as an alias. On Vercel select `redis`: file
+state is temporary and is intentionally rejected as a persistent setup.
+
 ### Option A — VPS with systemd (recommended)
 
 Paste this on a fresh Ubuntu VPS (20.04 / 22.04 / 24.04):

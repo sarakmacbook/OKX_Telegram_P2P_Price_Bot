@@ -561,13 +561,34 @@ def setup_status() -> dict:
         redis_ok = False
         redis_detail = "Connect Upstash for Redis or Vercel KV so group, merchant, and price state survives requests."
 
+    # A complete KV pair is not enough when the owner explicitly chose the file
+    # database: honour that choice rather than silently switching databases.
+    # Vercel has no durable file system, so a file choice there is a blocking
+    # misconfiguration even when Redis credentials happen to be available.
+    selected_backend = storage.state_backend()
+    if selected_backend == "redis":
+        state_ok = redis_ok
+        state_detail = (redis_detail if redis_ok else
+                        "P2P_STATE_BACKEND=redis is selected, but " + redis_detail)
+    elif selected_backend == "file":
+        state_ok = not on_vercel
+        state_detail = ("P2P_STATE_BACKEND=file is selected; state is kept in data.json."
+                        if state_ok else
+                        "P2P_STATE_BACKEND=file is selected, but Vercel discards file state. "
+                        "Choose redis and connect a KV/Redis REST store.")
+    else:
+        state_ok = redis_ok if on_vercel else True
+        state_detail = (redis_detail if redis_ok else
+                        ("Auto mode will use data.json on this host. Set "
+                         "P2P_STATE_BACKEND=redis and connect a KV store to share state."))
+
     checks = [
         _setup_check("bot_token", "Telegram bot token", True, token_ok,
                      token_detail, ("BOT_TOKEN",), source("BOT_TOKEN")),
         _setup_check("admin_ids", "Telegram admin ID", True, admins_ok,
                      admins_detail, ("ADMIN_IDS",), source("ADMIN_IDS")),
-        _setup_check("state_store", "Persistent state store", on_vercel, redis_ok,
-                     redis_detail, ("KV_REST_API_URL", "KV_REST_API_TOKEN")),
+        _setup_check("state_store", "State database", on_vercel, state_ok,
+                     state_detail, ("KV_REST_API_URL", "KV_REST_API_TOKEN", "P2P_STATE_BACKEND")),
     ]
     blocking = [check for check in checks if check["required"] and not check["ok"]]
     if blocking:
@@ -684,12 +705,26 @@ def _probe_redis(url: str, token: str) -> tuple[bool, str]:
 
 
 def _refresh_store() -> None:
-    """A KV pair that arrived after ``bot.py`` was imported must rebuild its store."""
+    """Rebuild the selected store after setup changes it.
+
+    A browser submission can add Redis credentials or switch the explicit
+    ``P2P_STATE_BACKEND`` choice after ``bot.py`` was imported.  Carry the
+    in-memory state into the newly selected database so changing stores does
+    not make an already configured group/merchant list disappear.  Saving is
+    best-effort, like every store write in ``storage.py``.
+    """
     if _bot is None:
         return
     try:
-        _bot.STORE = storage.build_store(ROOT)
-        log.info("state store rebuilt: %s", _bot.STORE.describe())
+        previous = _bot.STORE
+        replacement = storage.build_store(ROOT)
+        _bot.STORE = replacement
+        if previous.describe() != replacement.describe():
+            replacement.save(dict(_bot.state))
+            log.info("state store switched from %s to %s", previous.describe(),
+                     replacement.describe())
+        else:
+            log.info("state store rebuilt: %s", replacement.describe())
     except Exception as exc:                      # pragma: no cover - defensive
         log.warning("could not rebuild the state store: %s", exc)
 
@@ -725,6 +760,11 @@ def save_setup_values(values: dict, verify: bool = True) -> dict:
         errors.append("The KV REST URL and its token belong together — send both, or neither.")
     elif kv_url and not kv_url.startswith(("http://", "https://")):
         errors.append("The KV REST URL must start with https:// (Upstash shows the full endpoint).")
+
+    requested_backend = cleaned.get("P2P_STATE_BACKEND", storage.state_backend())
+    if requested_backend == "redis" and not (storage.redis_config() or (kv_url and kv_token)):
+        errors.append("Redis was selected as the state database. Add a KV/Redis REST URL and token, "
+                      "or choose auto or file.")
 
     if errors:
         return _save_report(False, errors=errors, warnings=warnings, notes=notes)
@@ -833,6 +873,20 @@ def _field(name: str, label: str, hint: str, *, secret: bool = False, value: str
             f'spellcheck="false">{note}</label>')
 
 
+def _select_field(name: str, label: str, hint: str, options: tuple[tuple[str, str], ...],
+                  value: str = "") -> str:
+    """A labelled select control for a non-secret setup choice."""
+    choices = "".join(
+        '<option value="{}"{}>{}</option>'.format(
+            html.escape(key), " selected" if key == value else "", html.escape(title))
+        for key, title in options
+    )
+    return (f'<label class="field"><span>{html.escape(label)} '
+            f'<code>{html.escape(name)}</code></span>'
+            f'<select name="{html.escape(name)}">{choices}</select>'
+            f'<small>{html.escape(hint)}</small></label>')
+
+
 def _setup_form(status: dict, values: dict | None = None) -> str:
     """The browser half of the setup: add the required settings, no redeploy.
 
@@ -844,9 +898,9 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
     values = values or {}
     runtime = status.get("runtime") or {}
     masked = runtime.get("masked") or {}
-    checks = {check["name"]: check for check in status.get("checks") or []}
     needs_secret = bool(status.get("setup_secret")) or bool(status["ready"])
-    wants_kv = not checks.get("state_store", {}).get("ok", False)
+    selected_backend = str(values.get("P2P_STATE_BACKEND") or
+                           runtime.get("state_backend") or storage.state_backend())
 
     if status["ready"] and not status.get("setup_secret"):
         return (
@@ -867,17 +921,22 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
                value=values.get("ADMIN_IDS", ""), placeholder="123456789",
                stored=masked.get("ADMIN_IDS", "")),
     ]
-    if wants_kv:
-        fields += [
-            _field("KV_REST_API_URL", "KV / Redis REST URL",
-                   "Upstash for Redis → REST API → endpoint. Optional, but without it "
-                   "nothing survives a restart on Vercel.",
-                   value=values.get("KV_REST_API_URL", ""),
-                   placeholder="https://eu1-….upstash.io"),
-            _field("KV_REST_API_TOKEN", "KV / Redis REST token",
-                   "The token that belongs to the URL above.", secret=True,
-                   placeholder="A…"),
-        ]
+    fields += [
+        _select_field(
+            "P2P_STATE_BACKEND", "State database",
+            "Auto chooses Redis when credentials exist, otherwise data.json. File always uses data.json; Redis requires the URL and token below.",
+            (("auto", "Auto — Redis when configured, otherwise file"),
+             ("file", "File — always use local data.json"),
+             ("redis", "Redis / KV — shared persistent database")),
+            selected_backend),
+        _field("KV_REST_API_URL", "KV / Redis REST URL",
+               "Required when Redis is selected. Upstash for Redis → REST API → endpoint.",
+               value=values.get("KV_REST_API_URL", ""),
+               placeholder="https://eu1-….upstash.io"),
+        _field("KV_REST_API_TOKEN", "KV / Redis REST token",
+               "The token that belongs to the URL above.", secret=True,
+               placeholder="A…"),
+    ]
     advanced = "".join([
         _field("ASSET", "Asset", "What is traded.", value=values.get("ASSET", ""),
                placeholder="USDT"),
@@ -922,7 +981,7 @@ def _terminal_panel(status: dict) -> str:
     return f"""
     <section class="panel" aria-labelledby="terminal-title">
       <div class="panel-heading"><div><h2 id="terminal-title">…or do it in a terminal</h2>
-        <p class="subtle">Same store, same values — pick whichever you prefer.</p></div></div>
+        <p class="subtle">Same settings store, same values — pick whichever you prefer.</p></div></div>
       <pre class="shell"><code># asks for what is missing; press Enter on a question to skip it
 python setup_cli.py
 
@@ -1060,8 +1119,8 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     .form {{ display: grid; gap: 13px; }}
     .field {{ display: grid; gap: 6px; }}
     .field span {{ font-weight: 700; }}
-    .field input {{ min-height: 44px; padding: 10px 13px; border-radius: 11px; border: 1px solid var(--line); background: #0b1122; color: var(--text); font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; }}
-    .field input:focus {{ outline: 2px solid var(--accent); outline-offset: 1px; }}
+    .field input, .field select {{ min-height: 44px; padding: 10px 13px; border-radius: 11px; border: 1px solid var(--line); background: #0b1122; color: var(--text); font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .field input:focus, .field select:focus {{ outline: 2px solid var(--accent); outline-offset: 1px; }}
     .field small {{ color: var(--muted); }}
     .advanced summary {{ cursor: pointer; color: #c7ceff; font-weight: 700; }}
     .advanced[open] {{ display: grid; gap: 13px; padding-top: 13px; }}
