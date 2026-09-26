@@ -592,3 +592,39 @@ def test_setup_page_hides_the_connect_button_once_a_database_is_connected(
 
     assert "Connect database" not in text
     assert "database is already connected" in text
+
+
+def test_vercel_save_does_not_claim_ready_without_redis(unconfigured, monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    status, _, payload = call(
+        method="POST",
+        body=urlencode({"BOT_TOKEN": "123456:ABCdef", "ADMIN_IDS": "424242",
+                        "P2P_STATE_BACKEND": "auto"}).encode(),
+        headers={"content-type": "application/x-www-form-urlencoded", "accept": "text/html"})
+    text = payload.decode()
+    assert status == 200
+    assert "setup is not complete" in text
+    assert "the bot can start now" not in text
+    assert 'class="banner info"' in text
+    assert "save the settings again" in text
+
+
+def test_vercel_new_redis_connection_warns_about_environment(unconfigured, monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+
+    class Reply:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"result": None}
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: Reply())
+    status, _, payload = post_form({
+        "BOT_TOKEN": "123456:ABCdef", "ADMIN_IDS": "424242",
+        "KV_REST_API_URL": "https://example.upstash.io", "KV_REST_API_TOKEN": "kv-token"})
+    data = json.loads(payload)
+    assert status == 200
+    assert any("applies only to this instance" in warning for warning in data["warnings"])
+    assert not any("No KV/Redis is connected" in warning for warning in data["warnings"])
