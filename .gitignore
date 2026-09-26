@@ -12,6 +12,7 @@ build/
 config.json
 config.json.bak
 data.json
+runtime_config.json
 .env
 bot.log
 bot.pid

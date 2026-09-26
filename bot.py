@@ -105,6 +105,15 @@ def setup_interactive(existing=None):
     return cfg
 
 def load_config():
+    # Settings saved on the setup page (/api/setup) or by `python setup_cli.py`
+    # live in the state store; copy whatever the environment does not provide
+    # into it before anything below reads the values.
+    try:
+        import runtime_config
+        runtime_config.apply(BASE_DIR)
+    except Exception as e:
+        log.warning("Stored settings unavailable: %s", e)
+
     file_cfg = {}
     if CONFIG.exists():
         try: file_cfg = json.loads(CONFIG.read_text())

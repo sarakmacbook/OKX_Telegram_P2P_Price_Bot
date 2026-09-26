@@ -2,10 +2,10 @@
 
 Telegram delivers every update here, and the payload is handed to the same
 handlers the polling bot uses (``bot.register_handlers``).  ``GET`` is the
-first-start setup UI when the deployment is missing its credentials or KV store;
-once configured it becomes the status page you open after deploying. It
-registers the webhook when it is missing and shows what the bot knows — state
-store, group, merchants, cron note.
+first-start setup UI when the deployment is missing its credentials or KV store
+(the same page ``/api/setup`` serves, form included); once configured it becomes
+the status page you open after deploying. It registers the webhook when it is
+missing and shows what the bot knows — state store, group, merchants, cron note.
 ``GET ?check=1`` additionally fetches every merchant once, so empty or broken
 prices can be diagnosed (geo-blocked regions, stale merchant links).
 

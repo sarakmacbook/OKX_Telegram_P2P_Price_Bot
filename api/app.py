@@ -21,6 +21,7 @@ public URLs are unchanged:
 
 * ``/api/webhook`` → ``api/webhook.py`` (Telegram updates + the status page)
 * ``/api/tick``    → ``api/tick.py``    (the cron round)
+* ``/api/setup``   → ``api/setup.py``   (first-start page + the settings form)
 * ``/``            → 302 to the status page (``vercel.json`` redirects there as
   well; answering it here too means the page opens even when a request reaches
   the function directly)
@@ -41,10 +42,11 @@ ROOT = Path(__file__).resolve().parent.parent          # repo root (bot.py, serv
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from api import setup as setup_endpoint                  # noqa: E402
 from api import tick as tick_endpoint                   # noqa: E402
 from api import webhook as webhook_endpoint             # noqa: E402
 from serverless import (                                # noqa: E402
-    TICK_PATH, WEBHOOK_PATH, Request, Response, asgi_dispatch,
+    SETUP_PATH, TICK_PATH, WEBHOOK_PATH, Request, Response, asgi_dispatch,
 )
 
 
@@ -60,6 +62,8 @@ async def handle(request: Request) -> Response:
         return await webhook_endpoint.handle(request)
     if path == TICK_PATH:
         return await tick_endpoint.handle(request)
+    if path == SETUP_PATH:
+        return await setup_endpoint.handle(request)
     if path == "/":
         return Response("Redirecting to the status page …", 302,
                         content_type="text/plain; charset=utf-8",
@@ -67,7 +71,8 @@ async def handle(request: Request) -> Response:
     return Response.json(
         {"ok": False, "path": request.path,
          "error": "not found — this deployment serves "
-                  f"{WEBHOOK_PATH} (Telegram updates + status page) and "
+                  f"{WEBHOOK_PATH} (Telegram updates + status page), "
+                  f"{SETUP_PATH} (first-start setup) and "
                   f"{TICK_PATH} (the cron round)"}, 404)
 
 

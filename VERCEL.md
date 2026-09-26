@@ -32,11 +32,30 @@ Vercel Cron ─► https://<your-app>.vercel.app/api/tick      (post prices, cle
   Just clicking *Create* is enough — the bot only stores one small JSON document.
 
 > ⚠️ KV/Redis is required for a Vercel deployment. If `BOT_TOKEN`, `ADMIN_IDS`,
-> or the KV pair is missing, opening `/api/webhook` shows a first-start setup UI
-> with a redacted environment checklist and the exact Vercel steps. Once the
-> variables are present, redeploy and reopen the page; it registers the webhook
-> automatically. A local file store is still supported for VPS/Docker installs,
-> but it cannot be used as persistent state on Vercel.
+> or the KV pair is missing, opening the deployment shows a first-start setup UI
+> with a redacted checklist, **a form that stores what is missing**, and the exact
+> Vercel steps. It registers the webhook automatically once everything is there.
+> A local file store is still supported for VPS/Docker installs, but it cannot be
+> used as persistent state on Vercel.
+
+### Three ways to add them — pick one, or mix
+
+| Way | How | Needs a redeploy? |
+|---|---|---|
+| **🌐 Browser** | open `https://<your-app>.vercel.app/api/setup`, fill the form, **💾 Save settings** | **no** — applied on the next request |
+| **⌨️ Terminal** | `python setup_cli.py` (Enter skips a question; `--skip` skips everything and prints the page above) | **no** — same store as the browser |
+| **▲ Dashboard / CLI** | *Settings → Environment Variables*, or `npx vercel env add BOT_TOKEN` (`python setup_cli.py --vercel-env` does it for you) | yes — variables apply to new deployments only |
+
+The browser form and the terminal wizard write to the **same place** — the
+connected KV/Redis under the key `p2p-price-bot:config`, or `runtime_config.json`
+next to the bot's data file when there is no Redis. So you can start in the
+terminal and finish in the browser (or the other way round), and
+`python setup_cli.py --show` prints what is stored, redacted. Environment
+variables always win over stored values, and `CRON_SECRET` stays
+environment-only (Vercel's cron sends it from there).
+
+> 🔒 The form is public, so it closes as soon as the deployment is configured —
+> and if you set `SETUP_SECRET`, every submission must carry it. See §10.
 
 ## 2. Deploy
 
@@ -152,6 +171,9 @@ in its answer) — anyone who knows the URL could then trigger a post, so set it
 | `KV_REST_API_URL` + `KV_REST_API_TOKEN` | ✅ | state store (set automatically by the Upstash/KV integration) |
 | `UPSTASH_REDIS_REST_URL` + `…_TOKEN`, `REDIS_REST_URL` + `…_TOKEN` | alt. | other Redis-REST providers, same idea |
 | `P2P_STATE_KEY` | – | key the state lives under (default `p2p-price-bot:state`) |
+| `SETUP_SECRET` | – (recommended) | locks the `/api/setup` form: every submission must carry it (form field, `?secret=`, or `Authorization: Bearer`). Without it the form is open while the deployment is unconfigured and closes once it is ready |
+| `P2P_CONFIG_KEY` | – | key the settings saved by the form / `setup_cli.py` live under (default `p2p-price-bot:config`) |
+| `P2P_RUNTIME_CONFIG_FILE` | – | file those settings live in when there is no Redis (default `runtime_config.json` next to the data file) |
 | `PUBLIC_URL` | – | public URL used to register the webhook; auto-detected from `VERCEL_PROJECT_PRODUCTION_URL`/`VERCEL_URL`, set it for a custom domain or if the page says it cannot tell |
 | `WEBHOOK_SECRET` | – | secret Telegram must send with every update; derived from `BOT_TOKEN` when empty |
 | `CRON_SECRET` | – (recommended) | locks `/api/tick` down |
@@ -171,6 +193,8 @@ in the dashboard).
 | `/api/webhook` | `POST` | Telegram updates — verified with `X-Telegram-Bot-Api-Secret-Token` (or `?secret=…`, handy for manual tests); everything else is rejected with 403 |
 | `/api/webhook` | `GET` | first-start setup UI when `BOT_TOKEN`/`ADMIN_IDS`/KV are missing; otherwise the health page (JSON for scripts, HTML in a browser) that registers the webhook; `?register=1` forces it, `?register=0` only reports |
 | `/api/webhook?check=1` | `GET` | status page + a live price fetch for every merchant — open this when prices are empty to see the per-merchant error |
+| `/api/setup` | `GET` | the first-start page: readiness checklist + a form for what is missing (rendered whether or not the bot can start, so it is also where you change a setting later) |
+| `/api/setup` | `POST` | stores the submitted settings (JSON or form-encoded) and applies them at once; 403 when the deployment is configured and no `SETUP_SECRET` is sent, 400 with a readable reason when a value is wrong or Telegram rejects the token |
 | `/api/tick` | `GET` | one cron round: keep the webhook registered → post prices if they changed → delete stale group messages |
 | anything else | – | `404` (JSON) — the deployment is one catch-all function, so the router answers what the platform's 404 used to |
 
@@ -180,8 +204,9 @@ in the dashboard).
   project as a **single application** — it loads one top-level `app` and rewrites
   *every* request to it (files in `api/` are no longer functions of their own).
   `api/app.py` is that entry point and does the routing the platform used to do:
-  `/api/webhook` → `api/webhook.py`, `/api/tick` → `api/tick.py`, `/` → the status
-  page, anything else → 404. `pyproject.toml` declares it:
+  `/api/webhook` → `api/webhook.py`, `/api/tick` → `api/tick.py`,
+  `/api/setup` → `api/setup.py`, `/` → the status page, anything else → 404.
+  `pyproject.toml` declares it:
 
   ```toml
   [tool.vercel]
@@ -230,7 +255,9 @@ in the dashboard).
 |---|---|
 | `vercel build` fails with *No python entrypoint found in default locations* | the entry point moved, or `pyproject.toml` lost its `[tool.vercel] entrypoint = "api.app:app"` → restore it (the file must be `api/app.py` and export a top-level `app`), then redeploy |
 | `vercel build` installs nothing / `ModuleNotFoundError: telegram` | `pyproject.toml` outranks `requirements.txt` on Vercel — the two dependency lists must match (see §8) |
-| Page shows ⚙️ *Setup needed* (or a 500 JSON with a *hint*) | `BOT_TOKEN`/`ADMIN_IDS`/KV missing or added **after** the last deploy → follow the steps on the page, then redeploy |
+| Page shows ⚙️ *Setup needed* (or a 500 JSON with a *hint*) | `BOT_TOKEN`/`ADMIN_IDS`/KV missing or added **after** the last deploy → add them in the form on the page (or `python setup_cli.py`) — no redeploy needed; only environment variables need one |
+| `POST /api/setup` answers `403 … the form is locked` | the deployment is configured → send `SETUP_SECRET` (and set it in the environment first), or change the value with `python setup_cli.py` / in the dashboard |
+| The form saved the settings but the next cold start forgot them | they went to the instance's temporary storage because no KV/Redis is connected → connect Upstash/KV, add the pair to the environment and redeploy |
 | Prices are `—`, or `⚠️ …451…` / *restricted* / *forbidden* | the exchange geo-blocks the function's region → keep `"regions": ["fra1"]` in `vercel.json` (EU) and redeploy; diagnose with `/api/webhook?check=1` |
 | Deployment URL shows a Vercel 404 | only `/` (redirects to the status page) and `/api/*` exist — check the URL |
 | Setup UI says the state store is missing (or an older deployment shows `State store: file — NOT persistent ❌`) | add/connect the Upstash or Vercel KV integration, confirm `KV_REST_API_URL` + `KV_REST_API_TOKEN`, then redeploy |
@@ -249,5 +276,13 @@ in the dashboard).
   `VERCEL_*` variables — never from the request's `Host` header, so a forged
   request cannot point your bot's updates at somebody else's server.
 * `CRON_SECRET` keeps `/api/tick` (which can post to your group) private.
-* `config.json`, `data.json` and `.env` are git-ignored; on Vercel everything
-  secret lives in the project's environment variables.
+* `POST /api/setup` (the settings form) accepts a submission only while the
+  deployment is **not** configured, and always when it carries `SETUP_SECRET`.
+  A configured deployment can therefore never be re-pointed at somebody else's
+  admin id by a stranger who finds the URL.
+* The token you submit is checked with Telegram (`getMe`) before it is stored, it
+  is stored in your own KV/Redis (never in the code or the logs), and it is never
+  echoed back — the checklist shows a redacted copy only.
+* `config.json`, `data.json`, `runtime_config.json` and `.env` are git-ignored; on
+  Vercel everything secret lives in the project's environment variables or in the
+  KV store the deployment already trusts.

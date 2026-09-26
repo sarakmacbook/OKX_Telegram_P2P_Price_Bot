@@ -30,7 +30,7 @@ except ModuleNotFoundError:                           # pragma: no cover - Pytho
     tomllib = None
 
 import api.app as entrypoint
-from serverless import TICK_PATH, WEBHOOK_PATH
+from serverless import SETUP_PATH, TICK_PATH, WEBHOOK_PATH
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -83,7 +83,7 @@ def test_entrypoint_also_lives_in_a_default_location():
 
 def test_endpoint_modules_still_export_their_own_app():
     """They stay runnable on their own (uvicorn api.webhook:app)."""
-    for name in ("api.tick", "api.webhook"):
+    for name in ("api.setup", "api.tick", "api.webhook"):
         assert callable(getattr(importlib.import_module(name), "app"))
 
 
@@ -160,6 +160,14 @@ def test_status_page_is_served():
     assert status == 200
     assert headers["content-type"].startswith("application/json")
     assert b'"mode"' in payload
+
+
+def test_setup_path_reaches_the_setup_endpoint():
+    """The settings form's own endpoint — it renders even before the bot can start."""
+    status, headers, payload = call(SETUP_PATH)
+    assert status == 200
+    assert headers["content-type"].startswith("text/html")
+    assert b"BOT_TOKEN" in payload
 
 
 def test_tick_path_reaches_the_tick_endpoint(monkeypatch):
