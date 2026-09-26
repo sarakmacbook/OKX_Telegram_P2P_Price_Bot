@@ -649,3 +649,62 @@ def test_price_check_explains_a_geo_blocked_region(serverless, webhook, monkeypa
         assert "fra1" in text and "geo-block" in text
     finally:
         _unseed_merchant(bot_module, old)
+
+
+# ── the "connect database" link on the web pages ───────────────────────────
+def test_status_page_links_to_the_database_page_when_state_is_not_persistent(
+        serverless, webhook, monkeypatch):
+    """The warning that says state will be lost carries the way to fix it."""
+    monkeypatch.setattr(webhook, "ensure_webhook",
+                        Recorder(result={"url": "https://bot.vercel.app/api/webhook",
+                                         "pending_updates": 0}))
+    monkeypatch.delenv("P2P_DATABASE_LINK", raising=False)
+
+    _, _, payload, _ = asgi_call(webhook.app, method="GET", headers={"Accept": "text/html"})
+    text = payload.decode()
+
+    assert "NOT persistent" in text                      # the test store is a file, not KV
+    assert "Connect database" in text
+    assert 'href="https://vercel.com/dashboard/stores"' in text
+
+
+def test_status_page_hides_the_connect_button_when_a_database_is_connected(serverless, webhook):
+    text = webhook._status_page({"state": {"backend": "redis", "persistent": True,
+                                           "detail": "redis (kv.example, key p2p)"}})
+
+    assert "Connect database" not in text
+    assert "Check the webhook again" in text             # the other action stays
+
+
+def test_broken_configuration_offers_the_database_link_to_scripts(
+        serverless, webhook, monkeypatch):
+    def broken():
+        raise serverless.ConfigError("BOT_TOKEN is missing")
+
+    monkeypatch.setattr(webhook, "get_bot", broken)
+    monkeypatch.delenv("P2P_DATABASE_LINK", raising=False)
+
+    status, data = asgi_json(webhook.app, method="GET")
+
+    assert status == 500
+    assert data["connect_database"] == "https://vercel.com/dashboard/stores"
+
+
+def test_page_escapes_link_urls(serverless):
+    """Links are rendered as HTML, so they are escaped like every other value."""
+    text = serverless.page("t", [], links=[("x", 'https://a.example/?q="><script>alert(1)</script>')])
+
+    assert "<script>" not in text
+    assert "&quot;&gt;" in text
+
+
+def test_status_json_carries_the_database_link_too(serverless, webhook, monkeypatch):
+    """Scripts polling the status endpoint get the link, not only browsers."""
+    monkeypatch.setattr(webhook, "ensure_webhook",
+                        Recorder(result={"url": "", "pending_updates": 0}))
+    monkeypatch.delenv("P2P_DATABASE_LINK", raising=False)
+
+    status, data = asgi_json(webhook.app, method="GET", params={"register": "0"})
+
+    assert status == 200
+    assert data["connect_database"] == "https://vercel.com/dashboard/stores"

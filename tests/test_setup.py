@@ -561,3 +561,34 @@ def test_setup_page_explains_how_to_insert_the_database(unconfigured):
     assert "KV_REST_API_URL" in text and "KV_REST_API_TOKEN" in text
     assert "Storage" in text and "Connect to this project" in text   # the Vercel path too
     assert "Save settings" in text                          # and it ends at the form's button
+
+
+def test_setup_page_links_to_the_database_connection_page(unconfigured, monkeypatch):
+    """The panel that explains the KV pair starts with the way to get it."""
+    monkeypatch.delenv("P2P_DATABASE_LINK", raising=False)
+    _, _, payload = call()
+    text = payload.decode()
+
+    assert "Connect database" in text
+    assert 'href="https://vercel.com/dashboard/stores"' in text
+    assert "Connect to this project" in text               # what to press when it opens
+
+
+def test_setup_page_honours_a_configured_database_link(unconfigured, monkeypatch):
+    monkeypatch.setenv("P2P_DATABASE_LINK", "https://console.upstash.com/redis/1")
+    _, _, payload = call()
+
+    assert 'href="https://console.upstash.com/redis/1"' in payload.decode()
+    assert "https://vercel.com/dashboard/stores" not in payload.decode()
+
+
+def test_setup_page_hides_the_connect_button_once_a_database_is_connected(
+        unconfigured, monkeypatch):
+    """A connected store needs no call to action — the checklist says it is ready."""
+    monkeypatch.setenv("KV_REST_API_URL", "https://example.upstash.io")
+    monkeypatch.setenv("KV_REST_API_TOKEN", "private-test-token")
+    _, _, payload = call()
+    text = payload.decode()
+
+    assert "Connect database" not in text
+    assert "database is already connected" in text

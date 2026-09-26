@@ -14,7 +14,7 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
 from exchanges import Merchant, parse_url, fetch, HEADERS
 from adlinks import (EXCHANGE_NAMES, AD_LINK_TEMPLATES, ad_link, market_link,
                      resolve_templates, render_template, template_is_exact, taker_side)
-from storage import build_store
+from storage import build_store, database_link, database_connected
 
 # ── paths: always relative to this file (works with systemd WorkingDirectory) ──
 # P2P_CONFIG_FILE / P2P_STATE_FILE override them (tests, or installs that keep
@@ -371,6 +371,29 @@ def edit_pop(u: Update, key: str):
 state = load()
 
 
+def db_is_persistent() -> bool:
+    """Whether the group, merchants and prices live in a shared database."""
+    return database_connected(STORE)
+
+
+def rebuild_store() -> str:
+    """Re-select the state backend, carrying the in-memory state over.
+
+    Credentials can appear after the process started — the setup page writes
+    them into the shared store and ``python setup_cli.py`` into the environment.
+    Whatever this process already knows is written into the newly selected store
+    first, so switching databases never loses the group or the merchants.  Like
+    every write in ``storage.py`` this is best-effort and never raises.
+    """
+    global STORE
+    previous = STORE
+    STORE = build_store(BASE_DIR)
+    if previous.describe() != STORE.describe():
+        STORE.save(dict(state))
+        log.info("State store switched from %s to %s", previous.describe(), STORE.describe())
+    return STORE.describe()
+
+
 merchants = lambda: [Merchant(**m) for m in state["merchants"].values()]
 is_admin = lambda u: u.effective_user and u.effective_user.id in ADMINS
 fmt = lambda p: f"{p:.4f}".rstrip("0").rstrip(".") if p is not None else "—"
@@ -479,11 +502,15 @@ def set_group_button():
         return B(label, url=f"https://t.me/{BOT_USERNAME}?startgroup=setgroup")
     return B(label, callback_data="setgroup_help")
 
+def database_button():
+    """The link to the page where a database is connected (Vercel → Storage)."""
+    return B("🔌 Connect database ↗", url=database_link())
+
 def panel():
     a = state["auto"]
     s = get_settings()
     liq_icon = "💧"
-    return KB([
+    rows = [
         [B("📊 Post prices now", callback_data="post"),
          B(f"{'🟢' if a else '🔴'} Auto: {'ON' if a else 'OFF'}", callback_data="auto")],
         [B("📋 Merchants", callback_data="list"), set_group_button()],
@@ -491,8 +518,13 @@ def panel():
         [B(f"{liq_icon} Liquidity: {'ON' if s.get('show_liquidity') else 'OFF'}", callback_data="toggle_liquidity"),
          B(f"🔘 Buttons: {'ON' if s.get('show_buttons') else 'OFF'}", callback_data="toggle_buttons")],
         [B("🔘 Manage buttons", callback_data="buttons_menu")],
-        [B("👁 Preview", callback_data="preview"), B("🔄 Refresh", callback_data="panel")]
-    ])
+    ]
+    # No shared database means this install forgets its group, merchants and
+    # prices; put the way to fix that in front of the admin, not in a manual.
+    if not db_is_persistent():
+        rows.append([database_button(), B("❓ Why", callback_data="database")])
+    rows.append([B("👁 Preview", callback_data="preview"), B("🔄 Refresh", callback_data="panel")])
+    return KB(rows)
 
 def settings_kb():
     s = get_settings()
@@ -508,7 +540,15 @@ def settings_kb():
         [B(f"🚪 Del Join/Left msgs: {'ON ✅' if s.get('delete_join_left', True) else 'OFF ❌'}", callback_data="toggle_joinleft")],
         [B("📝 Edit Header", callback_data="edit_header"), B("📝 Edit Body", callback_data="edit_body")],
         [B("📝 Edit Footer", callback_data="edit_footer"), B("🗑 Clear Custom Msg", callback_data="clear_custom")],
+        [B(f"🗄 Database: {'connected ✅' if db_is_persistent() else 'connect ⚠️'}", callback_data="database")],
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="panel")]
+    ])
+
+def database_kb():
+    return KB([
+        [database_button()],
+        [B("🔄 Check connection", callback_data="db_check")],
+        [B("⬅️ Back", callback_data="panel")],
     ])
 
 def buttons_menu_kb():
@@ -650,6 +690,56 @@ def custom_menu_kb():
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="panel")]
     ])
 
+def on_vercel() -> bool:
+    """Whether this process runs as a Vercel function (same flags as serverless.py)."""
+    return bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV") or os.getenv("VERCEL_URL")
+                or os.getenv("VERCEL_PROJECT_PRODUCTION_URL"))
+
+def database_text():
+    """Where the state lives, and the link that makes it survive a redeploy."""
+    persistent = db_is_persistent()
+    if persistent:
+        state_block = (
+            "✅ The group, the merchants, the settings and the prices are kept there, "
+            "so they survive restarts, redeploys and extra instances.\n\n"
+            "Change the database URL/token on the setup page or with "
+            "<code>python setup_cli.py</code>, then tap 🔄 Check connection."
+        )
+    elif on_vercel():
+        state_block = (
+            "⚠️ No shared database is connected: the state is kept on this host only. "
+            "A redeploy, a cold instance or a second instance starts empty.\n\n"
+            "<b>Connect one</b>\n"
+            "1. Open the Vercel dashboard → <b>Storage</b> (link below).\n"
+            "2. Add <b>Upstash for Redis</b> (or <b>Vercel KV</b>) → "
+            "<b>Connect to this project</b>. That writes "
+            "<code>KV_REST_API_URL</code> + <code>KV_REST_API_TOKEN</code> for you.\n"
+            "3. <b>Redeploy</b> — environment variables only apply to new deployments — "
+            "then tap 🔄 Check connection.\n\n"
+            "No redeploy needed instead: paste the REST URL + token into the browser "
+            "setup page (<code>/api/setup</code>) or answer <code>python setup_cli.py</code>, "
+            "then tap 🔄 Check connection."
+        )
+    else:
+        state_block = (
+            "⚠️ No shared database is connected: the state is kept in a local file on this "
+            "host, so a second instance (or a reinstalled machine) starts empty.\n\n"
+            "<b>Connect one</b>\n"
+            "1. Create a Redis-compatible REST database — a free Upstash one is enough "
+            "(link below).\n"
+            "2. Put its REST URL and token in <code>KV_REST_API_URL</code> + "
+            "<code>KV_REST_API_TOKEN</code> (.env / the service environment), or run "
+            "<code>python setup_cli.py</code> — it can store the pair for you.\n"
+            "3. Restart the bot if you edited .env, then tap 🔄 Check connection."
+        )
+    return (
+        f"🗄 <b>Database — where the bot keeps its state</b>\n\n"
+        f"Current store: <code>{html_escape(STORE.describe())}</code>\n"
+        f"Shared database: <b>{'connected ✅' if persistent else 'NOT connected ⚠️'}</b>\n\n"
+        f"{state_block}\n\n"
+        f"🔗 {html_escape(database_link())}"
+    )
+
 def group_label():
     if not state["group"]: return None
     t = state.get("group_title")
@@ -673,6 +763,8 @@ def panel_text():
         f"🤖 <b>P2P Price Bot</b>\n"
         f"Group: <code>{g}</code>\n"
         f"Merchants: {len(state['merchants'])} · Pair: {ASSET}/{FIAT} · every {INTERVAL}s\n"
+        f"🗄 Database: <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>"
+        f"{'' if db_is_persistent() else ' — tap 🔌 Connect database'}\n"
         f"💧 Liquidity: <b>{liq}</b> · 🔘 Buttons: <b>{btns}</b> · 🗑 AutoDel: <b>{autodel}</b>\n"
         f"🔄 Btn order: <b>{order_label()}</b> · 🎯 Links: <b>{'EXACT AD' if link_mode() == 'ad' else 'PROFILE'}</b>\n"
         f"🚪 Del Join/Left msgs: <b>{joinleft}</b>\n"
@@ -714,6 +806,9 @@ def settings_text():
         f"   When ON, the bot deletes Telegram's \"user joined the group\" and\n"
         f"   \"user left the group\" service messages in your group.\n"
         f"   ⚠️ Bot must be a group admin with 'Delete messages' permission.\n\n"
+        f"🗄 Database (state store): <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>\n"
+        f"   <code>{html_escape(STORE.describe())}</code>\n"
+        f"   Tap 🗄 Database for the connection link and what to do with it.\n\n"
         f"📝 Custom Header:\n{header}\n\n"
         f"📝 Custom Body (per merchant):\n{body}\n\n"
         f"📝 Custom Footer:\n{footer}\n\n"
@@ -1398,6 +1493,27 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return await q.edit_message_text(custom_menu_text(), parse_mode="HTML", reply_markup=custom_menu_kb())
 
+    elif d == "database":
+        await q.answer()
+        return await q.edit_message_text(database_text(), parse_mode="HTML",
+                                         reply_markup=database_kb(),
+                                         disable_web_page_preview=True)
+
+    elif d == "db_check":
+        # Credentials are usually added outside the bot (Vercel Storage, the
+        # setup page, setup_cli.py), so re-read them and re-select the backend.
+        try:
+            import runtime_config
+            runtime_config.apply(BASE_DIR)
+        except Exception as e:
+            log.warning("Stored settings unavailable: %s", e)
+        rebuild_store()
+        refresh_state()
+        await q.answer(f"State store: {'connected ✅' if db_is_persistent() else 'not connected ⚠️'}")
+        return await q.edit_message_text(database_text(), parse_mode="HTML",
+                                         reply_markup=database_kb(),
+                                         disable_web_page_preview=True)
+
     elif d == "buttons_menu":
         if edit_get(u, "awaiting_custom"):
             edit_pop(u, "awaiting_custom")
@@ -1742,6 +1858,12 @@ async def cancel_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     else:
         await u.message.reply_text("Nothing to cancel.", reply_markup=panel())
 
+async def database_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/database — the state store, and the link that makes it persistent."""
+    if not is_admin(u): return
+    await u.message.reply_html(database_text(), reply_markup=database_kb(),
+                               disable_web_page_preview=True)
+
 async def preview_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u) or u.effective_chat.type != "private": return
     if state["merchants"]:
@@ -1768,6 +1890,7 @@ def register_handlers(app):
     app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("preview", preview_cmd))
+    app.add_handler(CommandHandler(["database", "db"], database_cmd))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS

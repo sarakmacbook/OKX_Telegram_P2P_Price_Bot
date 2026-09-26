@@ -99,6 +99,31 @@ The setup page has the same **State database** selector. From a terminal use
 `P2P_STORAGE_BACKEND` is accepted as an alias. On Vercel select `redis`: file
 state is temporary and is intentionally rejected as a persistent setup.
 
+#### 🔌 Connect database link
+
+When no shared database is connected, every surface says so **and carries the
+link that fixes it** (Vercel → **Storage**, where *Connect to this project*
+writes `KV_REST_API_URL` + `KV_REST_API_TOKEN`):
+
+| Where | What you get |
+|---|---|
+| Telegram panel | a **🗄 Database** line in the status text and — while no store is connected — a **🔌 Connect database ↗** button (it disappears once one is connected) |
+| `/database` (alias `/db`) | the state store in use, the connection steps and the same link, plus **🔄 Check connection** |
+| ⚙️ Settings | a **🗄 Database** button showing `connected ✅` / `connect ⚠️` |
+| `/api/setup` and the status page | a **🔌 Connect database ↗** button above the database panel / next to the *not persistent* warning; scripts reading `/api/webhook` JSON get the URL as `connect_database` |
+
+The destination is `P2P_DATABASE_LINK` (default
+`https://vercel.com/dashboard/stores`) — point it at your own storage page,
+an Upstash console or a self-hosted Redis:
+
+```env
+P2P_DATABASE_LINK=https://vercel.com/dashboard/stores
+```
+
+After connecting a database, tap **🔄 Check connection** in the bot (or reopen
+the page): the bot re-reads the credentials and re-selects the store without a
+restart.
+
 ### Option A — VPS with systemd (recommended)
 
 Paste this on a fresh Ubuntu VPS (20.04 / 22.04 / 24.04):

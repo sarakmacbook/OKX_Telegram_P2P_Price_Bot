@@ -647,8 +647,9 @@ SETUP_STEPS = [
     f"1. Add BOT_TOKEN (from @BotFather) and ADMIN_IDS (your Telegram id, from @userinfobot) — "
     f"in the form on {SETUP_PATH}, with  python setup_cli.py  in a terminal, or in the Vercel "
     "dashboard (Settings → Environment Variables).",
-    "2. Storage → add Upstash for Redis (or Vercel KV) → Connect to this project — this sets "
-    "KV_REST_API_URL + KV_REST_API_TOKEN so the bot remembers its group and merchants.",
+    f"2. Connect a database ({storage.database_link()}): Storage → add Upstash for Redis (or "
+    "Vercel KV) → Connect to this project — this sets KV_REST_API_URL + KV_REST_API_TOKEN so the "
+    "bot remembers its group and merchants.",
     "3. Redeploy (Deployments → ⋯ → Redeploy — changed *environment variables* only apply to new "
     f"deploys), then reopen this page: it registers the Telegram webhook by itself. Settings saved "
     f"on {SETUP_PATH} are applied immediately, no redeploy needed.",
@@ -1016,12 +1017,26 @@ def _db_guide_panel() -> str:
     this panel explains where those two values come from and what to do with
     them: create an Upstash database and paste its REST pair into the form,
     or let Vercel's Storage integration write the environment pair itself.
+    It opens with a direct link to the Vercel Storage page
+    (:func:`storage.database_link`) — the screen *Connect to this project*
+    lives on.
     """
-    return """
+    connect_url = html.escape(storage.database_link(), quote=True)
+    return f"""
     <section class="panel" aria-labelledby="db-guide-title">
       <div class="panel-heading"><div><h2 id="db-guide-title">How to insert the database</h2>
         <p class="subtle">Where the KV / Redis URL and token come from — and what to do with them.</p></div>
         <span class="badge optional">KV / Redis</span></div>
+
+      <div class="actions">
+        <a class="button" href="{connect_url}" target="_blank" rel="noopener">🔌 Connect database ↗</a>
+        <a class="button secondary" href="https://console.upstash.com" target="_blank" rel="noopener">Create an Upstash database ↗</a>
+      </div>
+      <p class="where">The first link opens <b>Vercel → Storage</b> (or <code>P2P_DATABASE_LINK</code>
+        when it is set): create <b>Upstash for Redis</b> / <b>Vercel KV</b> there and press
+        <b>Connect to this project</b> — Vercel then writes <code>KV_REST_API_URL</code> +
+        <code>KV_REST_API_TOKEN</code> into the environment itself. Then redeploy — or paste the
+        pair into the form above and save, which needs no redeploy.</p>
 
       <h3 class="guide-option">Option A — create a free Upstash database, paste the pair into the form</h3>
       <div class="steps">
@@ -1088,7 +1103,12 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     checks_markup = "\n".join(cards)
     banner_markup = _banner(banner)
     form_markup = _setup_form(status, form_values)
-    db_guide_markup = "" if storage.redis_config() else _db_guide_panel()
+    database_connected = storage.database_connected()
+    db_guide_markup = "" if database_connected else _db_guide_panel()
+    connect_link_markup = (
+        "" if database_connected else
+        f'<a class="button" href="{html.escape(storage.database_link(), quote=True)}" '
+        f'target="_blank" rel="noopener">🔌 Connect database ↗</a>')
     terminal_markup = _terminal_panel(status)
     missing = status.get("missing") or "the required environment variables"
     deployment_note = (
@@ -1224,7 +1244,7 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
       <article><h3>🔗 Automatic webhook</h3><p>Once the variables are present, opening this page checks the token and registers <code>/api/webhook</code>.</p></article>
     </section>
 
-    <div class="actions"><a class="button" href="/api/setup">↻ Check setup again</a><a class="button secondary" href="/api/webhook?register=0">View diagnostics</a><a class="button secondary" href="https://github.com/sarakmacbook/OKX_Telegram_P2P_Price_Bot/blob/main/VERCEL.md" target="_blank" rel="noopener">Deployment guide ↗</a></div>
+    <div class="actions">{connect_link_markup}<a class="button secondary" href="/api/setup">↻ Check setup again</a><a class="button secondary" href="/api/webhook?register=0">View diagnostics</a><a class="button secondary" href="https://github.com/sarakmacbook/OKX_Telegram_P2P_Price_Bot/blob/main/VERCEL.md" target="_blank" rel="noopener">Deployment guide ↗</a></div>
     <p class="foot">The form posts over HTTPS to <code>/api/setup</code> and stores what you enter in this deployment's own state store — the same place <code>python setup_cli.py</code> writes to. Values are never shown again (the checklist shows a redacted copy), environment variables always win over stored ones, and the form asks for <code>SETUP_SECRET</code> — or closes — once the deployment is configured.</p>
   </main>
 </body>
@@ -1239,7 +1259,8 @@ def config_error_response(request: Request, message: str,
         return Response.html(_setup_page(message, status), status=500)
     return Response.json({"ok": False, "error": message, "hint": CONFIG_HINT,
                           "status": "setup_required", "setup": status,
-                          "steps": SETUP_STEPS, "setup_page": SETUP_PATH}, 500)
+                          "steps": SETUP_STEPS, "setup_page": SETUP_PATH,
+                          "connect_database": storage.database_link()}, 500)
 
 
 def internal_error_response(request: Request, message: str) -> Response:
@@ -1281,8 +1302,14 @@ async def asgi_dispatch(scope, receive, send, handler: Handler) -> None:
 
 # ── self-contained HTML pages (the status endpoint, opened in a browser) ───
 def page(title: str, rows: list[tuple[str, Any]], notes: list[str] | None = None,
-         warnings: list[str] | None = None) -> str:
-    """A self-contained status page — no CSS files, no JavaScript, dark-mode aware."""
+         warnings: list[str] | None = None,
+         links: list[tuple[str, str]] | None = None) -> str:
+    """A self-contained status page — no CSS files, no JavaScript, dark-mode aware.
+
+    ``links`` are ``(label, url)`` pairs rendered as buttons; only fixed,
+    platform/documentation URLs are ever passed in here — never a value that came
+    from a request.
+    """
     def cell(value: Any) -> str:
         if isinstance(value, bool):
             return "yes" if value else "no"
@@ -1295,6 +1322,11 @@ def page(title: str, rows: list[tuple[str, Any]], notes: list[str] | None = None
         for name, value in rows)
     warn = "".join(f'\n    <p class="warn">⚠️ {html.escape(w)}</p>' for w in warnings or [])
     extra = "".join(f"\n    <p>{html.escape(n)}</p>" for n in notes or [])
+    buttons = "".join(
+        f'\n    <a class="button" href="{html.escape(url, quote=True)}" target="_blank" '
+        f'rel="noopener">{html.escape(label)}</a>'
+        for label, url in links or [])
+    actions = f'\n    <p class="actions">{buttons}</p>' if buttons else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <meta charset="utf-8">
@@ -1309,8 +1341,10 @@ def page(title: str, rows: list[tuple[str, Any]], notes: list[str] | None = None
   th {{ width: 12rem; font-weight: 600; opacity: .75; }}
   code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
   .warn {{ border-left: 4px solid #d97706; background: #d9770622; padding: .5rem .7rem; border-radius: 0 .4rem .4rem 0; }}
+  .actions {{ display: flex; flex-wrap: wrap; gap: .6rem; margin: 1.1rem 0 0; }}
+  .button {{ display: inline-block; padding: .5rem .8rem; border-radius: .45rem; border: 1px solid #8886; text-decoration: none; font-weight: 600; }}
 </style>
-<h1>{html.escape(title)}</h1>{warn}
+<h1>{html.escape(title)}</h1>{warn}{actions}
 <table>
 {body}
 </table>{extra}

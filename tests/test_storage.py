@@ -117,3 +117,38 @@ def test_backend_aliases_are_normalized(monkeypatch):
     assert storage.state_backend() == "redis"
     assert storage.normalize_backend("json") == "file"
     assert storage.normalize_backend("postgres") is None
+
+
+# ── the "connect a database" link ──────────────────────────────────────────
+def test_database_link_defaults_to_the_vercel_storage_page(monkeypatch):
+    monkeypatch.delenv(storage.DATABASE_LINK_ENV, raising=False)
+    assert storage.database_link() == "https://vercel.com/dashboard/stores"
+
+
+def test_database_link_can_point_at_your_own_store(monkeypatch):
+    monkeypatch.setenv(storage.DATABASE_LINK_ENV, "https://console.upstash.com/redis/123")
+    assert storage.database_link() == "https://console.upstash.com/redis/123"
+
+
+def test_database_link_ignores_a_value_that_is_not_a_url(monkeypatch):
+    """A typo in the environment must not turn the button into a broken link."""
+    monkeypatch.setenv(storage.DATABASE_LINK_ENV, "vercel.com/dashboard/stores")
+    assert storage.database_link() == storage.DEFAULT_DATABASE_LINK
+    monkeypatch.setenv(storage.DATABASE_LINK_ENV, "https://")
+    assert storage.database_link() == storage.DEFAULT_DATABASE_LINK
+
+
+def test_database_connected_follows_the_credentials(monkeypatch):
+    for url_var, token_var in storage.REDIS_ENV_PAIRS:
+        monkeypatch.delenv(url_var, raising=False)
+        monkeypatch.delenv(token_var, raising=False)
+    assert storage.database_connected() is False
+
+    monkeypatch.setenv("KV_REST_API_URL", "https://kv.example")
+    monkeypatch.setenv("KV_REST_API_TOKEN", "tok")
+    assert storage.database_connected() is True
+
+    # With a store in hand the verified answer wins over the environment.
+    assert storage.database_connected(storage.RedisStore("https://kv.example", "tok")) is True
+    assert storage.database_connected(storage.FileStore("data.json")) is False
+    assert storage.database_connected(storage.NullStore()) is False
