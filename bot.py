@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import os, sys, json, asyncio, logging, argparse, signal, time, re
+import os, sys, json, asyncio, logging, argparse, signal, time, re, secrets
+from copy import deepcopy
 from dataclasses import asdict
+from urllib.parse import urlsplit
 from pathlib import Path
 import httpx
 from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as KB
@@ -200,6 +202,12 @@ if ":" not in TOKEN:
 DEFAULT_BUY_LABEL = "🟢 BUY {PRICE} {NICK}"
 DEFAULT_SELL_LABEL = "🔴 SELL {PRICE} {NICK}"
 
+# Persisted separately so the old ad-link default is migrated only once.
+LINK_TARGET_VERSION = 1
+MAX_EXTRA_BUTTONS = 8
+MAX_REPORT_BUTTONS = 100
+PROFILE_BUTTON_URLS = ("{URL}", "{PROFILE_URL}")
+
 DEFAULT_SETTINGS = {
     "show_liquidity": False,
     "show_buttons": True,
@@ -211,19 +219,71 @@ DEFAULT_SETTINGS = {
     "delete_join_left": True,  # delete Telegram "X joined/left the group" service messages
     # ── Buy / Sell buttons (editable from the private bot chat) ──
     "buttons_order": "buy_sell",   # "buy_sell" = Buy left / Sell right, "sell_buy" = the opposite
+    "btn_buy_enabled": True,      # remove/restore either built-in button independently
+    "btn_sell_enabled": True,
+    "extra_buttons": [],          # {id, label, url}; appended per merchant, two per row
     "btn_buy_label": "",           # empty = DEFAULT_BUY_LABEL
     "btn_sell_label": "",          # empty = DEFAULT_SELL_LABEL
-    "btn_buy_url": "",             # empty = exact best ad (see below)
-    "btn_sell_url": "",            # empty = exact best ad (see below)
+    "btn_buy_url": "",             # empty = selected target (profile by default)
+    "btn_sell_url": "",            # empty = selected target (profile by default)
     # ── where the buttons/prices point ──
-    "btn_link_mode": "ad",         # "ad" = the exact ad of the shown price, "profile" = merchant profile
+    "btn_link_mode": "profile",    # "profile" = merchant profile, "ad" = optional ad-link templates
     "ad_link_templates": {},       # per-exchange deep-link overrides (see adlinks.py)
     "price_links": True,           # also make the prices in the post clickable
 }
 
+def clean_extra_button_label(value) -> str:
+    """Custom captions are plain text, not HTML or price templates."""
+    if not isinstance(value, str):
+        return ""
+    label = " ".join(value.split())
+    return label if 0 < len(label) <= 60 and not any(ord(ch) < 32 or ord(ch) == 127 for ch in label) else ""
+
+
+def valid_extra_button_url(value) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 2048:
+        return False
+    if value in PROFILE_BUTTON_URLS:
+        return True
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch in '<>"{}\\' for ch in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        # Read .port too: urllib rejects malformed ports here, not at urlsplit().
+        port = parsed.port
+        return bool(parsed.scheme in ("https", "http", "tg") and parsed.hostname
+                    and parsed.username is None and parsed.password is None
+                    and (port is None or port > 0))
+    except ValueError:
+        return False
+
+
+def normalize_extra_buttons(value) -> list[dict]:
+    """Copy valid saved records; malformed state must not break a group post."""
+    if not isinstance(value, list):
+        return []
+    result, seen = [], set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        ident = item.get("id")
+        label = clean_extra_button_label(item.get("label"))
+        url = item.get("url")
+        url = url.strip() if isinstance(url, str) else ""
+        if (not isinstance(ident, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,24}", ident)
+                or ident in seen or not label or not valid_extra_button_url(url)):
+            continue
+        result.append({"id": ident, "label": label, "url": url})
+        seen.add(ident)
+        if len(result) == MAX_EXTRA_BUTTONS:
+            break
+    return result
+
+
 def empty_state():
     return {"group": None, "auto": False, "merchants": {}, "last": {}, "edits": {},
-            "settings": DEFAULT_SETTINGS.copy(), "last_msg_id": None, "last_msg_time": None}
+            "settings": deepcopy(DEFAULT_SETTINGS), "link_target_version": LINK_TARGET_VERSION,
+            "last_msg_id": None, "last_msg_time": None}
 
 
 def load():
@@ -236,11 +296,21 @@ def load():
         data = empty_state()
     # migration: ensure keys exist
     if "settings" not in data or not isinstance(data["settings"], dict):
-        data["settings"] = DEFAULT_SETTINGS.copy()
+        data["settings"] = deepcopy(DEFAULT_SETTINGS)
+    # Older installs persisted "ad" even when the owner never chose a target.
+    # Apply the profile default on upgrade, but preserve any later opt-in to ad
+    # links. Custom URLs, labels, merchants and other settings are left intact.
+    if data.get("link_target_version") != LINK_TARGET_VERSION:
+        data["settings"]["btn_link_mode"] = DEFAULT_SETTINGS["btn_link_mode"]
+        data["link_target_version"] = LINK_TARGET_VERSION
     for k, v in DEFAULT_SETTINGS.items():
         if k not in data["settings"]:
-            data["settings"][k] = v
+            data["settings"][k] = deepcopy(v)
     # sanitise the settings that are read as structured values
+    data["settings"]["extra_buttons"] = normalize_extra_buttons(data["settings"].get("extra_buttons"))
+    for key in ("btn_buy_enabled", "btn_sell_enabled"):
+        if not isinstance(data["settings"].get(key), bool):
+            data["settings"][key] = DEFAULT_SETTINGS[key]
     if not isinstance(data["settings"].get("ad_link_templates"), dict):
         data["settings"]["ad_link_templates"] = {}
     if data["settings"].get("btn_link_mode") not in ("ad", "profile"):
@@ -284,11 +354,17 @@ def edit_get(u: Update, key: str, default=None):
     return edits_of(u).get(key, default)
 
 def edit_set(u: Update, key: str, value):
-    edits_of(u)[key] = value
+    edits = edits_of(u)
+    if key == "awaiting_custom":
+        edits.pop("extra_button_label", None)  # discard an abandoned add-button draft
+    edits[key] = value
     save()
 
 def edit_pop(u: Update, key: str):
-    edits_of(u).pop(key, None)
+    edits = edits_of(u)
+    edits.pop(key, None)
+    if key == "awaiting_custom":
+        edits.pop("extra_button_label", None)
     save()
 
 
@@ -316,6 +392,18 @@ def fmt_amount(a):
 def get_settings():
     return state.get("settings", DEFAULT_SETTINGS)
 
+
+def builtin_button_enabled(side: str) -> bool:
+    return get_settings().get(f"btn_{side}_enabled", True) is not False
+
+
+def extra_buttons() -> list[dict]:
+    return normalize_extra_buttons(get_settings().get("extra_buttons"))
+
+
+def extra_button(ident: str) -> dict | None:
+    return next((button for button in extra_buttons() if button["id"] == ident), None)
+
 # ── exact-ad links ──────────────────────────────────────────────────────────
 def ad_templates() -> dict:
     """Default deep-link templates merged with per-exchange overrides
@@ -333,24 +421,25 @@ def ad_templates() -> dict:
     return resolve_templates(overrides)
 
 def link_mode() -> str:
-    """'ad' → the exact ad of the shown price, 'profile' → merchant profile page."""
-    return "profile" if get_settings().get("btn_link_mode") == "profile" else "ad"
+    """Use merchant profiles by default; ad-link templates remain opt-in."""
+    mode = get_settings().get("btn_link_mode")
+    return mode if mode in ("ad", "profile") else DEFAULT_SETTINGS["btn_link_mode"]
 
 def side_links(side: str, m: Merchant, r: dict | None = None) -> dict:
     """Every URL we know for one side of one merchant.
 
     ``ad``      exact advertisement the price came from (empty when unknown)
-    ``profile`` merchant profile page that was pasted into the bot
+    ``profile`` public merchant profile (canonical URL for OKX)
     ``market``  exchange market page for this pair/side
-    ``best``    what the buttons should use (ad → profile → market)
+    ``best``    selected target first (default: profile → ad → market)
     """
     r = r or {}
     asset, fiat = (m.asset or ASSET), (m.fiat or FIAT)
     ad_id = r.get(f"{side}_ad_id")
     exact = ad_link(m.exchange, ad_id, asset, fiat, side,
                     templates=ad_templates(), nick=m.nickname or m.merchant_id,
-                    profile_url=m.url or "") if ad_id else None
-    profile = m.url or ""
+                    profile_url=m.profile_url or "") if ad_id else None
+    profile = m.profile_url or ""
     mkt = market_link(m.exchange, asset, fiat, side) or ""
     if link_mode() == "ad":
         best = exact or profile or mkt
@@ -401,7 +490,7 @@ def panel():
         [B("⚙️ Settings", callback_data="settings"), B("📝 Custom Msg", callback_data="custom_menu")],
         [B(f"{liq_icon} Liquidity: {'ON' if s.get('show_liquidity') else 'OFF'}", callback_data="toggle_liquidity"),
          B(f"🔘 Buttons: {'ON' if s.get('show_buttons') else 'OFF'}", callback_data="toggle_buttons")],
-        [B("🟢🔴 Buy/Sell buttons", callback_data="buttons_menu")],
+        [B("🔘 Manage buttons", callback_data="buttons_menu")],
         [B("👁 Preview", callback_data="preview"), B("🔄 Refresh", callback_data="panel")]
     ])
 
@@ -409,8 +498,8 @@ def settings_kb():
     s = get_settings()
     return KB([
         [B(f"💧 Liquidity: {'ON ✅' if s.get('show_liquidity') else 'OFF ❌'}", callback_data="toggle_liquidity"),
-         B(f"🔘 Buy/Sell Buttons: {'ON ✅' if s.get('show_buttons') else 'OFF ❌'}", callback_data="toggle_buttons")],
-        [B("🟢🔴 Edit Buy/Sell buttons", callback_data="buttons_menu")],
+         B(f"🔘 All buttons: {'ON ✅' if s.get('show_buttons') else 'OFF ❌'}", callback_data="toggle_buttons")],
+        [B("🔘 Manage buttons", callback_data="buttons_menu")],
         [B(f"🎯 Exact ad links: {'ON ✅' if link_mode() == 'ad' else 'OFF ❌'}", callback_data="toggle_link_mode"),
          B(f"🔗 Link prices: {'ON ✅' if s.get('price_links', True) else 'OFF ❌'}", callback_data="toggle_price_links")],
         [B("🔗 Ad link templates", callback_data="adlink_menu")],
@@ -424,21 +513,87 @@ def settings_kb():
 
 def buttons_menu_kb():
     s = get_settings()
-    return KB([
-        [B(f"🔘 Buttons: {'ON ✅' if s.get('show_buttons') else 'OFF ❌'}", callback_data="toggle_buttons"),
+    rows = [
+        [B(f"🔘 All buttons: {'ON ✅' if s.get('show_buttons') else 'OFF ❌'}", callback_data="toggle_buttons"),
          B(f"🔄 Order: {order_label()}", callback_data="toggle_btn_order")],
         [B(f"🎯 Target: {'EXACT AD 🎯' if link_mode() == 'ad' else 'PROFILE 👤'}", callback_data="toggle_link_mode")],
         [B("🟢 Edit BUY label", callback_data="edit_buy_label"),
          B("🔴 Edit SELL label", callback_data="edit_sell_label")],
         [B("🔗 BUY link", callback_data="edit_buy_url"),
          B("🔗 SELL link", callback_data="edit_sell_url")],
+    ]
+    rows.append([
+        B(f"{'🗑 Remove' if builtin_button_enabled(side) else '➕ Restore'} {side.upper()}",
+          callback_data=f"{'remove' if builtin_button_enabled(side) else 'restore'}_{side}_button")
+        for side in ("buy", "sell")
+    ])
+    rows += [
+        [B("➕ Add button", callback_data="extra_add"),
+         B(f"🧩 Extra buttons ({len(extra_buttons())})", callback_data="extra_buttons")],
         [B("🔗 Ad link templates", callback_data="adlink_menu")],
         [B("♻️ Reset buttons to default", callback_data="reset_buttons")],
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="settings")]
+    ]
+    return KB(rows)
+
+
+def extra_buttons_text():
+    return (
+        f"🧩 <b>Extra buttons ({len(extra_buttons())}/{MAX_EXTRA_BUTTONS})</b>\n\n"
+        "Add your own profile, support, channel or website links.\n"
+        "They appear after the remaining Buy/Sell buttons for <b>each merchant</b>, two per row.\n\n"
+        "Tap a button below to edit its label/link or delete it.\n"
+        "Use <code>{URL}</code> as the link to open each merchant's profile.\n"
+        f"The full post is capped at {MAX_REPORT_BUTTONS} buttons; reduce merchants or extras if needed.\n"
+        "The All buttons switch hides these too."
+    )
+
+
+def extra_buttons_kb():
+    rows = [[B(f"✏️ {button['label'][:40]}", callback_data=f"extra_button:{button['id']}")]
+            for button in extra_buttons()]
+    rows += [[B("➕ Add button", callback_data="extra_add")],
+             [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="buttons_menu")]]
+    return KB(rows)
+
+
+def extra_button_text(button: dict):
+    visibility = "" if get_settings().get("show_buttons", True) else (
+        "\n\n⚠️ All buttons are OFF. Turn them on in 🔘 Manage buttons to show this button.")
+    return (
+        f"🧩 <b>Custom button</b>\n\n"
+        f"Label: <code>{html_escape(button['label'])}</code>\n"
+        f"Link: <code>{html_escape(button['url'])}</code>\n\n"
+        "Shown for each merchant after the remaining Buy/Sell buttons.\n"
+        "Changes appear in the next price post; use 👁 Preview to check them."
+        + visibility
+    )
+
+
+def extra_button_kb(ident: str):
+    return KB([
+        [B("✏️ Edit label", callback_data=f"extra_label:{ident}"),
+         B("🔗 Edit link", callback_data=f"extra_url:{ident}")],
+        [B("🗑 Delete button", callback_data=f"extra_remove:{ident}")],
+        [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="extra_buttons")],
     ])
 
+
+def extra_button_prompt(field: str) -> str:
+    if field == "label":
+        return ("🧩 <b>Send the button label</b>\n\n"
+                "Use 1–60 characters of plain text, for example: 👤 My profile or 💬 Support.\n"
+                "Extra-button labels are literal text, not price templates.\n\n"
+                "Send /cancel to stop without saving.")
+    return ("🔗 <b>Send the button link</b>\n\n"
+            "Send an https://, http:// or tg:// URL (up to 2048 characters).\n"
+            "Or send <code>{URL}</code> to open each merchant's public P2P profile.\n\n"
+            "Example: <code>https://t.me/your_support</code>\n"
+            "Send /cancel to stop without saving.")
+
+
 def adlink_menu_text():
-    """Deep links: explain that buttons open the exact ad of the shown price."""
+    """Explain the selected target and the optional ad-link templates."""
     s = get_settings()
     templates = ad_templates()
     mode = link_mode()
@@ -448,7 +603,7 @@ def adlink_menu_text():
         f"🎯 Exact ad links: <b>{'ON ✅' if mode == 'ad' else 'OFF ❌'}</b>",
         ("   Buy/Sell buttons and the prices in the post open the <b>exact ad</b> "
          "the price was taken from." if mode == "ad" else
-         "   Buttons open the merchant's profile page instead."),
+         "   Both buttons and linked prices open the merchant's public P2P profile."),
         f"🔗 Link prices in text: <b>{'ON ✅' if s.get('price_links', True) else 'OFF ❌'}</b>",
         "",
         "<b>Templates per exchange</b> (placeholders: <code>{AD_ID}</code> "
@@ -543,12 +698,12 @@ def settings_text():
         f"⚙️ <b>Settings</b>\n\n"
         f"💧 Show liquidity amount: <b>{liq}</b>\n"
         f"   When ON, shows available amount next to price.\n\n"
-        f"🔘 Show Buy/Sell buttons in group: <b>{btns}</b>\n"
-        f"   When ON, group message includes Buy/Sell URL buttons.\n"
-        f"   Order: <b>{order_label()}</b> — tap 🟢🔴 Edit Buy/Sell buttons to change\n"
-        f"   the order, the labels and the links.\n\n"
+        f"🔘 Show buttons in group: <b>{btns}</b>\n"
+        f"   When ON, group messages include the buttons you have configured.\n"
+        f"   Order: <b>{order_label()}</b> — tap 🔘 Manage buttons to add or remove\n"
+        f"   buttons, or edit their labels and links.\n\n"
         f"🎯 Buy/Sell buttons & prices open: <b>{'the EXACT ad 🎯' if link_mode() == 'ad' else 'the merchant profile 👤'}</b>\n"
-        f"   Toggle it here or with the 🟢🔴 Edit Buy/Sell buttons menu; the deep-link\n"
+        f"   Toggle it here or with the 🔘 Manage buttons menu; the deep-link\n"
         f"   templates live in 🔗 Ad link templates.\n\n"
         f"🔗 Clickable prices in the post: <b>{'ON ✅' if s.get('price_links', True) else 'OFF ❌'}</b>\n\n"
         f"🗑 Auto-delete previous message: <b>{autodel}</b>\n"
@@ -578,19 +733,27 @@ def buttons_menu_text():
     on = "ON ✅" if s.get("show_buttons") else "OFF ❌"
     buy_tpl = s.get("btn_buy_label") or DEFAULT_BUY_LABEL
     sell_tpl = s.get("btn_sell_label") or DEFAULT_SELL_LABEL
-    buy_url = s.get("btn_buy_url") or "(merchant profile URL)"
-    sell_url = s.get("btn_sell_url") or "(merchant profile URL)"
-    if buttons_order() == "buy_sell":
-        preview_row = f"[ {html_escape(buy_tpl)} ] [ {html_escape(sell_tpl)} ]"
-        order_txt = "🟢 <b>BUY left</b> · 🔴 <b>SELL right</b>"
-    else:
-        preview_row = f"[ {html_escape(sell_tpl)} ] [ {html_escape(buy_tpl)} ]"
-        order_txt = "🔴 <b>SELL left</b> · 🟢 <b>BUY right</b>"
+    default_url = "(merchant profile URL)" if link_mode() == "profile" else "(ad link template)"
+    buy_url = s.get("btn_buy_url") or default_url
+    sell_url = s.get("btn_sell_url") or default_url
+    order_txt = "🟢 <b>BUY left</b> · 🔴 <b>SELL right</b>" if buttons_order() == "buy_sell" else "🔴 <b>SELL left</b> · 🟢 <b>BUY right</b>"
+    labels = {"buy": buy_tpl, "sell": sell_tpl}
+    sides = ("buy", "sell") if buttons_order() == "buy_sell" else ("sell", "buy")
+    preview_labels = [labels[side] for side in sides if builtin_button_enabled(side)]
+    preview_labels += [button["label"] for button in extra_buttons()]
+    preview_row = "\n".join(" ".join(f"[ {html_escape(label)} ]" for label in preview_labels[i:i + 2])
+                            for i in range(0, len(preview_labels), 2))
+    if not preview_row:
+        preview_row = "<i>No buttons. Restore BUY/SELL or add a custom button.</i>"
     return (
-        f"🟢🔴 <b>Buy / Sell buttons</b>\n\n"
+        f"🔘 <b>Buy / Sell buttons &amp; extras</b>\n\n"
         f"These are the inline buttons under the price post in your group.\n\n"
-        f"🔘 Buttons: <b>{on}</b>\n"
-        f"🔄 Order: {order_txt}\n\n"
+        f"🔘 All buttons: <b>{on}</b>\n"
+        f"🟢 BUY: <b>{'included' if builtin_button_enabled('buy') else 'removed'}</b> · "
+        f"🔴 SELL: <b>{'included' if builtin_button_enabled('sell') else 'removed'}</b>\n"
+        f"🧩 Extra buttons: <b>{len(extra_buttons())}/{MAX_EXTRA_BUTTONS}</b>\n"
+        f"Use Remove/Restore for BUY or SELL, or ➕ Add button for your own link.\n"
+        f"🔄 Buy/Sell order: {order_txt}\n\n"
         f"🟢 <b>BUY label:</b>\n<code>{html_escape(buy_tpl)}</code>\n"
         f"🔴 <b>SELL label:</b>\n<code>{html_escape(sell_tpl)}</code>\n\n"
         f"🔗 BUY link: <code>{html_escape(buy_url)}</code>\n"
@@ -599,10 +762,11 @@ def buttons_menu_text():
         + ("   Each button opens the ad the price was read from "
            "(🟡 Binance = one specific ad, others = market page + ad hint).\n"
            if link_mode() == "ad" else
-           "   Tap 🎯 Target to send buyers straight to the exact ad instead.\n")
-        + "\n"
-        f"<b>Row preview (per merchant):</b>\n{preview_row}\n\n"
-        f"<b>Label placeholders:</b>\n"
+           "   Both buttons open the merchant's public P2P profile.\n"
+           "   Users choose an ad there; no order is placed automatically.\n")
+        + "   Custom BUY/SELL links override the selected target.\n\n"
+        f"<b>Configured buttons (per merchant, two per row):</b>\n{preview_row}\n\n"
+        f"<b>BUY/SELL label placeholders:</b>\n"
         f"<code>{{PRICE}}</code> <code>{{NICK}}</code> <code>{{FULLNICK}}</code> <code>{{EXCHANGE}}</code> "
         f"<code>{{ICON}}</code> <code>{{AMOUNT}}</code> <code>{{ASSET}}</code> <code>{{FIAT}}</code> "
         f"<code>{{PAIR}}</code> <code>{{SIDE}}</code>\n"
@@ -716,7 +880,7 @@ def apply_body_template(tpl: str, m: Merchant, r: dict) -> str:
     if not tpl:
         return ""
     nick = m.nickname or m.merchant_id
-    link = f'<a href="{m.url}">{nick}</a>' if m.url else nick
+    link = f'<a href="{m.profile_url}">{nick}</a>' if m.profile_url else nick
     sell_amt = fmt_amount(r.get("sell_amount")) or "—"
     buy_amt = fmt_amount(r.get("buy_amount")) or "—"
     sell, buy = fmt(r.get("sell")), fmt(r.get("buy"))
@@ -731,12 +895,12 @@ def apply_body_template(tpl: str, m: Merchant, r: dict) -> str:
         "ICON": ICON.get(m.exchange, "💱"),
         "EXCHANGE": m.exchange.title(), "exchange": m.exchange, "Exchange": m.exchange.title(),
         "NICK": nick, "nick": nick, "Nick": (nick[:1].upper() + nick[1:]) if nick else nick,
-        "URL": m.url or "", "url": m.url or "",
+        "URL": m.profile_url or "", "url": m.profile_url or "",
         "LINK": link, "Link": link,
         "SELL": sell, "Sell": sell, "BUY": buy, "Buy": buy,
         "SELL_AMOUNT": sell_amt, "BUY_AMOUNT": buy_amt,
         "SELL_LIQ": sell_amt, "BUY_LIQ": buy_amt,
-        # exact-ad links of the prices above (see adlinks.py)
+        # selected profile/ad targets and optional ad links (see adlinks.py)
         "SELL_URL": sell_links["best"], "BUY_URL": buy_links["best"],
         "SELL_AD_URL": sell_links["ad"], "BUY_AD_URL": buy_links["ad"],
         "SELL_AD_ID": sell_links["ad_id"], "BUY_AD_ID": buy_links["ad_id"],
@@ -753,6 +917,60 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     txt = u.message.text.strip()
 
     awaiting = edit_get(u, "awaiting_custom")
+    if isinstance(awaiting, str) and (awaiting in ("extra_add_label", "extra_add_url")
+                                      or awaiting.startswith(("extra_label:", "extra_url:"))):
+        if txt.lower() == "/cancel":
+            edit_pop(u, "awaiting_custom")
+            return await u.message.reply_text("❌ Cancelled.", reply_markup=buttons_menu_kb())
+        creating = awaiting.startswith("extra_add_")
+        field = "label" if awaiting == "extra_add_label" or awaiting.startswith("extra_label:") else "url"
+        button = None if creating else extra_button(awaiting.split(":", 1)[1])
+        if not creating and button is None:
+            edit_pop(u, "awaiting_custom")
+            return await u.message.reply_text("This button was removed. No changes saved.",
+                                              reply_markup=extra_buttons_kb())
+        if field == "label":
+            value = clean_extra_button_label(txt)
+            if not value:
+                return await u.message.reply_text("❌ Send a non-empty label of 1–60 characters, or /cancel.")
+            if creating:
+                # Store the draft and next step together: the next message may
+                # reach a different Vercel instance. Nothing is published yet.
+                edits_of(u).update({"awaiting_custom": "extra_add_url", "extra_button_label": value})
+                save()
+                return await u.message.reply_html(
+                    f"Label: <b>{html_escape(value)}</b>\n\n" + extra_button_prompt("url"),
+                    reply_markup=KB([[B("❌ Cancel", callback_data="cancel_edit")]]))
+        else:
+            value = txt
+            if not valid_extra_button_url(value):
+                return await u.message.reply_text(
+                    "❌ Use a valid https://, http:// or tg:// link, or {URL} for the merchant profile. "
+                    "Maximum 2048 characters; no spaces or embedded login credentials. Try again or /cancel.")
+        items = extra_buttons()
+        if creating:
+            if len(items) >= MAX_EXTRA_BUTTONS:
+                edit_pop(u, "awaiting_custom")
+                return await u.message.reply_text(f"You can add up to {MAX_EXTRA_BUTTONS} extra buttons. Remove one first.",
+                                                  reply_markup=extra_buttons_kb())
+            label = clean_extra_button_label(edit_get(u, "extra_button_label"))
+            if not label:
+                edit_pop(u, "awaiting_custom")
+                return await u.message.reply_text("The button draft is missing. Tap Add button to start again.",
+                                                  reply_markup=buttons_menu_kb())
+            button = {"id": secrets.token_hex(6), "label": label, "url": value}
+            items.append(button)
+        else:
+            for item in items:
+                if item["id"] == button["id"]:
+                    item[field] = value
+                    button = item
+                    break
+        state["settings"]["extra_buttons"] = items
+        edit_pop(u, "awaiting_custom")  # saves the complete button and clears its draft atomically
+        return await u.message.reply_html("✅ Button saved.\n\n" + extra_button_text(button),
+                                           reply_markup=extra_button_kb(button["id"]))
+
     if awaiting in ("header", "body", "footer"):
         if txt.lower() == "/cancel":
             edit_pop(u, "awaiting_custom")
@@ -884,7 +1102,7 @@ def report(prices):
             continue
         nick_display = m.nickname or m.merchant_id
         lines.append(f"{ICON[m.exchange]} <b>{m.exchange.title()}</b> · "
-                     f"<a href=\"{m.url}\">{nick_display}</a>")
+                     f"<a href=\"{m.profile_url}\">{nick_display}</a>")
         if r.get("error"):
             lines.append(f"   ⚠️ {r['error']}\n")
             continue
@@ -893,7 +1111,7 @@ def report(prices):
         sell_amt = fmt_amount(r.get("sell_amount")) if s.get("show_liquidity") else None
         buy_amt = fmt_amount(r.get("buy_amount")) if s.get("show_liquidity") else None
 
-        # make the prices themselves open the exact ad the price came from
+        # Prices follow the selected target, just like default Buy/Sell buttons.
         if s.get("price_links", True):
             sell_url = side_links("sell", m, r)["best"]
             buy_url = side_links("buy", m, r)["best"]
@@ -965,8 +1183,8 @@ def render_btn_label(tpl: str, m: Merchant, price, amount, side: str) -> str:
 def btn_url(side: str, m: Merchant, r: dict | None = None) -> str:
     """Link behind a Buy/Sell button.
 
-    Priority: custom override (settings ▸ 🔗 BUY/SELL link) → the exact ad the
-    shown price was taken from → the merchant profile → the exchange market page.
+    A custom URL wins; otherwise use the selected target (merchant profile by
+    default). Try the other target if unavailable, then the market page.
     """
     custom = (get_settings().get(f"btn_{side}_url") or "").strip()
     if custom:
@@ -976,9 +1194,10 @@ def btn_url(side: str, m: Merchant, r: dict | None = None) -> str:
 
 def report_keyboard(prices):
     s = get_settings()
-    if not s.get("show_buttons"):
+    if not s.get("show_buttons", True):
         return None
-    rows = []
+    rows, count = [], 0
+    custom_buttons = extra_buttons()
     for m in merchants():
         r = prices.get(m.key)
         if not r:
@@ -987,24 +1206,33 @@ def report_keyboard(prices):
         buy_btn = sell_btn = None
         # NOTE: a merchant's BUY ad is where the user sells, and vice-versa —
         # the labels keep the exchange wording, only their order is configurable.
-        # Each button links to the exact ad its price came from (btn_link_mode).
-        if buy is not None:
+        # Both buttons open the merchant profile by default (btn_link_mode).
+        if buy is not None and builtin_button_enabled("buy"):
             buy_url = btn_url("buy", m, r)
             if buy_url:
                 buy_btn = B(render_btn_label(buy_label_tpl(), m, buy, r.get("buy_amount"), "buy"),
                             url=buy_url)
-        if sell is not None:
+        if sell is not None and builtin_button_enabled("sell"):
             sell_url = btn_url("sell", m, r)
             if sell_url:
                 sell_btn = B(render_btn_label(sell_label_tpl(), m, sell, r.get("sell_amount"), "sell"),
                              url=sell_url)
         pair = [buy_btn, sell_btn] if buttons_order() == "buy_sell" else [sell_btn, buy_btn]
-        row = [b for b in pair if b]
-        if row:
-            rows.append(row)
-    if not rows:
-        return None
-    return KB(rows)
+        merchant_buttons = [button for button in pair if button]
+        for button in custom_buttons:
+            url = m.profile_url if button["url"] in PROFILE_BUTTON_URLS else button["url"]
+            # A missing/broken profile must not invalidate the entire keyboard.
+            if valid_extra_button_url(url) and url not in PROFILE_BUTTON_URLS:
+                merchant_buttons.append(B(button["label"], url=url))
+        remaining = MAX_REPORT_BUTTONS - count
+        visible = merchant_buttons[:remaining]
+        rows.extend(visible[i:i + 2] for i in range(0, len(visible), 2))
+        count += len(visible)
+        if len(merchant_buttons) > remaining:
+            log.warning("Price-post keyboard capped at %s buttons; reduce merchants or extra buttons",
+                        MAX_REPORT_BUTTONS)
+            break
+    return KB(rows) if rows else None
 
 # ── deletion helpers ──
 async def delete_last_group_message(bot):
@@ -1052,6 +1280,9 @@ async def post(bot, force=False):
     snap["_btn_sell"] = s.get("btn_sell_label", "")
     snap["_btn_buy_url"] = s.get("btn_buy_url", "")
     snap["_btn_sell_url"] = s.get("btn_sell_url", "")
+    snap["_btn_buy_enabled"] = builtin_button_enabled("buy")
+    snap["_btn_sell_enabled"] = builtin_button_enabled("sell")
+    snap["_extra_buttons"] = extra_buttons()  # detached copy: edits must change the snapshot
     snap["_link_mode"] = link_mode()
     snap["_ad_templates"] = ad_templates()
     snap["_price_links"] = bool(s.get("price_links", True))
@@ -1168,8 +1399,61 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await q.edit_message_text(custom_menu_text(), parse_mode="HTML", reply_markup=custom_menu_kb())
 
     elif d == "buttons_menu":
+        if edit_get(u, "awaiting_custom"):
+            edit_pop(u, "awaiting_custom")
         await q.answer()
         return await q.edit_message_text(buttons_menu_text(), parse_mode="HTML", reply_markup=buttons_menu_kb())
+
+    elif d in ("remove_buy_button", "remove_sell_button", "restore_buy_button", "restore_sell_button"):
+        action, side, _ = d.split("_")
+        state["settings"][f"btn_{side}_enabled"] = action == "restore"
+        save()
+        await q.answer(f"{side.upper()} button {'restored' if action == 'restore' else 'removed'}")
+        return await q.edit_message_text(buttons_menu_text(), parse_mode="HTML", reply_markup=buttons_menu_kb())
+
+    elif d == "extra_buttons":
+        if edit_get(u, "awaiting_custom"):
+            edit_pop(u, "awaiting_custom")
+        await q.answer()
+        return await q.edit_message_text(extra_buttons_text(), parse_mode="HTML", reply_markup=extra_buttons_kb())
+
+    elif d == "extra_add":
+        if len(extra_buttons()) >= MAX_EXTRA_BUTTONS:
+            return await q.answer(f"Limit: {MAX_EXTRA_BUTTONS} extra buttons. Delete one first.", show_alert=True)
+        edit_set(u, "awaiting_custom", "extra_add_label")
+        await q.answer()
+        return await q.edit_message_text(extra_button_prompt("label"), parse_mode="HTML",
+                                          reply_markup=KB([[B("❌ Cancel", callback_data="cancel_edit")]]))
+
+    elif d.startswith(("extra_button:", "extra_label:", "extra_url:", "extra_remove:", "extra_delete:")):
+        action, ident = d.split(":", 1)
+        button = extra_button(ident)
+        if button is None:
+            return await q.answer("This button no longer exists. Open Manage buttons again.", show_alert=True)
+        if action == "extra_button":
+            if edit_get(u, "awaiting_custom"):
+                edit_pop(u, "awaiting_custom")
+            await q.answer()
+            return await q.edit_message_text(extra_button_text(button), parse_mode="HTML",
+                                              reply_markup=extra_button_kb(ident))
+        if action in ("extra_label", "extra_url"):
+            field = "label" if action == "extra_label" else "url"
+            edit_set(u, "awaiting_custom", d)
+            await q.answer()
+            return await q.edit_message_text(
+                extra_button_prompt(field) + f"\n\nCurrent: <code>{html_escape(button[field])}</code>",
+                parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="cancel_edit")]]))
+        if action == "extra_remove":
+            await q.answer()
+            return await q.edit_message_text(
+                f"🗑 Delete <b>{html_escape(button['label'])}</b> from future price posts?",
+                parse_mode="HTML", reply_markup=KB([
+                    [B("🗑 Delete", callback_data=f"extra_delete:{ident}"),
+                     B("Keep button", callback_data=f"extra_button:{ident}")]]))
+        state["settings"]["extra_buttons"] = [item for item in extra_buttons() if item["id"] != ident]
+        edit_pop(u, "awaiting_custom")
+        await q.answer("Button deleted")
+        return await q.edit_message_text(extra_buttons_text(), parse_mode="HTML", reply_markup=extra_buttons_kb())
 
     elif d == "adlink_menu":
         await q.answer()
@@ -1262,25 +1546,33 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         side = "buy" if d == "edit_buy_url" else "sell"
         edit_set(u, "awaiting_custom", f"{side}_url")
         icon = "🟢" if side == "buy" else "🔴"
-        cur = state["settings"].get(f"btn_{side}_url") or "(merchant profile URL)"
+        default_url = "(merchant profile URL)" if link_mode() == "profile" else "(ad link template)"
+        cur = state["settings"].get(f"btn_{side}_url") or default_url
         await q.answer()
         return await q.edit_message_text(
             f"{icon} <b>Send the new {side.upper()} button link</b>\n\n"
-            "By default the button opens the merchant's profile page.\n"
+            "Without a custom link, the button follows the selected Target (default: merchant profile).\n"
             "You can send your own link (e.g. your support chat or a referral page).\n\n"
             "Placeholders: <code>{URL}</code> <code>{NICK}</code> <code>{EXCHANGE}</code> "
             "<code>{ASSET}</code> <code>{FIAT}</code>\n\n"
             f"Current:\n<code>{html_escape(cur)}</code>\n\n"
-            "Send <code>default</code> to go back to the merchant profile URL, or /cancel to abort.",
+            "Send <code>default</code> to clear the override and use the selected Target, or /cancel to abort.",
             parse_mode="HTML",
             reply_markup=KB([[B("❌ Cancel", callback_data="cancel_edit")]])
         )
 
-    elif d == "reset_buttons":
-        for k in ("btn_buy_label", "btn_sell_label", "btn_buy_url", "btn_sell_url"):
-            state["settings"][k] = ""
-        state["settings"]["buttons_order"] = DEFAULT_SETTINGS["buttons_order"]
-        save()
+    elif d in ("reset_buttons", "reset_buttons_confirm"):
+        if d == "reset_buttons" and extra_buttons():
+            await q.answer()
+            return await q.edit_message_text(
+                "♻️ Reset all buttons? This deletes the extra buttons and restores BUY/SELL with profile links.",
+                reply_markup=KB([[B("Reset all buttons", callback_data="reset_buttons_confirm"),
+                                   B("Cancel", callback_data="buttons_menu")]]))
+        for k in ("btn_buy_label", "btn_sell_label", "btn_buy_url", "btn_sell_url",
+                  "btn_buy_enabled", "btn_sell_enabled", "extra_buttons", "show_buttons",
+                  "buttons_order", "btn_link_mode"):
+            state["settings"][k] = deepcopy(DEFAULT_SETTINGS[k])
+        edit_pop(u, "awaiting_custom")
         await q.answer("♻️ Buttons reset to default")
         return await q.edit_message_text(buttons_menu_text(), parse_mode="HTML", reply_markup=buttons_menu_kb())
 

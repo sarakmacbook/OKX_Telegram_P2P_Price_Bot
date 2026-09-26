@@ -224,7 +224,7 @@ docker compose up -d --build
 3. **Paste a merchant URL** into the bot chat to add it:
    - `https://p2p.binance.com/en/advertiserDetail?advertiserNo=…`
    - `https://www.bybit.com/en/fiat/trade/otc/profile/…`
-   - `https://www.okx.com/p2p/market?publicUserId=…`
+   - `https://www.okx.com/p2p/ads-merchant?publicUserId=…`
    - `https://www.bitget.com/p2p/merchant/…`
 4. Tap **🟢 Auto: ON** — prices are posted whenever they change.
 
@@ -237,7 +237,7 @@ docker compose up -d --build
 | 📋 **Merchants** | List merchants — tap one to remove |
 | 👥 **Set group** | One click: choose the group that receives updates |
 | ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup** |
-| 🟢🔴 **Buy/Sell buttons** | Swap Buy/Sell order and edit their labels + links |
+| 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
 | 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer |
 | 👁 **Preview** | See exactly how the group post will look |
 | 🔄 **Refresh** | Refresh the panel |
@@ -258,10 +258,10 @@ Tap **📝 Custom Msg** (or ⚙️ Settings → Edit) to fully customize the gro
 | `{EXCHANGE}` | Exchange name, e.g. `Binance` |
 | `{NICK}` | Merchant nickname |
 | `{LINK}` | Clickable merchant name (`<a>` to the profile) |
-| `{URL}` | Raw merchant profile URL |
+| `{URL}` | Public merchant profile URL (canonical profile route for OKX) |
 | `{SELL}` / `{BUY}` | Best sell / buy price |
 | `{SELL_AMOUNT}` / `{BUY_AMOUNT}` | Available liquidity (if the merchant has ads) |
-| `{SELL_URL}` / `{BUY_URL}` | Link to the exact ad behind that price (profile/market fallback) |
+| `{SELL_URL}` / `{BUY_URL}` | Selected link target: merchant profile by default, or optional ad link |
 | `{SELL_LINK}` / `{BUY_LINK}` | The price itself as a clickable link |
 | `{SELL_AD_ID}` / `{BUY_AD_ID}` | The ad ids the prices came from |
 | `{ERROR}` | Fetch error text, if any |
@@ -276,23 +276,28 @@ HTML (`<b>`, `<i>`, `<code>`, `<a href>`) and new lines are supported. Example 3
 
 Use **👁 Preview** to check the result before it goes to the group.
 
-### 🟢🔴 Buy / Sell buttons — order, labels & links
+### 🔘 Manage buttons — add, remove, labels & links
 
-Under every group post the bot shows one row of inline buttons per merchant. By default it is
-**🟢 BUY on the left · 🔴 SELL on the right** — and everything about them is editable from the
-**private chat with the bot**: tap **🟢🔴 Buy/Sell buttons** on the panel (or ⚙️ Settings →
-**🟢🔴 Edit Buy/Sell buttons**).
+Under every group post the bot shows configurable URL buttons for each merchant. By default it is
+**🟢 BUY on the left · 🔴 SELL on the right**. In the bot's **private admin chat**, tap
+**🔘 Manage buttons** on the panel (or **⚙️ Settings → 🔘 Manage buttons**). You can keep both,
+remove either or both, and add your own buttons. **Buy and Sell still open the merchant's public
+P2P profile by default**, where users can choose an ad themselves.
 
 | Menu item | What it does |
 |---|---|
-| 🔘 **Buttons: ON/OFF** | Show or hide the buttons in the group post |
+| 🔘 **All buttons: ON/OFF** | Show or hide all configured buttons, including extras |
 | 🔄 **Order** | Switch between `🟢 Buy ⬅️ \| Sell ➡️ 🔴` and `🔴 Sell ⬅️ \| Buy ➡️ 🟢` (the price lines in the text follow the same order) |
 | 🟢 **Edit BUY label** | Send your own caption for the Buy button |
 | 🔴 **Edit SELL label** | Send your own caption for the Sell button |
-| 🎯 **Target** | Switch between **the exact ad** of the shown price (default) and the merchant profile page |
+| 🗑 **Remove BUY / SELL** | Remove either built-in button from the post without losing its label or link |
+| ➕ **Restore BUY / SELL** | Bring a removed built-in button back |
+| ➕ **Add button** | Create an extra button: send its label, then its link |
+| 🧩 **Extra buttons** | Select an extra button to edit its label/link or delete it (with confirmation) |
+| 🎯 **Target** | Switch between **the merchant profile page** (default) and optional ad-link templates |
 | 🔗 **BUY / SELL link** | Optional custom URL — overrides the target for that side (`{AD_URL}`, `{AD_ID}`, `{PRICE}`, `{URL}`, `{NICK}`, … available) |
 | 🔗 **Ad link templates** | Edit the deep-link template of each exchange (Binance / Bybit / OKX / Bitget) |
-| ♻️ **Reset buttons to default** | Back to the defaults below |
+| ♻️ **Reset buttons to default** | Restore both Buy/Sell buttons and profile links, clear extras and overrides, and turn buttons ON; asks for confirmation if extras would be deleted |
 
 Defaults:
 
@@ -300,7 +305,7 @@ Defaults:
 🟢 BUY {PRICE} {NICK}      🔴 SELL {PRICE} {NICK}
 ```
 
-**Label placeholders**
+**Buy/Sell label placeholders** (extra-button labels are plain text)
 
 | Placeholder | Replaced with |
 |---|---|
@@ -317,28 +322,75 @@ exact ad), `{AD_ID}`, `{URL}` (merchant profile), `{PRICE}`, `{NICK}`, `{EXCHANG
 `{FIAT}`, `{SIDE}`. Send `default` while editing to restore the
 default label/link, or `/cancel` to abort. Use **👁 Preview** to see the real buttons before posting.
 
-### 🎯 Buy/Sell buttons that open the **exact ad**
+#### Add your own buttons or replace Buy/Sell
 
-Every price in the post comes from one specific ad: the cheapest **SELL** ad and the highest
-**BUY** ad of that merchant. The bot remembers those ad ids and turns the buttons (and,
-optionally, the prices in the text) into links that open **that very ad**, not just the
-merchant's profile.
+1. Open **🔘 Manage buttons → ➕ Add button**.
+2. Send a label, such as `👤 My P2P profile`, `💬 Support` or `📢 Channel` (1–60 characters).
+3. Send its public `https://`, `http://` or `tg://` link (up to 2048 characters).
+   Send **`{URL}`** (or `{PROFILE_URL}`) instead to use each merchant's P2P profile automatically.
+4. Use **👁 Preview**, then **📊 Post prices now** to publish the updated buttons.
+
+For a single **My P2P profile** button instead of Buy and Sell, remove **BUY** and **SELL**,
+then add a button named `👤 My P2P profile` with link `{URL}`. Removing buttons does not remove
+the prices from the message. If you remove both defaults and all extras, no keyboard is sent.
+
+Extra buttons appear in their creation order after the remaining Buy/Sell buttons **for each
+merchant**, laid out two per row. You can add up to **8 extra buttons**. The bot caps the full
+post's keyboard at **100 buttons**; with many merchants, reduce the number of extras/merchants
+if some buttons are omitted. The **All buttons** switch hides everything without deleting it.
+
+A new button is saved only after both a valid label and link have been provided. Send `/cancel`
+or tap **Cancel** to discard a draft. Drafts and completed buttons use the shared state store,
+so they survive restarts and Vercel requests; two admins' drafts are kept separate. Only IDs
+in `ADMIN_IDS` can manage the buttons. Extra labels are literal plain text (not HTML or templates),
+and extra links support only a full URL or the exact `{URL}` / `{PROFILE_URL}` placeholder.
+
+To change or remove an extra button, open **🧩 Extra buttons**, select it, then **Edit label**,
+**Edit link**, or **Delete button**. Deletion asks for confirmation. Changes apply to the next
+post (including auto-posts even when prices have not changed); existing Telegram messages keep
+their old buttons until replaced.
+
+### 👤 Buy/Sell buttons open the **merchant profile**
+
+Both **BUY** and **SELL** open the public P2P profile of the merchant in that row. For OKX,
+the bot builds `https://www.okx.com/p2p/ads-merchant?publicUserId=…` from the saved merchant's
+public ID. This also fixes older saved marketplace-style URLs; you do not need to re-add
+the merchant. Linked prices and the merchant name use the same profile destination.
+
+Users select an ad and complete the trade on OKX themselves. The bot does **not** automatically
+click Buy/Sell or place an order, and it does not force the OKX app to open: app/browser
+handling depends on the user's device and Telegram settings.
+
+Existing installations switch from the old ad target to the profile target once on upgrade.
+Custom BUY/SELL link overrides are preserved and still take priority. To clear one without
+changing extra buttons, edit its **BUY / SELL link** and send `default`.
+**🔘 Manage buttons → ♻️ Reset buttons to default** restores both built-in buttons and the
+profile target, but also deletes extra buttons after confirmation.
+After restarting/redeploying, use **📊 Post prices now** to publish the new links (old Telegram
+messages retain their original buttons).
 
 ```
 📊 P2P USDT/USD
 
 ⚫ Okx · Fast_sonic
-   🟢 Best BUY  (you sell): 1.001          ← button → that exact BUY ad
-   🔴 Best SELL (you buy):  0.999          ← button → that exact SELL ad
+   🟢 Best BUY  (you sell): 1.001          ← button → merchant profile
+   🔴 Best SELL (you buy):  0.999          ← button → merchant profile
 [🟢 BUY 1.001 Fast_sonic] [🔴 SELL 0.999 Fast_sonic]
 ```
 
-* ⚙️ **Settings → 🎯 Exact ad links** switches the buttons (and prices) between
-  **the exact ad** and the **merchant profile page**. Default: exact ad.
+* ⚙️ **Settings → 🎯 Exact ad links** can opt back into ad-link templates. It is **OFF**
+  by default, so buttons and linked prices open the **merchant profile**. A choice made
+  after the upgrade survives restarts and serverless requests.
 * ⚙️ **Settings → 🔗 Link prices** makes the prices inside the post clickable too.
 * ⚙️ **Settings → 🔗 Ad link templates** — one template per exchange, editable from Telegram
   (or via the `AD_LINK_TEMPLATES` env var). Placeholders: `{AD_ID}` `{ASSET}` `{ASSET_LOWER}`
   `{FIAT}` `{FIAT_LOWER}` `{SIDE}` `{TAKER_SIDE}` `{ACTION_TYPE}` `{URL}` `{NICK}`.
+
+#### Optional ad-link templates
+
+The bot still remembers the IDs behind each price (the cheapest merchant SELL ad and highest
+merchant BUY ad). If you explicitly enable ad links, these templates are used instead of the
+profile. They are also available as a fallback when no profile URL can be resolved.
 
 Built-in templates and how precise they are:
 
