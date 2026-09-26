@@ -914,16 +914,29 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
                            runtime.get("state_backend") or storage.state_backend())
     redis_connected = bool(storage.redis_config())
 
+    # A configured deployment is editable in the browser when the owner has
+    # supplied SETUP_SECRET.  ``edit_authorized`` is set only after the GET
+    # request proves the secret; it is deliberately not persisted in status.
     if status["ready"] and not status.get("setup_secret"):
         return (
             '<section class="panel" aria-labelledby="form-title">'
-            '<div class="panel-heading"><div><h2 id="form-title">Add the required settings</h2>'
+            '<div class="panel-heading"><div><h2 id="form-title">Reconfigure the bot</h2>'
             '<p class="subtle">Locked — this deployment is configured.</p></div></div>'
             f'<p class="locked">🔒 Everything is in place, so the form is closed: an open page '
-            f'must not be able to change a running bot. To change a setting from the browser, '
-            f'set <code>SETUP_SECRET</code> in the deployment environment and reopen '
-            f'<code>{html.escape(SETUP_PATH)}</code>. In a terminal, '
+            f'must not be able to change a running bot. To edit settings from the browser, '
+            f'set <code>SETUP_SECRET</code> in the deployment environment, then open '
+            f'<code>{html.escape(SETUP_PATH)}?secret=…</code>. In a terminal, '
             f'<code>python setup_cli.py</code> writes to the same store.</p></section>')
+
+    if status.get("edit_authorized"):
+        # Keep the authorization across the form submit without putting the
+        # secret in the URL again. The value is password-like and never echoed
+        # into the page; POST authorization still validates it server-side.
+        fields_hidden = '<input type="hidden" name="SETUP_SECRET" value="' + html.escape(
+            str(status.get("edit_secret", ""))) + '">'
+    else:
+        fields_hidden = ""
+
 
     fields = [
         _field("BOT_TOKEN", "Telegram bot token", "From @BotFather → /newbot.",
@@ -965,7 +978,7 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
         _field("INTERVAL", "Check every N seconds", "Polling installs only; Vercel uses its cron.",
                value=values.get("INTERVAL", ""), placeholder="60"),
     ])
-    if needs_secret:
+    if needs_secret and not status.get("edit_authorized"):
         fields.append(_field("SETUP_SECRET", "Setup secret",
                              "This deployment protects the form with SETUP_SECRET.",
                              secret=True, placeholder="the value of SETUP_SECRET"))
@@ -984,7 +997,7 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
         <span class="badge {'ready' if persistent else 'optional'}">{'persistent store' if persistent else 'temporary store'}</span>
       </div>
       <form method="post" action="{html.escape(SETUP_PATH)}" class="form">
-        {''.join(fields)}
+        {fields_hidden}{''.join(fields)}
         <details class="advanced"><summary>Optional: asset, fiat and interval</summary>{advanced}</details>
         <p class="where">💾 {html.escape(str(store))} — {html.escape(where)} Values are never
           shown again; only a redacted copy appears in the checklist.</p>
