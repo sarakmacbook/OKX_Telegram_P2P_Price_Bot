@@ -1000,6 +1000,42 @@ python setup_cli.py --show</code></pre>
     </section>"""
 
 
+def _db_guide_panel() -> str:
+    """Step-by-step instructions for inserting the KV / Redis database.
+
+    The form above asks for ``KV_REST_API_URL`` and ``KV_REST_API_TOKEN`` —
+    this panel explains where those two values come from and what to do with
+    them: create an Upstash database and paste its REST pair into the form,
+    or let Vercel's Storage integration write the environment pair itself.
+    """
+    return """
+    <section class="panel" aria-labelledby="db-guide-title">
+      <div class="panel-heading"><div><h2 id="db-guide-title">How to insert the database</h2>
+        <p class="subtle">Where the KV / Redis URL and token come from — and what to do with them.</p></div>
+        <span class="badge optional">KV / Redis</span></div>
+
+      <h3 class="guide-option">Option A — create a free Upstash database, paste the pair into the form</h3>
+      <div class="steps">
+        <article class="step"><span class="number">1</span><div><h3>Open the Upstash console</h3><p>Sign in at <a href="https://console.upstash.com" target="_blank" rel="noopener">console.upstash.com</a> — a free account is enough, the bot only stores one small JSON document.</p></div></article>
+        <article class="step"><span class="number">2</span><div><h3>Create the database</h3><p><b>Create Database</b> → give it any name → pick the region closest to the deployment (e.g. <code>eu-central-1</code> for the <code>fra1</code> region pinned in <code>vercel.json</code>) → <b>Create</b>.</p></div></article>
+        <article class="step"><span class="number">3</span><div><h3>Copy the REST credentials</h3><p>Open the new database and scroll to <b>REST API</b>. <code>UPSTASH_REDIS_REST_URL</code> is the <b>KV / Redis REST URL</b> (<code>KV_REST_API_URL</code>) in the form above, <code>UPSTASH_REDIS_REST_TOKEN</code> is the <b>KV / Redis REST token</b> (<code>KV_REST_API_TOKEN</code>).</p></div></article>
+        <article class="step"><span class="number">4</span><div><h3>Paste them into the form and save</h3><p>Leave <b>State database</b> (<code>P2P_STATE_BACKEND</code>) on <code>auto</code> or set it to <code>redis</code>, paste both values, then press <b>💾 Save settings</b>. This instance starts using the database immediately — no redeploy.</p></div></article>
+      </div>
+
+      <h3 class="guide-option">Option B — let Vercel connect the storage for you</h3>
+      <div class="steps">
+        <article class="step"><span class="number">1</span><div><h3>Vercel dashboard → your project → Storage</h3><p><b>Create Database</b> → choose <b>Upstash for Redis</b> (or <b>Vercel KV</b>) → confirm the region → <b>Create</b>.</p><a href="https://vercel.com/dashboard" target="_blank" rel="noopener">Open Vercel dashboard ↗</a></div></article>
+        <article class="step"><span class="number">2</span><div><h3>Connect it to this project</h3><p><b>Connect to this project</b> → keep the proposed variable names <code>KV_REST_API_URL</code> + <code>KV_REST_API_TOKEN</code>. Vercel writes the pair into the environment variables for you — nothing to copy-paste.</p></div></article>
+        <article class="step"><span class="number">3</span><div><h3>Redeploy</h3><p>Environment variables only apply to new deployments: <b>Deployments → ⋯ → Redeploy</b>. After that every cold start reads the database pair from the environment — the durable path on Vercel.</p></div></article>
+      </div>
+
+      <p class="subtle" style="margin-top:13px">ℹ️ Values saved in the form live in this deployment's
+        own state store. On Vercel, also add <code>KV_REST_API_URL</code> +
+        <code>KV_REST_API_TOKEN</code> to <b>Settings → Environment Variables</b> (Option B does it
+        automatically) so other instances and cold starts read the same database.</p>
+    </section>"""
+
+
 def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = None,
                 form_values: dict | None = None) -> str:
     """Render a polished, actionable first-start web UI.
@@ -1009,6 +1045,11 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     (``python setup_cli.py``, which can be skipped with ``--skip`` and writes to
     the very same store), and the deployment's environment variables — the only
     option for ``CRON_SECRET``, which Vercel's cron reads from there.
+
+    A "How to insert the database" panel sits under the form and walks through
+    getting the KV/Redis pair: create an Upstash database and paste its REST
+    URL + token into the form, or connect the storage in the Vercel dashboard
+    (which writes ``KV_REST_API_URL`` + ``KV_REST_API_TOKEN`` by itself).
 
     Secrets are accepted over HTTPS and stored in the deployment's own state
     store; they are never echoed back, and the form closes (or requires
@@ -1037,6 +1078,7 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     checks_markup = "\n".join(cards)
     banner_markup = _banner(banner)
     form_markup = _setup_form(status, form_values)
+    db_guide_markup = _db_guide_panel()
     terminal_markup = _terminal_panel(status)
     missing = status.get("missing") or "the required environment variables"
     deployment_note = (
@@ -1124,6 +1166,7 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     .field small {{ color: var(--muted); }}
     .advanced summary {{ cursor: pointer; color: #c7ceff; font-weight: 700; }}
     .advanced[open] {{ display: grid; gap: 13px; padding-top: 13px; }}
+    .guide-option {{ margin: 20px 0 10px; font-size: 15px; letter-spacing: -.01em; }}
     .where {{ color: var(--muted); margin: 2px 0 0; font-size: 13px; }}
     .locked {{ color: var(--muted); margin: 0; }}
     .shell-code, pre.shell {{ overflow-x: auto; margin: 0; padding: 16px; border-radius: 15px; border: 1px solid var(--line); background: #080c17; }}
@@ -1148,6 +1191,7 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
       </div>
     </section>
     {form_markup}
+    {db_guide_markup}
 
     <section class="panel" aria-labelledby="check-title">
       <div class="panel-heading"><div><h2 id="check-title">Environment checklist</h2><p class="subtle">Values are checked without displaying any secrets.</p></div></div>
