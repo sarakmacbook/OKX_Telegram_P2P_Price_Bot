@@ -20,6 +20,11 @@ Redis is configured by any of::
 
 Nothing here ever raises: a failed write is logged and the in-memory state
 stays the source of truth for the running process.
+
+This module is also the single source of the "connect a database" link the bot
+panel, the setup page and the status page show when no shared database is
+connected (:func:`database_link`) — the destination is deployment specific, so
+it is resolved in one place instead of being spelled out in three UIs.
 """
 
 from __future__ import annotations
@@ -47,6 +52,13 @@ REDIS_ENV_PAIRS = (
     ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
     ("REDIS_REST_URL", "REDIS_REST_TOKEN"),
 )
+
+# Where the owner connects a database: Vercel's Storage page, which is where
+# "Connect to this project" writes KV_REST_API_URL + KV_REST_API_TOKEN into the
+# deployment environment.  P2P_DATABASE_LINK overrides it for a team- or
+# project-specific storage page, an Upstash console, or a self-hosted Redis.
+DEFAULT_DATABASE_LINK = "https://vercel.com/dashboard/stores"
+DATABASE_LINK_ENV = "P2P_DATABASE_LINK"
 
 
 def normalize_backend(value: str | None) -> str | None:
@@ -90,6 +102,33 @@ def redis_config() -> tuple[str, str] | None:
         if url and token:
             return url, token
     return None
+
+
+def database_link() -> str:
+    """Where to connect a shared database (Vercel's Storage page by default).
+
+    One link, used by every surface that tells the owner how to make the bot
+    remember things: the panel in Telegram, the first-start page and the status
+    page.  ``P2P_DATABASE_LINK`` points it at your own storage page, an Upstash
+    console or a self-hosted Redis; a value that is not an http(s) URL is
+    ignored, so a typo cannot turn a button into a broken link.
+    """
+    explicit = (os.getenv(DATABASE_LINK_ENV) or "").strip()
+    if explicit.startswith(("http://", "https://")) and len(explicit) > len("https://"):
+        return explicit
+    return DEFAULT_DATABASE_LINK
+
+
+def database_connected(store=None) -> bool:
+    """Whether state is kept in a shared Redis-compatible database.
+
+    Pass the store in use (``bot.STORE``) for the verified answer; without one
+    this reports whether a complete credential pair exists in the environment,
+    which is what the setup page can know before the bot may import.
+    """
+    if store is not None:
+        return getattr(store, "backend", "none") == "redis"
+    return redis_config() is not None
 
 
 class RedisStore:

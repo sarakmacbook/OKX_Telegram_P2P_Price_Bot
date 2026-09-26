@@ -27,6 +27,7 @@ from serverless import (                                          # noqa: E402
     page, process_update, setup_status, state_status, webhook_secret,
     webhook_secret_note,
 )
+from storage import database_link                                 # noqa: E402
 
 log = logging.getLogger("p2p-bot.serverless.webhook")
 
@@ -84,6 +85,8 @@ async def _status(request: Request) -> Response:
         "auto_posting": bool(bot_module.state.get("auto")),
         "state": state_status(),
         "webhook_secret": webhook_secret_note(),
+        # Scripts get the same "connect a database" link the page renders.
+        "connect_database": database_link(),
     }
     if check_webhook:
         try:
@@ -197,15 +200,19 @@ def _status_page(data: dict) -> str:
         "Register the webhook again at any time: /api/webhook?register=1",
         "Diagnose empty prices: /api/webhook?check=1 fetches every merchant once and shows errors.",
     ]
+    links: list[tuple[str, str]] = []
     if not state.get("persistent"):
         notes.append("Make the bot remember anything: Vercel dashboard → Storage → add Upstash for "
                      "Redis → Connect to this project → Redeploy.")
+        # The one-click way there, right under the warning that says it is needed.
+        links.append(("🔌 Connect database ↗", database_link()))
+    links.append(("↻ Check the webhook again", "/api/webhook?register=1"))
     if "prices" in data:
         price_rows, price_warnings = _price_check_presentation(data["prices"] or {},
                                                                data.get("region"))
         rows.extend(price_rows)
         warnings.extend(price_warnings)
-    return page("🤖 P2P Price Bot · Vercel", rows, notes=notes, warnings=warnings)
+    return page("🤖 P2P Price Bot · Vercel", rows, notes=notes, warnings=warnings, links=links)
 
 
 async def app(scope, receive, send) -> None:

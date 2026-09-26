@@ -64,9 +64,13 @@ environment-only (Vercel's cron sends it from there).
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot&env=BOT_TOKEN,ADMIN_IDS,KV_REST_API_URL,KV_REST_API_TOKEN&envDescription=BOT_TOKEN%20and%20ADMIN_IDS%20are%20required%3B%20KV_REST_API_URL%2FTOKEN%20come%20from%20the%20KV%20or%20Upstash%20integration&project-name=p2p-price-bot)
 
 1. **Import** the repository into Vercel.
-2. **Connect storage** from **Storage → Upstash for Redis** (or Vercel KV) →
-   **Connect to this project**, then confirm `KV_REST_API_URL` and
-   `KV_REST_API_TOKEN` exist in the project's environment variables.
+2. **Connect storage** — [**Storage**](https://vercel.com/dashboard/stores) →
+   **Upstash for Redis** (or Vercel KV) → **Connect to this project**, then
+   confirm `KV_REST_API_URL` and `KV_REST_API_TOKEN` exist in the project's
+   environment variables. The deployment itself links there whenever no store is
+   connected: the **🔌 Connect database ↗** button on `/api/setup` and on the
+   status page, and — in Telegram — the same button in the panel, in ⚙️ Settings
+   and behind `/database`.
 3. Set `BOT_TOKEN` and `ADMIN_IDS` in **Settings → Environment Variables**.
 4. **Deploy**. If anything is missing, the deployment URL opens the first-start
    web UI and tells you which redacted checklist item still needs attention.
@@ -116,6 +120,11 @@ curl -s "https://<your-app>.vercel.app/api/webhook?register=1"  # force a re-reg
 1. Open your bot → `/start` → tap **👥 Set group** and pick your group.
 2. Paste a merchant URL (`p2p.binance.com/…`, `bybit.com/…`, `okx.com/…`, `bitget.com/…`).
 3. Tap **🟢 Auto: ON**. From then on every cron run posts the prices when they changed.
+
+If the panel still shows **🔌 Connect database ↗**, no KV store reached the
+deployment: tap it (or send `/database`) to open **Vercel → Storage**, connect
+Upstash for Redis to the project, redeploy, then tap **🔄 Check connection** — the
+bot re-reads the credentials and switches store without a restart.
 
 Prefer a **separate bot token for preview deployments**: each preview has its own
 domain and would otherwise re-register the same bot's webhook away from production.
@@ -172,6 +181,7 @@ in its answer) — anyone who knows the URL could then trigger a post, so set it
 | `UPSTASH_REDIS_REST_URL` + `…_TOKEN`, `REDIS_REST_URL` + `…_TOKEN` | alt. | other Redis-REST providers, same idea |
 | `P2P_STATE_BACKEND` | – (`auto`) | choose `auto`, `redis`, or `file`; use `redis` on Vercel. `file` is intentionally not accepted as persistent Vercel state even when a KV pair exists (`P2P_STORAGE_BACKEND` is an alias) |
 | `P2P_STATE_KEY` | – | key the state lives under (default `p2p-price-bot:state`) |
+| `P2P_DATABASE_LINK` | – | destination of the **🔌 Connect database** link the bot (`/database`, the panel, ⚙️ Settings) and the setup/status pages show when no KV store is connected. Default `https://vercel.com/dashboard/stores`; set it to your team's storage page, an Upstash console or your own Redis docs |
 | `SETUP_SECRET` | – (recommended) | locks the `/api/setup` form: every submission must carry it (form field, `?secret=`, or `Authorization: Bearer`). Without it the form is open while the deployment is unconfigured and closes once it is ready |
 | `P2P_CONFIG_KEY` | – | key the settings saved by the form / `setup_cli.py` live under (default `p2p-price-bot:config`) |
 | `P2P_RUNTIME_CONFIG_FILE` | – | file those settings live in when there is no Redis (default `runtime_config.json` next to the data file) |

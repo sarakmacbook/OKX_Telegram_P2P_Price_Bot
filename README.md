@@ -99,6 +99,31 @@ The setup page has the same **State database** selector. From a terminal use
 `P2P_STORAGE_BACKEND` is accepted as an alias. On Vercel select `redis`: file
 state is temporary and is intentionally rejected as a persistent setup.
 
+#### 🔌 Connect database link
+
+When no shared database is connected, every surface says so **and carries the
+link that fixes it** (Vercel → **Storage**, where *Connect to this project*
+writes `KV_REST_API_URL` + `KV_REST_API_TOKEN`):
+
+| Where | What you get |
+|---|---|
+| Telegram panel | a **🗄 Database** line in the status text and — while no store is connected — a **🔌 Connect database ↗** button (it disappears once one is connected) |
+| `/database` (alias `/db`) | the state store in use, the connection steps and the same link, plus **🔄 Check connection** |
+| ⚙️ Settings | a **🗄 Database** button showing `connected ✅` / `connect ⚠️` |
+| `/api/setup` and the status page | a **🔌 Connect database ↗** button above the database panel / next to the *not persistent* warning; scripts reading `/api/webhook` JSON get the URL as `connect_database` |
+
+The destination is `P2P_DATABASE_LINK` (default
+`https://vercel.com/dashboard/stores`) — point it at your own storage page,
+an Upstash console or a self-hosted Redis:
+
+```env
+P2P_DATABASE_LINK=https://vercel.com/dashboard/stores
+```
+
+After connecting a database, tap **🔄 Check connection** in the bot (or reopen
+the page): the bot re-reads the credentials and re-selects the store without a
+restart.
+
 ### Option A — VPS with systemd (recommended)
 
 Paste this on a fresh Ubuntu VPS (20.04 / 22.04 / 24.04):
@@ -236,7 +261,7 @@ docker compose up -d --build
 | 🟢/🔴 **Auto** | Toggle automatic posting on price change |
 | 📋 **Merchants** | List merchants — tap one to remove |
 | 👥 **Set group** | One click: choose the group that receives updates |
-| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup** |
+| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup**, **🖼 button icons & post banner** |
 | 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
 | 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer |
 | 👁 **Preview** | See exactly how the group post will look |
@@ -297,6 +322,8 @@ P2P profile by default**, where users can choose an ad themselves.
 | 🎯 **Target** | Switch between **the merchant profile page** (default) and optional ad-link templates |
 | 🔗 **BUY / SELL link** | Optional custom URL — overrides the target for that side (`{AD_URL}`, `{AD_ID}`, `{PRICE}`, `{URL}`, `{NICK}`, … available) |
 | 🔗 **Ad link templates** | Edit the deep-link template of each exchange (Binance / Bybit / OKX / Bitget) |
+| 🖼 **Button icons** | Put a custom-emoji image (and a colour) in front of any button label — see below |
+| 🖼 **Post banner** | Post a photo with the prices in its caption — see below |
 | ♻️ **Reset buttons to default** | Restore both Buy/Sell buttons and profile links, clear extras and overrides, and turn buttons ON; asks for confirmation if extras would be deleted |
 
 Defaults:
@@ -349,6 +376,53 @@ To change or remove an extra button, open **🧩 Extra buttons**, select it, the
 **Edit link**, or **Delete button**. Deletion asks for confirmation. Changes apply to the next
 post (including auto-posts even when prices have not changed); existing Telegram messages keep
 their old buttons until replaced.
+
+### 🖼 Button icons — an image in front of a button label
+
+Telegram can draw a **custom emoji** (a premium, often animated emoji image) before a button's
+label, and colour the button **green / red / blue** (Bot API 9.4). Open
+**⚙️ Settings → 🖼 Button icons** (or **🔘 Manage buttons → 🖼 Button icons**).
+
+The icon is chosen by **the emoji the label starts with**, so one entry covers every button that
+uses it — the group post, the panel and every menu:
+
+| Set an icon for | …and it appears on |
+|---|---|
+| `🟢` | `🟢 BUY {PRICE} …`, `🟢 Edit BUY label`, and every other 🟢 button |
+| `🔴` | `🔴 SELL {PRICE} …`, `🔴 Edit SELL label`, … |
+| `⚙️`, `📋`, `👁`, `🖼` … | the matching buttons in the panel and the menus |
+
+Tap an emoji, then set its icon in either of two ways:
+
+1. **Forward (or send) the custom emoji** — a message that contains it, or the emoji as a
+   premium sticker. The bot reads its id.
+2. **Paste the numeric id** — e.g. `5368324170671202286`.
+
+**🎨 Colour** cycles that emoji's buttons through *green → red → blue → default*, and
+**🗑 Remove icon** clears the entry. A plain emoji like 😀 has no id — only Telegram *custom*
+emoji do.
+
+> ⚠️ Telegram only shows these icons for bots that bought a username on **Fragment**, or when the
+> bot owner has **Telegram Premium**; other clients simply show the plain emoji. If your Telegram
+> refuses the icons, the bot notices once, logs it, and keeps posting with plain buttons — a price
+> post is never lost because of a decoration.
+
+### 🖼 Post banner — a photo with the prices in its caption
+
+**⚙️ Settings → 🖼 Post banner** puts a picture (your logo, a banner, a rate card) above the
+prices: the post is then sent as a **photo whose caption is the report**, with the buttons under
+it.
+
+* **📤 Send a photo** — send it in the chat; the bot stores Telegram's `file_id` (no re-uploading
+  on every post).
+* **🔗 Use an image URL** — an `https://` JPG/PNG link instead.
+* **👁 Send a test** / **👁 Preview** — see exactly what the group will get.
+* **🗑 Remove banner** — back to a plain text post.
+
+Telegram caps a **photo caption at 1024 characters**, so a longer report is posted as a plain text
+message and the banner is skipped (logged, and the test tells you). A banner Telegram refuses
+(deleted file, dead URL) also falls back to the text post. Deleting the previous message
+(**🗑 Auto-delete prev**) and the `N`-hour auto-delete both cover the banner message too.
 
 ### 👤 Buy/Sell buttons open the **merchant profile**
 

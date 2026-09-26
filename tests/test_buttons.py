@@ -172,11 +172,13 @@ def test_every_menu_renders(bot, merchant, prices):
     bot.state["group"] = -1001234567890
     bot.state["group_title"] = "My P2P group"
     for text in (bot.panel_text(), bot.settings_text(), bot.buttons_menu_text(),
-                 bot.adlink_menu_text(), bot.custom_menu_text()):
+                 bot.adlink_menu_text(), bot.custom_menu_text(), bot.database_text(),
+                 bot.button_icons_text(), bot.banner_text(), bot.icon_editor_text("🟢")):
         assert isinstance(text, str) and text.strip()
     for kb in (bot.panel(), bot.settings_kb(), bot.buttons_menu_kb(),
                bot.adlink_menu_kb(), bot.custom_menu_kb(), bot.list_kb(),
-               bot.report_keyboard(prices)):
+               bot.database_kb(), bot.button_icons_kb(), bot.banner_kb(),
+               bot.icon_editor_kb("🟢"), bot.report_keyboard(prices)):
         assert isinstance(kb, InlineKeyboardMarkup) and kb.inline_keyboard
     # the ad-link screen lists one editor per supported exchange
     callbacks = [b.callback_data for row in bot.adlink_menu_kb().inline_keyboard for b in row]
@@ -253,3 +255,107 @@ def test_post_sends_profile_buttons(bot, merchant, prices, monkeypatch):
     assert asyncio.run(bot.post(telegram)) is True
     keyboard = telegram.send_message.call_args.kwargs["reply_markup"]
     assert [b.url for b in _buttons(keyboard)] == [merchant.profile_url] * 2
+
+
+# ── the "connect database" link ────────────────────────────────────────────
+def test_panel_links_to_the_database_page_when_no_shared_store(bot, monkeypatch):
+    """Nothing remembers the group without a database — so say how to connect one."""
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: False)
+    monkeypatch.setenv("P2P_DATABASE_LINK", "https://vercel.com/dashboard/stores")
+
+    connect = [b for b in _buttons(bot.panel()) if b.text.startswith("🔌")]
+
+    assert len(connect) == 1
+    assert connect[0].url == "https://vercel.com/dashboard/stores"
+    assert connect[0].callback_data is None                  # a plain link, one tap
+    assert "NOT connected" in bot.panel_text()
+
+
+def test_panel_has_no_connect_button_once_a_database_is_connected(bot, monkeypatch):
+    """A connected store needs no call to action; the settings screen still explains it."""
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: True)
+
+    buttons = _buttons(bot.panel())
+
+    assert not any("Connect database" in b.text for b in buttons)
+    assert not any(b.url and "vercel.com" in b.url for b in buttons)
+    assert "connected ✅" in bot.panel_text()
+    assert "database" in [b.callback_data for b in _buttons(bot.settings_kb())]
+
+
+def test_database_screen_shows_the_store_and_the_link(bot, monkeypatch):
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: False)
+    monkeypatch.setenv("P2P_DATABASE_LINK", "https://console.upstash.com/redis/1")
+
+    text = bot.database_text()
+    buttons = _buttons(bot.database_kb())
+
+    assert "NOT connected" in text
+    assert "console.upstash.com/redis/1" in text
+    assert "KV_REST_API_URL" in text and "python setup_cli.py" in text   # the self-hosted steps
+    assert buttons[0].url == "https://console.upstash.com/redis/1"
+    assert [b.callback_data for b in buttons] == [None, "db_check", "panel"]
+
+
+def test_database_screen_gives_the_vercel_steps_on_vercel(bot, monkeypatch):
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: False)
+    monkeypatch.setenv("VERCEL", "1")
+
+    text = bot.database_text()
+
+    assert "Storage" in text and "Connect to this project" in text
+    assert "Redeploy" in text
+
+
+def test_settings_offers_the_database_screen(bot, monkeypatch):
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: False)
+
+    callbacks = [b.callback_data for b in _buttons(bot.settings_kb())]
+
+    assert "database" in callbacks
+    assert "🗄 Database" in bot.settings_text()
+
+
+def test_check_connection_re_reads_the_store_and_reports_it(bot, monkeypatch):
+    """Credentials are usually added outside the bot, so the button re-reads them."""
+    import runtime_config
+
+    class FreshStore:
+        backend = "redis"
+
+        def load(self):
+            return None
+
+        def save(self, data):
+            pass
+
+        def describe(self):
+            return "redis (kv.example, key p2p)"
+
+    monkeypatch.setattr(bot, "STORE", FreshStore())
+    monkeypatch.setattr(bot, "rebuild_store", lambda: bot.STORE.describe())
+    monkeypatch.setattr(bot, "refresh_state", lambda: bot.state)
+    monkeypatch.setattr(runtime_config, "apply", lambda *a, **k: {})
+
+    query = SimpleNamespace(data="db_check", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=next(iter(bot.ADMINS))),
+                             callback_query=query)
+    asyncio.run(bot.on_button(update, SimpleNamespace()))
+
+    assert "redis (kv.example, key p2p)" in query.edit_message_text.await_args.args[0]
+    assert "connected ✅" in query.edit_message_text.await_args.args[0]
+    assert query.edit_message_text.await_args.kwargs["reply_markup"] is not None
+
+
+def test_database_command_is_admin_only_and_sends_the_screen(bot, monkeypatch):
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: False)
+    message = SimpleNamespace(reply_html=AsyncMock())
+    stranger = SimpleNamespace(effective_user=SimpleNamespace(id=999999), message=message)
+    asyncio.run(bot.database_cmd(stranger, SimpleNamespace()))
+    message.reply_html.assert_not_awaited()
+
+    admin = SimpleNamespace(effective_user=SimpleNamespace(id=next(iter(bot.ADMINS))),
+                            message=message)
+    asyncio.run(bot.database_cmd(admin, SimpleNamespace()))
+    message.reply_html.assert_awaited()
+    assert "Connect database" in str(message.reply_html.await_args.kwargs["reply_markup"].inline_keyboard[0][0].text)

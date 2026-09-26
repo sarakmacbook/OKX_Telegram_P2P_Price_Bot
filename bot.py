@@ -8,13 +8,13 @@ from dataclasses import asdict
 from urllib.parse import urlsplit
 from pathlib import Path
 import httpx
-from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as KB
+from telegram import Update, InlineKeyboardButton as _TelegramButton, InlineKeyboardMarkup as KB
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, ChatMemberHandler, ContextTypes, filters)
 from exchanges import Merchant, parse_url, fetch, HEADERS
 from adlinks import (EXCHANGE_NAMES, AD_LINK_TEMPLATES, ad_link, market_link,
                      resolve_templates, render_template, template_is_exact, taker_side)
-from storage import build_store
+from storage import build_store, database_link, database_connected
 
 # ── paths: always relative to this file (works with systemd WorkingDirectory) ──
 # P2P_CONFIG_FILE / P2P_STATE_FILE override them (tests, or installs that keep
@@ -230,6 +230,9 @@ DEFAULT_SETTINGS = {
     "btn_link_mode": "profile",    # "profile" = merchant profile, "ad" = optional ad-link templates
     "ad_link_templates": {},       # per-exchange deep-link overrides (see adlinks.py)
     "price_links": True,           # also make the prices in the post clickable
+    # ── look of the buttons and the post ──
+    "button_icons": {},            # {"🟢": {"icon": "<custom emoji id>", "style": "success"}}
+    "post_photo": "",              # banner for the group post: file_id or https URL
 }
 
 def clean_extra_button_label(value) -> str:
@@ -280,6 +283,229 @@ def normalize_extra_buttons(value) -> list[dict]:
     return result
 
 
+# ── button icons (custom emoji images) & the post banner ────────────────────
+# Telegram can show a custom emoji — a premium, often animated "image" — in
+# front of a button label, and colour the button (Bot API 9.4).  Only PTB 22.7
+# names those fields, but 21.6 forwards them verbatim through ``api_kwargs``, so
+# the pinned dependency already supports them.
+#
+# The icon is chosen by the emoji a label starts with: an admin sets it once for
+# 🟢 and every button whose label starts with 🟢 shows it.  That is what makes
+# this work for *every* button in the bot — the group post, the panel, the menus
+# — without a per-button setting for each of them.
+BUTTON_STYLES = ("success", "danger", "primary")
+STYLE_TITLES = {"success": "green 🟢", "danger": "red 🔴", "primary": "blue 🔵"}
+CAPTION_LIMIT = 1024              # Telegram's limit for a photo caption
+
+# Leading emoji of a label, including the variation selectors and ZWJ sequences
+# Telegram builds emoji from ("⚙️" is U+2699 U+FE0F, "👁" is a lone pictograph).
+_EMOJI_RUN_RE = re.compile(
+    r"^((?:[0-9#*]\uFE0F?\u20E3"
+    r"|[\U0001F000-\U0001FAFF\u2300-\u23FF\u2460-\u24FF\u25A0-\u25FF"
+    r"\u2600-\u27BF\u2B00-\u2BFF\u2190-\u21FF\u2900-\u297F"
+    r"\u00A9\u00AE\u203C\u2049\u2122\u2139\u3030\u303D\u3297\u3299"
+    r"\uFE0F\u200D\u20E3\U000E0020-\U000E007F])+)\s*",
+    re.UNICODE,
+)
+
+
+def leading_emoji(text: str) -> str:
+    """The emoji a button label starts with (``"⚙️ Settings"`` → ``"⚙️"``)."""
+    match = _EMOJI_RUN_RE.match((text or "").lstrip())
+    return match.group(1) if match else ""
+
+
+def icon_key(value: str) -> str:
+    """The lookup key for a label or a stored emoji — ``""`` when unusable.
+
+    Also keeps the key small enough for ``callback_data`` (64 bytes), which is
+    where it travels while an admin edits it.
+    """
+    key = leading_emoji(value)
+    return key if key and len(key.encode()) <= 48 else ""
+
+
+def clean_icon_id(value) -> str:
+    """A custom emoji id — a plain number, exactly as Telegram reports it."""
+    text = str(value or "").strip()
+    return text if text.isdigit() and 1 <= len(text) <= 25 else ""
+
+
+def normalize_button_icons(value) -> dict:
+    """Copy the valid saved icon records; malformed state must not break a post."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key, entry in value.items():
+        key = icon_key(key) if isinstance(key, str) else ""
+        if not key:
+            continue
+        if isinstance(entry, str):                     # tolerate a bare id
+            entry = {"icon": entry}
+        if not isinstance(entry, dict):
+            continue
+        icon = clean_icon_id(entry.get("icon"))
+        style = entry.get("style")
+        style = style if style in BUTTON_STYLES else ""
+        if icon or style:
+            result[key] = {"icon": icon, "style": style}
+    return result
+
+
+def button_icons() -> dict:
+    return normalize_button_icons(get_settings().get("button_icons"))
+
+
+def button_icon(label: str, override: str | None = None) -> tuple[str, str]:
+    """``(custom emoji id, style)`` for a label — ``("", "")`` when nothing is set."""
+    key = icon_key(override) if override is not None else icon_key(label)
+    entry = button_icons().get(key) if key else None
+    return (entry["icon"], entry["style"]) if entry else ("", "")
+
+
+# Telegram only shows button icons to bots with a Fragment username, or in
+# messages sent to chats when the bot owner has Premium.  A server that refuses
+# them must not cost us the price post: remember the refusal for this process
+# and keep sending plain buttons (the price post matters more than its looks).
+# The memory is the icon map that failed, so editing 🖼 Button icons tries again
+# instead of staying plain until a restart.
+_rejected_icons: dict | None = None
+
+
+def icons_available() -> bool:
+    """Whether buttons may carry icons — False while the refused set is unchanged."""
+    if _rejected_icons is None:
+        return True
+    try:
+        return button_icons() != _rejected_icons
+    except Exception:                                  # pragma: no cover - defensive
+        return False
+
+
+def disable_button_icons(reason) -> None:
+    global _rejected_icons
+    if _rejected_icons is None:
+        log.warning("Telegram refused the button icons (%s) — sending plain buttons from now "
+                    "on. Remove the icon in 🖼 Button icons, or get the bot a Fragment username "
+                    "/ a Premium owner.", reason)
+    try:
+        _rejected_icons = button_icons()
+    except Exception:                                  # pragma: no cover - defensive
+        _rejected_icons = {}
+
+
+def _looks_like_icon_refusal(error) -> bool:
+    text = str(error).lower()
+    return ("icon_custom_emoji" in text or "custom emoji" in text
+            or ("button" in text and "emoji" in text))
+
+
+def B(text, *, icon=None, style=None, **kwargs):
+    """``InlineKeyboardButton`` plus the configured custom-emoji icon / colour.
+
+    Every button in the bot is built through this wrapper, so one 🖼 Button icons
+    entry restyles every button that starts with that emoji — group post and
+    admin panel alike.  Never raises: a broken setting leaves a plain button.
+    """
+    try:
+        icon_id, saved_style = button_icon(text, icon)
+    except Exception as e:                             # pragma: no cover - defensive
+        log.warning("Button icon lookup failed (%s) — using a plain button", e)
+        icon_id, saved_style = "", ""
+    extras = {}
+    if icons_available():
+        if icon_id:
+            extras["icon_custom_emoji_id"] = icon_id
+        chosen = style or saved_style
+        if chosen in BUTTON_STYLES:
+            extras["style"] = chosen
+    if extras:
+        kwargs["api_kwargs"] = {**(kwargs.get("api_kwargs") or {}), **extras}
+    return _TelegramButton(text, **kwargs)
+
+
+# ── the post banner ─────────────────────────────────────────────────────────
+def valid_photo_url(value: str) -> bool:
+    """An http(s) image URL Telegram can download for ``send_photo``."""
+    if not isinstance(value, str) or not value or len(value) > 2048:
+        return False
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch in '<>"\\' for ch in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        return bool(parsed.scheme in ("http", "https") and parsed.hostname
+                    and parsed.username is None and parsed.password is None)
+    except ValueError:
+        return False
+
+
+def clean_banner(value) -> str:
+    """A banner is a Telegram file id or an http(s) image URL — nothing else."""
+    text = str(value or "").strip()
+    if not text or len(text) > 2048:
+        return ""
+    if text.startswith(("http://", "https://")):
+        return text if valid_photo_url(text) else ""
+    return text if re.fullmatch(r"[A-Za-z0-9_\-=]{10,200}", text) else ""
+
+
+def post_banner() -> str:
+    return clean_banner(get_settings().get("post_photo"))
+
+
+def custom_emoji_id(message) -> str:
+    """The custom emoji id inside a message: text, caption, or emoji sticker.
+
+    Telegram reports custom emoji as ``MessageEntity.custom_emoji_id`` (in a
+    forwarded message or caption) and on premium emoji *stickers*.
+    """
+    for entities in (getattr(message, "entities", None),
+                     getattr(message, "caption_entities", None)):
+        for entity in entities or []:
+            found = clean_icon_id(getattr(entity, "custom_emoji_id", ""))
+            if found:
+                return found
+    sticker = getattr(message, "sticker", None)
+    return clean_icon_id(getattr(sticker, "custom_emoji_id", "")) if sticker else ""
+
+
+async def send_report(bot, chat_id, text, kb, rebuild=None):
+    """Send a price post — as a banner photo with the report as its caption.
+
+    Telegram caps a caption at :data:`CAPTION_LIMIT` characters, so a longer
+    report is posted as a normal text message and the banner is skipped (logged,
+    never silently mangled).  A banner that Telegram refuses (deleted file,
+    unreachable URL) also falls back to the text post.
+
+    ``rebuild`` is a callable that builds the keyboard again; it is used when
+    Telegram rejects the button icons, so the post goes out with plain buttons
+    instead of not going out at all.
+    """
+    photo = post_banner()
+    if photo and len(text) > CAPTION_LIMIT:
+        log.info("Report is %s characters — above the %s-character caption limit; "
+                 "posting it without the banner", len(text), CAPTION_LIMIT)
+        photo = ""
+
+    async def deliver(keyboard):
+        if photo:
+            try:
+                return await bot.send_photo(chat_id, photo=photo, caption=text,
+                                            parse_mode="HTML", reply_markup=keyboard)
+            except Exception as e:
+                log.warning("Could not send the banner (%s) — falling back to a text post", e)
+        return await bot.send_message(chat_id, text, parse_mode="HTML",
+                                      disable_web_page_preview=True, reply_markup=keyboard)
+
+    try:
+        return await deliver(kb)
+    except Exception as e:
+        if not (rebuild and icons_available() and _looks_like_icon_refusal(e)):
+            raise
+        disable_button_icons(e)
+        return await deliver(rebuild())
+
+
 def empty_state():
     return {"group": None, "auto": False, "merchants": {}, "last": {}, "edits": {},
             "settings": deepcopy(DEFAULT_SETTINGS), "link_target_version": LINK_TARGET_VERSION,
@@ -313,6 +539,9 @@ def load():
             data["settings"][key] = DEFAULT_SETTINGS[key]
     if not isinstance(data["settings"].get("ad_link_templates"), dict):
         data["settings"]["ad_link_templates"] = {}
+    # icons and the post banner are read while building every keyboard
+    data["settings"]["button_icons"] = normalize_button_icons(data["settings"].get("button_icons"))
+    data["settings"]["post_photo"] = clean_banner(data["settings"].get("post_photo"))
     if data["settings"].get("btn_link_mode") not in ("ad", "profile"):
         data["settings"]["btn_link_mode"] = DEFAULT_SETTINGS["btn_link_mode"]
     if "last" not in data:
@@ -369,6 +598,29 @@ def edit_pop(u: Update, key: str):
 
 
 state = load()
+
+
+def db_is_persistent() -> bool:
+    """Whether the group, merchants and prices live in a shared database."""
+    return database_connected(STORE)
+
+
+def rebuild_store() -> str:
+    """Re-select the state backend, carrying the in-memory state over.
+
+    Credentials can appear after the process started — the setup page writes
+    them into the shared store and ``python setup_cli.py`` into the environment.
+    Whatever this process already knows is written into the newly selected store
+    first, so switching databases never loses the group or the merchants.  Like
+    every write in ``storage.py`` this is best-effort and never raises.
+    """
+    global STORE
+    previous = STORE
+    STORE = build_store(BASE_DIR)
+    if previous.describe() != STORE.describe():
+        STORE.save(dict(state))
+        log.info("State store switched from %s to %s", previous.describe(), STORE.describe())
+    return STORE.describe()
 
 
 merchants = lambda: [Merchant(**m) for m in state["merchants"].values()]
@@ -479,11 +731,15 @@ def set_group_button():
         return B(label, url=f"https://t.me/{BOT_USERNAME}?startgroup=setgroup")
     return B(label, callback_data="setgroup_help")
 
+def database_button():
+    """The link to the page where a database is connected (Vercel → Storage)."""
+    return B("🔌 Connect database ↗", url=database_link())
+
 def panel():
     a = state["auto"]
     s = get_settings()
     liq_icon = "💧"
-    return KB([
+    rows = [
         [B("📊 Post prices now", callback_data="post"),
          B(f"{'🟢' if a else '🔴'} Auto: {'ON' if a else 'OFF'}", callback_data="auto")],
         [B("📋 Merchants", callback_data="list"), set_group_button()],
@@ -491,8 +747,13 @@ def panel():
         [B(f"{liq_icon} Liquidity: {'ON' if s.get('show_liquidity') else 'OFF'}", callback_data="toggle_liquidity"),
          B(f"🔘 Buttons: {'ON' if s.get('show_buttons') else 'OFF'}", callback_data="toggle_buttons")],
         [B("🔘 Manage buttons", callback_data="buttons_menu")],
-        [B("👁 Preview", callback_data="preview"), B("🔄 Refresh", callback_data="panel")]
-    ])
+    ]
+    # No shared database means this install forgets its group, merchants and
+    # prices; put the way to fix that in front of the admin, not in a manual.
+    if not db_is_persistent():
+        rows.append([database_button(), B("❓ Why", callback_data="database")])
+    rows.append([B("👁 Preview", callback_data="preview"), B("🔄 Refresh", callback_data="panel")])
+    return KB(rows)
 
 def settings_kb():
     s = get_settings()
@@ -508,7 +769,17 @@ def settings_kb():
         [B(f"🚪 Del Join/Left msgs: {'ON ✅' if s.get('delete_join_left', True) else 'OFF ❌'}", callback_data="toggle_joinleft")],
         [B("📝 Edit Header", callback_data="edit_header"), B("📝 Edit Body", callback_data="edit_body")],
         [B("📝 Edit Footer", callback_data="edit_footer"), B("🗑 Clear Custom Msg", callback_data="clear_custom")],
+        [B(f"🗄 Database: {'connected ✅' if db_is_persistent() else 'connect ⚠️'}", callback_data="database")],
+        [B("🖼 Button icons", callback_data="button_icons"),
+         B("🖼 Post banner", callback_data="banner_menu")],
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="panel")]
+    ])
+
+def database_kb():
+    return KB([
+        [database_button()],
+        [B("🔄 Check connection", callback_data="db_check")],
+        [B("⬅️ Back", callback_data="panel")],
     ])
 
 def buttons_menu_kb():
@@ -531,6 +802,8 @@ def buttons_menu_kb():
         [B("➕ Add button", callback_data="extra_add"),
          B(f"🧩 Extra buttons ({len(extra_buttons())})", callback_data="extra_buttons")],
         [B("🔗 Ad link templates", callback_data="adlink_menu")],
+        [B("🖼 Button icons", callback_data="button_icons"),
+         B("🖼 Post banner", callback_data="banner_menu")],
         [B("♻️ Reset buttons to default", callback_data="reset_buttons")],
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="settings")]
     ]
@@ -650,6 +923,220 @@ def custom_menu_kb():
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="panel")]
     ])
 
+def on_vercel() -> bool:
+    """Whether this process runs as a Vercel function (same flags as serverless.py)."""
+    return bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV") or os.getenv("VERCEL_URL")
+                or os.getenv("VERCEL_PROJECT_PRODUCTION_URL"))
+
+# ── 🖼 Button icons & post banner (admin screens) ───────────────────────────
+# The labels of these two screens themselves.  They are listed here instead of
+# reading their keyboards: those screens are built from this list, so building
+# them here would recurse.
+ICON_SCREEN_LABELS = ("🖼 Button icons", "🖼 Post banner", "👁 Send a test",
+                      "📤 Send a photo", "🔗 Use an image URL", "🗑 Remove banner",
+                      "🖼 Set / replace icon", "🎨 Colour: green 🟢", "🗑 Remove icon")
+
+
+def button_labels() -> list[str]:
+    """Every button label the bot can show, in the order the menus show them.
+
+    The icons screen is built from this, so it lists exactly the emoji this bot
+    actually uses — panel, menus and group post — and never a hard-coded list.
+    """
+    labels = [buy_label_tpl(), sell_label_tpl()]
+    labels += [button["label"] for button in extra_buttons()]
+    for builder in (panel, settings_kb, buttons_menu_kb, extra_buttons_kb, adlink_menu_kb,
+                    custom_menu_kb, database_kb, list_kb):
+        try:
+            keyboard = builder()
+        except Exception as e:                        # pragma: no cover - defensive
+            log.debug("Could not inspect %s: %s", getattr(builder, "__name__", builder), e)
+            continue
+        labels += [button.text for row in keyboard.inline_keyboard for button in row]
+    return labels + list(ICON_SCREEN_LABELS)
+
+
+def emoji_in_use() -> list[str]:
+    """The distinct leading emoji of every button the bot shows."""
+    keys: list[str] = []
+    for label in button_labels():
+        key = icon_key(label)
+        if key and key not in keys:
+            keys.append(key)
+    return keys[:60]
+
+
+def labels_for_emoji(key: str) -> list[str]:
+    """The buttons that would show the icon saved under ``key``."""
+    seen, found = set(), []
+    for label in button_labels():
+        if icon_key(label) == key and label not in seen:
+            seen.add(label)
+            found.append(label)
+    return found
+
+
+def button_icons_text():
+    configured = button_icons()
+    keys = emoji_in_use()
+    with_icon = [key for key in keys if configured.get(key, {}).get("icon")]
+    lines = [
+        "🖼 <b>Button icons</b>",
+        "",
+        "Telegram can show a custom emoji — a premium, often animated emoji image — before a "
+        "button's label, and colour the button. The icon is chosen by the emoji the label "
+        "starts with, so one entry covers every button that uses it.",
+        "",
+        f"Emoji in use: <b>{len(keys)}</b> · with an icon: <b>{len(with_icon)}</b>",
+        "",
+        "Tap an emoji below to set, replace or remove its icon (forward the emoji, send it as "
+        "a sticker, or paste the numeric id).",
+        "",
+        "⚠️ Telegram only shows button icons for bots that bought a username on Fragment, or "
+        "when the bot owner has Premium — other clients keep the plain emoji.",
+    ]
+    return "\n".join(lines)
+
+
+def button_icons_kb():
+    configured = button_icons()
+    rows, row = [], []
+    for key in emoji_in_use():
+        if len(f"icon_menu:{key}".encode()) > 64:      # Telegram's callback_data limit
+            continue
+        mark = " ✅" if configured.get(key, {}).get("icon") else ""
+        row.append(B(f"{key}{mark}", callback_data=f"icon_menu:{key}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([B("🖼 Post banner", callback_data="banner_menu"),
+                 B("👁 Preview", callback_data="preview")])
+    rows.append([B("⬅️ Back", callback_data="settings")])
+    return KB(rows)
+
+
+def icon_editor_text(key: str):
+    entry = button_icons().get(key, {})
+    labels = labels_for_emoji(key)
+    lines = [f"🖼 <b>Icon for {key} buttons</b>", ""]
+    if labels:
+        shown = ", ".join(f"<code>{html_escape(label)}</code>" for label in labels[:6])
+        more = "" if len(labels) <= 6 else f" (+{len(labels) - 6} more)"
+        lines += [f"Used by <b>{len(labels)}</b> button(s): {shown}{more}", ""]
+    if entry.get("icon"):
+        lines += [f"Current icon: <code>{html_escape(entry['icon'])}</code> · "
+                  f"colour: <b>{STYLE_TITLES.get(entry.get('style'), 'default')}</b>", ""]
+    elif entry.get("style"):
+        lines += [f"Colour: <b>{STYLE_TITLES.get(entry['style'])}</b> — no icon yet.", ""]
+    else:
+        lines += ["Nothing set — these buttons show the plain emoji.", ""]
+    lines += [
+        "<b>Two ways to set the icon</b>",
+        "• Forward (or send) a message that contains the custom emoji — the bot reads its id, or",
+        "• paste the numeric id (custom emoji ids are numbers only).",
+        "",
+        "ℹ️ A normal emoji (😀) has no id; only Telegram <i>custom</i> emoji do.",
+    ]
+    return "\n".join(lines)
+
+
+def icon_editor_kb(key: str):
+    entry = button_icons().get(key, {})
+    rows = [[B("🖼 Set / replace icon", callback_data=f"icon_set:{key}")]]
+    rows.append([B(f"🎨 Colour: {STYLE_TITLES.get(entry.get('style'), 'default')}",
+                   callback_data=f"icon_style:{key}")])
+    if entry:
+        rows.append([B("🗑 Remove icon", callback_data=f"icon_clear:{key}")])
+    rows.append([B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="button_icons")])
+    return KB(rows)
+
+
+def icon_prompt(key: str):
+    return (f"🖼 <b>Send the icon for {key} buttons</b>\n\n"
+            "• Forward a message that contains the custom emoji, or send it as a sticker; the "
+            "bot stores the emoji's id.\n"
+            "• Or paste the id itself (numbers only, e.g. <code>5368324170671202286</code>).\n\n"
+            "Send /cancel to stop without changing anything.")
+
+
+def banner_text():
+    photo = post_banner()
+    if photo.startswith(("http://", "https://")):
+        shown = photo if len(photo) <= 80 else photo[:79] + "…"
+        current = f"an image URL (<code>{html_escape(shown)}</code>)"
+    elif photo:
+        current = f"a Telegram photo (<code>…{html_escape(photo[-10:])}</code>)"
+    else:
+        current = "<b>none</b> — the post is sent as text"
+    return (
+        "🖼 <b>Post banner</b>\n\n"
+        f"Current: {current}\n\n"
+        "With a banner set, the price post is sent as a photo with the report as its caption and "
+        "the buttons underneath — your logo above the prices.\n\n"
+        "Send a photo in this chat, or set an https:// image URL.\n\n"
+        f"⚠️ Telegram caps a caption at {CAPTION_LIMIT} characters, so a longer report is posted "
+        "as a plain text message instead (the banner is skipped)."
+    )
+
+
+def banner_kb():
+    rows = [[B("📤 Send a photo", callback_data="banner_send"),
+             B("🔗 Use an image URL", callback_data="banner_url")]]
+    if post_banner():
+        rows.append([B("👁 Send a test", callback_data="banner_test"),
+                     B("🗑 Remove banner", callback_data="banner_clear")])
+    rows.append([B("🖼 Button icons", callback_data="button_icons")])
+    rows.append([B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="settings")])
+    return KB(rows)
+
+
+def database_text():
+    """Where the state lives, and the link that makes it survive a redeploy."""
+    persistent = db_is_persistent()
+    if persistent:
+        state_block = (
+            "✅ The group, the merchants, the settings and the prices are kept there, "
+            "so they survive restarts, redeploys and extra instances.\n\n"
+            "Change the database URL/token on the setup page or with "
+            "<code>python setup_cli.py</code>, then tap 🔄 Check connection."
+        )
+    elif on_vercel():
+        state_block = (
+            "⚠️ No shared database is connected: the state is kept on this host only. "
+            "A redeploy, a cold instance or a second instance starts empty.\n\n"
+            "<b>Connect one</b>\n"
+            "1. Open the Vercel dashboard → <b>Storage</b> (link below).\n"
+            "2. Add <b>Upstash for Redis</b> (or <b>Vercel KV</b>) → "
+            "<b>Connect to this project</b>. That writes "
+            "<code>KV_REST_API_URL</code> + <code>KV_REST_API_TOKEN</code> for you.\n"
+            "3. <b>Redeploy</b> — environment variables only apply to new deployments — "
+            "then tap 🔄 Check connection.\n\n"
+            "No redeploy needed instead: paste the REST URL + token into the browser "
+            "setup page (<code>/api/setup</code>) or answer <code>python setup_cli.py</code>, "
+            "then tap 🔄 Check connection."
+        )
+    else:
+        state_block = (
+            "⚠️ No shared database is connected: the state is kept in a local file on this "
+            "host, so a second instance (or a reinstalled machine) starts empty.\n\n"
+            "<b>Connect one</b>\n"
+            "1. Create a Redis-compatible REST database — a free Upstash one is enough "
+            "(link below).\n"
+            "2. Put its REST URL and token in <code>KV_REST_API_URL</code> + "
+            "<code>KV_REST_API_TOKEN</code> (.env / the service environment), or run "
+            "<code>python setup_cli.py</code> — it can store the pair for you.\n"
+            "3. Restart the bot if you edited .env, then tap 🔄 Check connection."
+        )
+    return (
+        f"🗄 <b>Database — where the bot keeps its state</b>\n\n"
+        f"Current store: <code>{html_escape(STORE.describe())}</code>\n"
+        f"Shared database: <b>{'connected ✅' if persistent else 'NOT connected ⚠️'}</b>\n\n"
+        f"{state_block}\n\n"
+        f"🔗 {html_escape(database_link())}"
+    )
+
 def group_label():
     if not state["group"]: return None
     t = state.get("group_title")
@@ -673,6 +1160,8 @@ def panel_text():
         f"🤖 <b>P2P Price Bot</b>\n"
         f"Group: <code>{g}</code>\n"
         f"Merchants: {len(state['merchants'])} · Pair: {ASSET}/{FIAT} · every {INTERVAL}s\n"
+        f"🗄 Database: <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>"
+        f"{'' if db_is_persistent() else ' — tap 🔌 Connect database'}\n"
         f"💧 Liquidity: <b>{liq}</b> · 🔘 Buttons: <b>{btns}</b> · 🗑 AutoDel: <b>{autodel}</b>\n"
         f"🔄 Btn order: <b>{order_label()}</b> · 🎯 Links: <b>{'EXACT AD' if link_mode() == 'ad' else 'PROFILE'}</b>\n"
         f"🚪 Del Join/Left msgs: <b>{joinleft}</b>\n"
@@ -706,6 +1195,11 @@ def settings_text():
         f"   Toggle it here or with the 🔘 Manage buttons menu; the deep-link\n"
         f"   templates live in 🔗 Ad link templates.\n\n"
         f"🔗 Clickable prices in the post: <b>{'ON ✅' if s.get('price_links', True) else 'OFF ❌'}</b>\n\n"
+        f"🖼 Button icons: <b>{len(button_icons())}</b> emoji configured\n"
+        f"   Custom emoji images shown before button labels — one entry per emoji,\n"
+        f"   so it applies to every button that starts with it.\n\n"
+        f"🖼 Post banner: <b>{'set ✅' if post_banner() else 'none ❌'}</b>\n"
+        f"   A photo posted with the prices, which travel in its caption.\n\n"
         f"🗑 Auto-delete previous message: <b>{autodel}</b>\n"
         f"   When ON, deletes previous price message on refresh/update.\n\n"
         f"⏰ Auto-delete after: <b>{del_hours}h</b>\n"
@@ -714,6 +1208,9 @@ def settings_text():
         f"   When ON, the bot deletes Telegram's \"user joined the group\" and\n"
         f"   \"user left the group\" service messages in your group.\n"
         f"   ⚠️ Bot must be a group admin with 'Delete messages' permission.\n\n"
+        f"🗄 Database (state store): <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>\n"
+        f"   <code>{html_escape(STORE.describe())}</code>\n"
+        f"   Tap 🗄 Database for the connection link and what to do with it.\n\n"
         f"📝 Custom Header:\n{header}\n\n"
         f"📝 Custom Body (per merchant):\n{body}\n\n"
         f"📝 Custom Footer:\n{footer}\n\n"
@@ -752,7 +1249,10 @@ def buttons_menu_text():
         f"🟢 BUY: <b>{'included' if builtin_button_enabled('buy') else 'removed'}</b> · "
         f"🔴 SELL: <b>{'included' if builtin_button_enabled('sell') else 'removed'}</b>\n"
         f"🧩 Extra buttons: <b>{len(extra_buttons())}/{MAX_EXTRA_BUTTONS}</b>\n"
-        f"Use Remove/Restore for BUY or SELL, or ➕ Add button for your own link.\n"
+        f"🖼 Button icons: <b>{len(button_icons())}</b> emoji · "
+        f"🖼 Post banner: <b>{'set ✅' if post_banner() else 'none'}</b>\n"
+        f"Use Remove/Restore for BUY or SELL, ➕ Add button for your own link, or\n"
+        f"🖼 Button icons to put a custom emoji image in front of any label.\n"
         f"🔄 Buy/Sell order: {order_txt}\n\n"
         f"🟢 <b>BUY label:</b>\n<code>{html_escape(buy_tpl)}</code>\n"
         f"🔴 <b>SELL label:</b>\n<code>{html_escape(sell_tpl)}</code>\n\n"
@@ -911,12 +1411,92 @@ def apply_body_template(tpl: str, m: Merchant, r: dict) -> str:
     pattern = re.compile(r"\{(" + "|".join(re.escape(k) for k in keys) + r")\}")
     return pattern.sub(lambda mm: mapping[mm.group(1)], tpl)
 
+# ── button icons & banner input (the two ways an admin sets an icon) ──
+def store_button_icon(key: str, emoji_id: str) -> dict:
+    """Save one 🖼 icon entry (state only — the caller persists it)."""
+    icons = button_icons()
+    entry = dict(icons.get(key) or {"icon": "", "style": ""})
+    entry["icon"] = clean_icon_id(emoji_id)
+    entry.setdefault("style", "")
+    if entry["icon"] or entry["style"]:
+        icons[key] = entry
+    else:
+        icons.pop(key, None)
+    state["settings"]["button_icons"] = icons
+    return icons
+
+
+def icon_saved_reply(key: str, emoji_id: str):
+    return (f"✅ <b>Icon saved for {key} buttons</b>\n"
+            f"<code>{html_escape(emoji_id)}</code>\n\n" + icon_editor_text(key))
+
+
+async def on_photo(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """An admin sends a photo → the post banner (private chat, only when asked)."""
+    if not is_admin(u) or u.effective_chat.type != "private": return
+    if edit_get(u, "awaiting_custom") != "banner_photo": return
+    photos = u.message.photo or []
+    if not photos: return
+    state["settings"]["post_photo"] = photos[-1].file_id       # largest size Telegram sent
+    edit_pop(u, "awaiting_custom")                             # saves
+    await u.message.reply_html("✅ Banner saved — the next price post uses it.\n\n" + banner_text(),
+                               reply_markup=banner_kb())
+
+
+async def on_sticker(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """A premium emoji sticker is exactly what a button icon is — accept one."""
+    if not is_admin(u) or u.effective_chat.type != "private": return
+    awaiting = edit_get(u, "awaiting_custom")
+    if not isinstance(awaiting, str) or not awaiting.startswith("icon:"): return
+    key = icon_key(awaiting.split(":", 1)[1])
+    emoji_id = custom_emoji_id(u.message)
+    if not key or not emoji_id:
+        return await u.message.reply_text(
+            "❌ That sticker is not a custom emoji. Send a premium emoji sticker, forward a "
+            "message with the emoji, or paste its numeric id.")
+    store_button_icon(key, emoji_id)
+    edit_pop(u, "awaiting_custom")
+    await u.message.reply_html(icon_saved_reply(key, emoji_id), reply_markup=icon_editor_kb(key))
+
+
 # ── add merchant by pasting URL / handle custom msg input ──
 async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u) or u.effective_chat.type != "private": return
     txt = u.message.text.strip()
 
     awaiting = edit_get(u, "awaiting_custom")
+
+    if awaiting == "banner_url":
+        if txt.lower() == "/cancel":
+            edit_pop(u, "awaiting_custom")
+            return await u.message.reply_text("❌ Cancelled.", reply_markup=banner_kb())
+        if not valid_photo_url(txt):
+            return await u.message.reply_text(
+                "❌ Send an https:// (or http://) URL of a JPG/PNG image, or /cancel.")
+        state["settings"]["post_photo"] = txt
+        save()
+        edit_pop(u, "awaiting_custom")
+        return await u.message.reply_html("✅ Banner saved — the next price post uses it.\n\n"
+                                          + banner_text(), reply_markup=banner_kb())
+
+    if isinstance(awaiting, str) and awaiting.startswith("icon:"):
+        key = icon_key(awaiting.split(":", 1)[1])
+        if txt.lower() == "/cancel":
+            edit_pop(u, "awaiting_custom")
+            return await u.message.reply_text("❌ Cancelled.", reply_markup=button_icons_kb())
+        if not key:
+            edit_pop(u, "awaiting_custom")
+            return await u.message.reply_text("That emoji is no longer editable — open "
+                                              "🖼 Button icons again.", reply_markup=button_icons_kb())
+        emoji_id = custom_emoji_id(u.message) or clean_icon_id(txt)
+        if not emoji_id:
+            return await u.message.reply_text(
+                "❌ No custom emoji found. Forward a message with the premium emoji (or send it "
+                "as a sticker), or paste the numeric id — a normal emoji like 😀 has no id.")
+        store_button_icon(key, emoji_id)
+        edit_pop(u, "awaiting_custom")
+        return await u.message.reply_html(icon_saved_reply(key, emoji_id),
+                                          reply_markup=icon_editor_kb(key))
     if isinstance(awaiting, str) and (awaiting in ("extra_add_label", "extra_add_url")
                                       or awaiting.startswith(("extra_label:", "extra_url:"))):
         if txt.lower() == "/cancel":
@@ -1286,6 +1866,8 @@ async def post(bot, force=False):
     snap["_link_mode"] = link_mode()
     snap["_ad_templates"] = ad_templates()
     snap["_price_links"] = bool(s.get("price_links", True))
+    snap["_photo"] = post_banner()      # changing the banner must repost too
+    snap["_button_icons"] = button_icons()
     if not force and snap == state["last"]: return False
     state["last"] = snap; save()
 
@@ -1296,7 +1878,11 @@ async def post(bot, force=False):
     text = report(prices)
     kb = report_keyboard(prices)
     try:
-        sent = await bot.send_message(state["group"], text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb)
+        # send_report adds the banner photo when one is configured and the report
+        # fits in a caption (see CAPTION_LIMIT); rebuild() lets it retry with
+        # plain buttons if Telegram refuses the icons
+        sent = await send_report(bot, state["group"], text, kb,
+                                 rebuild=lambda: report_keyboard(prices))
         # store new message id and time
         state["last_msg_id"] = sent.message_id
         state["last_msg_time"] = int(time.time())
@@ -1397,6 +1983,116 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif d == "custom_menu":
         await q.answer()
         return await q.edit_message_text(custom_menu_text(), parse_mode="HTML", reply_markup=custom_menu_kb())
+
+    elif d == "button_icons":
+        if edit_get(u, "awaiting_custom"):
+            edit_pop(u, "awaiting_custom")
+        await q.answer()
+        return await q.edit_message_text(button_icons_text(), parse_mode="HTML",
+                                         reply_markup=button_icons_kb())
+
+    elif d.startswith("icon_menu:"):
+        key = icon_key(d.split(":", 1)[1])
+        if not key:
+            return await q.answer("Unknown emoji", show_alert=True)
+        await q.answer()
+        return await q.edit_message_text(icon_editor_text(key), parse_mode="HTML",
+                                         reply_markup=icon_editor_kb(key))
+
+    elif d.startswith("icon_set:"):
+        key = icon_key(d.split(":", 1)[1])
+        if not key:
+            return await q.answer("Unknown emoji", show_alert=True)
+        edit_set(u, "awaiting_custom", f"icon:{key}")
+        await q.answer("Forward the emoji or paste its id")
+        return await q.edit_message_text(icon_prompt(key), parse_mode="HTML",
+                                         reply_markup=KB([[B("❌ Cancel", callback_data=f"icon_menu:{key}")]]))
+
+    elif d.startswith("icon_style:"):
+        key = icon_key(d.split(":", 1)[1])
+        if not key:
+            return await q.answer("Unknown emoji", show_alert=True)
+        icons = button_icons()
+        current = (icons.get(key) or {}).get("style", "")
+        following = list(BUTTON_STYLES) + [""]
+        chosen = following[(following.index(current) + 1) % len(following)]
+        entry = dict(icons.get(key) or {"icon": ""})
+        entry["style"] = chosen
+        entry.setdefault("icon", "")
+        if entry.get("icon") or entry.get("style"):
+            icons[key] = entry
+        else:
+            icons.pop(key, None)
+        state["settings"]["button_icons"] = icons
+        save()
+        await q.answer(f"Colour: {STYLE_TITLES.get(chosen, 'default')}")
+        return await q.edit_message_text(icon_editor_text(key), parse_mode="HTML",
+                                         reply_markup=icon_editor_kb(key))
+
+    elif d.startswith("icon_clear:"):
+        key = icon_key(d.split(":", 1)[1])
+        icons = button_icons()
+        icons.pop(key, None)
+        state["settings"]["button_icons"] = icons
+        save()
+        await q.answer("🗑 Icon removed")
+        return await q.edit_message_text(icon_editor_text(key), parse_mode="HTML",
+                                         reply_markup=icon_editor_kb(key))
+
+    elif d == "banner_menu":
+        if edit_get(u, "awaiting_custom"):
+            edit_pop(u, "awaiting_custom")
+        await q.answer()
+        return await q.edit_message_text(banner_text(), parse_mode="HTML", reply_markup=banner_kb())
+
+    elif d == "banner_send":
+        edit_set(u, "awaiting_custom", "banner_photo")
+        await q.answer("Send the photo")
+        return await q.edit_message_text(
+            "🖼 <b>Send the photo for the post banner</b>\n\n"
+            "Send it as a photo and the bot stores it (Telegram keeps the file, so the post "
+            "reuses it without re-uploading).\n\nSend /cancel to stop.",
+            parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="banner_menu")]]))
+
+    elif d == "banner_url":
+        edit_set(u, "awaiting_custom", "banner_url")
+        await q.answer("Send the image URL")
+        return await q.edit_message_text(
+            "🔗 <b>Send the image URL</b>\n\n"
+            "An <code>https://</code> link to a picture (JPG/PNG) Telegram can download — for "
+            "example a file you host yourself or a CDN link.\n\nSend /cancel to stop.",
+            parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="banner_menu")]]))
+
+    elif d == "banner_clear":
+        state["settings"]["post_photo"] = ""
+        save()
+        await q.answer("🗑 Banner removed")
+        return await q.edit_message_text(banner_text(), parse_mode="HTML", reply_markup=banner_kb())
+
+    elif d == "banner_test":
+        await q.answer("Sending a test…")
+        return await banner_test(u, c)
+
+    elif d == "database":
+        await q.answer()
+        return await q.edit_message_text(database_text(), parse_mode="HTML",
+                                         reply_markup=database_kb(),
+                                         disable_web_page_preview=True)
+
+    elif d == "db_check":
+        # Credentials are usually added outside the bot (Vercel Storage, the
+        # setup page, setup_cli.py), so re-read them and re-select the backend.
+        try:
+            import runtime_config
+            runtime_config.apply(BASE_DIR)
+        except Exception as e:
+            log.warning("Stored settings unavailable: %s", e)
+        rebuild_store()
+        refresh_state()
+        await q.answer(f"State store: {'connected ✅' if db_is_persistent() else 'not connected ⚠️'}")
+        return await q.edit_message_text(database_text(), parse_mode="HTML",
+                                         reply_markup=database_kb(),
+                                         disable_web_page_preview=True)
 
     elif d == "buttons_menu":
         if edit_get(u, "awaiting_custom"):
@@ -1717,9 +2413,12 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"{apply_template(state['settings'].get('custom_footer')) or ''}"
         )
         kb = report_keyboard(prices) if prices else None
+        body = f"👁 <b>Preview - how it will look in group:</b>\n\n{text}"
         try:
-            await c.bot.send_message(q.message.chat_id, f"👁 <b>Preview - how it will look in group:</b>\n\n{text}",
-                                     parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb)
+            # the banner and its caption limit apply here too, so the preview
+            # shows what the group will actually get
+            await send_report(c.bot, q.message.chat_id, body, kb,
+                              rebuild=lambda: report_keyboard(prices))
         except Exception as e:
             await c.bot.send_message(q.message.chat_id, f"Preview error: {e}\n\n{text[:3000]}", parse_mode="HTML")
         return
@@ -1742,6 +2441,21 @@ async def cancel_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     else:
         await u.message.reply_text("Nothing to cancel.", reply_markup=panel())
 
+async def database_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/database — the state store, and the link that makes it persistent."""
+    if not is_admin(u): return
+    await u.message.reply_html(database_text(), reply_markup=database_kb(),
+                               disable_web_page_preview=True)
+
+def preview_payload():
+    """The exact text + keyboard the group post would use (no network calls)."""
+    if state["merchants"]:
+        return None, None                       # prices are fetched by the callers
+    text = (f"{apply_template(state['settings'].get('custom_header')) or f'📊 P2P {ASSET}/{FIAT}'}"
+            "\n\n<i>No merchants yet — add one by pasting a merchant URL here.</i>")
+    return text, None
+
+
 async def preview_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u) or u.effective_chat.type != "private": return
     if state["merchants"]:
@@ -1749,9 +2463,27 @@ async def preview_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         text = report(prices)
         kb = report_keyboard(prices)
     else:
-        text = f"{apply_template(state['settings'].get('custom_header')) or f'📊 P2P {ASSET}/{FIAT}'}\n\n<i>No merchants yet.</i>"
-        kb = None
-    await u.message.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
+        text, kb = preview_payload()
+    # Same delivery path as the group post, so the banner (and the caption
+    # fallback) is previewed honestly.
+    await send_report(c.bot, u.effective_chat.id, text, kb)
+
+
+async def banner_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Send the admin the post exactly as the group receives it, banner included."""
+    if state["merchants"]:
+        prices = await get_prices()
+        text = report(prices)
+        kb = report_keyboard(prices)
+    else:
+        text, kb = preview_payload()
+    sent = await send_report(c.bot, u.effective_user.id, text, kb)
+    if getattr(sent, "photo", None):
+        note = "✅ That is the post with your banner."
+    else:
+        note = ("ℹ️ No banner was used: either none is set, or the report is longer than "
+                f"{CAPTION_LIMIT} characters so Telegram would reject the caption.")
+    await c.bot.send_message(u.effective_user.id, note, reply_markup=banner_kb())
 
 async def error_handler(update, context):
     log.warning("Update %s caused error %s", update, context.error)
@@ -1768,10 +2500,14 @@ def register_handlers(app):
     app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("preview", preview_cmd))
+    app.add_handler(CommandHandler(["database", "db"], database_cmd))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS
                                    | filters.StatusUpdate.LEFT_CHAT_MEMBER, on_join_left))
+    # banner photos and premium-emoji stickers (the two image inputs)
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.Sticker.ALL, on_sticker))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(error_handler)
     return app
