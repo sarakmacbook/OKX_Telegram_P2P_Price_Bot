@@ -111,6 +111,7 @@ writes `KV_REST_API_URL` + `KV_REST_API_TOKEN`):
 | `/database` (alias `/db`) | the state store in use, the connection steps and the same link, plus **🔄 Check connection** |
 | ⚙️ Settings | a **🗄 Database** button showing `connected ✅` / `connect ⚠️` |
 | `/api/setup` and the status page | a **🔌 Connect database ↗** button above the database panel / next to the *not persistent* warning; scripts reading `/api/webhook` JSON get the URL as `connect_database` |
+| `/api/setup` when the bot is running | the **🔧 Reconfigure — send me a link** button: the bot DMs the admins a one-time link that reopens the setup form (see [Reconfiguring](#reconfiguring-a-running-deployment)) |
 
 The destination is `P2P_DATABASE_LINK` (default
 `https://vercel.com/dashboard/stores`) — point it at your own storage page,
@@ -193,6 +194,24 @@ Telegram pushes every update to `/api/webhook` and a **Vercel Cron** calls
 
 Full walkthrough, environment variables, endpoints and troubleshooting:
 **[VERCEL.md](VERCEL.md)**.
+
+#### Reconfiguring a running deployment
+
+Change the token, the admins, the pair or the database **without a redeploy and
+without the dashboard**:
+
+1. Open `https://<your-app>.vercel.app/api/setup` (or press **⚙️ Reconfigure
+   setup** on the status page).
+2. Press **🔧 Reconfigure — send me a link** — the bot DMs the admin(s) a
+   one-time link (single use, 15 minutes). `/setup` in Telegram does the same.
+3. Open the link, change what you want, **💾 Save settings**. The running
+   instance picks the new values up immediately.
+
+The form opens by itself whenever the deployment cannot work — a missing token,
+or a database whose credentials are set but which no longer answers. That second
+case used to hide behind a green "connected" tick while the bot silently forgot
+its group, merchants and prices; the checklist now shows **Not responding** and
+hands you the form to repair it.
 
 <details>
 <summary>No curl and no wget? (python3 / PowerShell / manual)</summary>
@@ -652,6 +671,19 @@ Install one of them, or point the scripts at a fork/renamed repo without editing
 ```bash
 P2P_REPO_SLUG=your-name/your-repo bash install.sh
 ```
+
+### The bot forgot its group / merchants, but every page says the database is fine
+
+The database credentials are set, so the checklist *used* to show a green tick —
+while `RedisStore.load()` was quietly returning "nothing saved" because the store
+stopped answering (deleted or rotated Upstash database, wrong region, expired
+token). The bot then starts from an empty state on every request.
+
+`/api/setup` now probes the store instead of trusting the variables: it shows
+**Not responding** with the connection error, keeps the deployment "not ready",
+and reopens the form so you can paste working credentials — no redeploy. On a
+VPS/Docker install, `python bot.py` logs the same and `python setup_cli.py --show`
+prints where the settings are.
 
 ---
 

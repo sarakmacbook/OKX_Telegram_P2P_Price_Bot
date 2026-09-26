@@ -15,7 +15,7 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
 from exchanges import Merchant, parse_url, fetch, HEADERS
 from adlinks import (EXCHANGE_NAMES, AD_LINK_TEMPLATES, ad_link, market_link,
                      resolve_templates, render_template, template_is_exact, taker_side)
-from storage import build_store, database_link, database_connected
+from storage import build_store, database_link, database_connected, probe_store
 
 # ── paths: always relative to this file (works with systemd WorkingDirectory) ──
 # P2P_CONFIG_FILE / P2P_STATE_FILE override them (tests, or installs that keep
@@ -846,6 +846,24 @@ def db_is_persistent() -> bool:
     return database_connected(STORE)
 
 
+# A database is *configured* the moment a URL + token exist, which is not the
+# same as it answering.  ``RedisStore.load()`` reports a dead store exactly like
+# an empty one, so the bot used to show "connected ✅" while it had already
+# forgotten everything.  The answer is cached: the panel calls it several times.
+_DB_PROBE_TTL = 60.0
+_db_probe: dict = {"at": 0.0, "ok": True, "detail": ""}
+
+
+def db_health(force: bool = False) -> tuple[bool, str]:
+    """``(answers, detail)`` for the store in use — never raises."""
+    now = time.monotonic()
+    if not force and now - _db_probe["at"] < _DB_PROBE_TTL:
+        return bool(_db_probe["ok"]), str(_db_probe["detail"])
+    ok, detail = probe_store(STORE)
+    _db_probe.update(at=now, ok=ok, detail=detail)
+    return bool(ok), str(detail)
+
+
 def rebuild_store() -> str:
     """Re-select the state backend, carrying the in-memory state over.
 
@@ -1437,11 +1455,24 @@ def database_text():
             "<code>python setup_cli.py</code> — it can store the pair for you.\n"
             "3. Restart the bot if you edited .env, then tap 🔄 Check connection."
         )
+    # "configured" is not "answering": load() reports a database that went away
+    # exactly like an empty one, so it is probed here instead.
+    answers, detail = db_health(force=True) if persistent else (True, "")
+    if persistent and not answers:
+        label = "NOT answering ⚠️"
+        outage = (f"\n\n🚨 <b>Configured, but not answering</b> — {html_escape(detail)}\n"
+                  f"Until it responds the bot starts from an empty state every time and "
+                  f"forgets the group, the merchants and the prices. Fix the URL and token "
+                  f"on <code>/api/setup</code> or with <code>python setup_cli.py</code>, "
+                  f"then tap 🔄 Check connection.")
+    else:
+        label = "connected ✅" if persistent else "NOT connected ⚠️"
+        outage = ""
     return (
         f"🗄 <b>Database — where the bot keeps its state</b>\n\n"
         f"Current store: <code>{html_escape(STORE.describe())}</code>\n"
-        f"Shared database: <b>{'connected ✅' if persistent else 'NOT connected ⚠️'}</b>\n\n"
-        f"{state_block}\n\n"
+        f"Shared database: <b>{label}</b>\n\n"
+        f"{state_block}{outage}\n\n"
         f"🔗 {html_escape(database_link())}"
     )
 

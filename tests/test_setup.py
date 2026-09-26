@@ -13,6 +13,7 @@ public form, and the fact that neither one ever echoes a secret back.
 """
 
 import asyncio
+import importlib
 import json
 import os
 import sys
@@ -97,6 +98,12 @@ def isolated_store(tmp_path, monkeypatch):
             os.environ[name] = value
     runtime_config.invalidate()
     runtime_config._injected.clear()
+    # A save reloads bot.py so the new settings take effect at once (that is the
+    # point of "reconfigure").  Reload it once more with the environment back to
+    # normal, so the rest of the suite sees the module it expects.
+    module = sys.modules.get("bot")
+    if module is not None:
+        importlib.reload(module)
 
 
 @pytest.fixture(autouse=True)
@@ -508,9 +515,41 @@ def test_the_wizard_can_push_to_the_vercel_environment(monkeypatch, capsys):
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert setup_cli.main(["--token", "123456:ABCdef", "--admins", "424242",
                            "--yes", "--vercel-env"]) == 0
-    assert [call[0][:3] for call in calls] == [["vercel", "env", "add"]] * 2
+    # ``vercel env ls`` discovers what is already there first (``env add``
+    # refuses duplicates), then the two missing values are added.
+    assert [call[0][:3] for call in calls] == [["vercel", "env", "ls"],
+                                               ["vercel", "env", "add"],
+                                               ["vercel", "env", "add"]]
     assert b"123456:ABCdef" in [call[1] for call in calls]
     assert "Vercel" in capsys.readouterr().out
+
+
+def test_the_wizard_leaves_variables_alone_that_vercel_already_has(monkeypatch, capsys):
+    """A KV pair created by an integration must not be turned into an error."""
+    calls: list[tuple] = []
+
+    class Done:
+        returncode = 0
+        stderr = b""
+
+        def __init__(self, stdout=b""):
+            self.stdout = stdout
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs.get("input")))
+        # the listing prints every variable the project already has
+        return Done(b"BOT_TOKEN    123456:OLD    Production\n")
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert setup_cli.main(["--token", "123456:ABCdef", "--admins", "424242",
+                           "--yes", "--vercel-env"]) == 0
+
+    added = [call[0][3] for call in calls if call[0][:3] == ["vercel", "env", "add"]]
+    assert added == ["ADMIN_IDS"]                   # BOT_TOKEN exists → left alone
+    assert b"424242" in [call[1] for call in calls]
+    out = capsys.readouterr().out
+    assert "already exists" in out and "BOT_TOKEN" in out
 
 
 def test_a_missing_vercel_cli_is_reported_not_fatal(monkeypatch, capsys):
@@ -628,3 +667,259 @@ def test_vercel_new_redis_connection_warns_about_environment(unconfigured, monke
     assert status == 200
     assert any("applies only to this instance" in warning for warning in data["warnings"])
     assert not any("No KV/Redis is connected" in warning for warning in data["warnings"])
+
+
+# ── a database that stopped answering ──────────────────────────────────────
+# ``RedisStore.load()`` reports "nothing saved" both for a fresh install and for
+# a database that went away.  The second one used to look like a healthy
+# deployment with a locked form — nothing worked and nothing could be fixed.
+@pytest.fixture(autouse=True)
+def fresh_store_probe():
+    """Every test sees the database as it is, not as the last one left it."""
+    import serverless
+    serverless.reset_store_probe()
+    yield
+    serverless.reset_store_probe()
+
+
+def _kv_pair(monkeypatch, url="https://example.upstash.io", token="kv-token"):
+    monkeypatch.setenv("KV_REST_API_URL", url)
+    monkeypatch.setenv("KV_REST_API_TOKEN", token)
+
+
+def _redis_answers(monkeypatch):
+    class Reply:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"result": "PONG"}
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: Reply())
+
+
+def _redis_dead(monkeypatch):
+    import httpx
+
+    def dead(*a, **k):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(httpx, "post", dead)
+
+
+def test_a_database_that_stopped_answering_is_reported_not_hidden(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    _kv_pair(monkeypatch)
+    _redis_dead(monkeypatch)
+
+    import serverless
+    status = serverless.setup_status()
+
+    assert status["ready"] is False, "the bot cannot work without its state"
+    assert status["broken"] == ["state_store"]
+    check = {item["name"]: item for item in status["checks"]}["state_store"]
+    assert check["status"] == "broken" and "does not answer" in check["detail"]
+    assert "database" in status["message"]
+
+
+def test_a_dead_database_reopens_the_form_and_asks_for_credentials(monkeypatch):
+    """The page that reports the outage is the page that can repair it."""
+    monkeypatch.setenv("VERCEL", "1")
+    _kv_pair(monkeypatch)
+    _redis_dead(monkeypatch)
+
+    status, _, payload = call()
+    text = payload.decode()
+
+    assert status == 200
+    assert "Not responding" in text                     # its own badge, not "missing"
+    assert 'name="KV_REST_API_URL"' in text             # credentials can be entered again
+    assert 'name="KV_REST_API_TOKEN"' in text
+    assert "How to insert the database" in text         # …and the guide is back
+    assert "Locked" not in text
+
+
+def test_a_dead_database_lets_the_form_save_a_repair(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    _kv_pair(monkeypatch)
+    _redis_dead(monkeypatch)
+
+    status, _, payload = post_form({"ADMIN_IDS": "424242"})
+    assert status == 200 and json.loads(payload)["ok"] is True
+
+
+def test_a_database_that_answers_keeps_the_deployment_ready(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    _kv_pair(monkeypatch)
+    _redis_answers(monkeypatch)
+
+    import serverless
+    status = serverless.setup_status()
+
+    assert status["ready"] is True and status["broken"] == []
+    assert status["store_health"]["ok"] is True
+
+
+# ── the 🔧 one-button reconfigure ─────────────────────────────────────────
+class FakeApp:
+    """The smallest stand-in for an initialized PTB application."""
+
+    def __init__(self):
+        self.bot = self
+        self.messages: list[tuple] = []
+
+    async def send_message(self, chat_id=None, text=None, **kwargs):
+        self.messages.append((chat_id, text, kwargs.get("reply_markup")))
+
+
+@pytest.fixture()
+def telegram(monkeypatch):
+    """A configured deployment whose bot can talk to Telegram — offline."""
+    import serverless
+    app = FakeApp()
+    monkeypatch.setattr(serverless, "get_application", lambda *a, **k: _await(app))
+    monkeypatch.setattr(serverless, "public_base_url", lambda: "https://p2p-bot.vercel.app")
+    serverless._pending_setup_link.update(token="", expires=0.0, issued_at=0.0)
+    yield app
+    serverless._pending_setup_link.update(token="", expires=0.0, issued_at=0.0)
+
+
+class _await:
+    """``async`` return value for a patched ``get_application``."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __await__(self):
+        async def _get():
+            return self.value
+        return _get().__await__()
+
+
+def test_the_locked_setup_page_offers_one_button_that_reconfigures():
+    status, _, payload = call()
+    text = payload.decode()
+
+    assert status == 200
+    assert "Reconfigure" in text
+    assert 'name="action" value="send-link"' in text
+    assert "locked" in text.lower()
+
+
+def test_the_button_sends_a_one_time_link_to_the_admins(telegram):
+    status, _, payload = post_form({"action": "send-link"})
+    text = payload.decode()
+
+    assert status == 200
+    assert telegram.messages, "the admins were messaged"
+    chat_id, body, markup = telegram.messages[0]
+    assert chat_id == 424242
+    assert "/api/setup?secret=" in (markup["inline_keyboard"][0][0]["url"])
+    # The link is the key to the form: it is delivered, never shown to the clicker.
+    token = markup["inline_keyboard"][0][0]["url"].split("secret=")[-1]
+    assert token and token not in text
+    assert "Sent to the bot admin" in text
+
+
+def test_the_one_time_link_reopens_the_form(telegram):
+    post_form({"action": "send-link"})
+    token = telegram.messages[0][2]["inline_keyboard"][0][0]["url"].split("secret=")[-1]
+
+    status, _, payload = call(params={"secret": token})
+    text = payload.decode()
+
+    assert status == 200
+    assert 'name="BOT_TOKEN"' in text, "a configured deployment's form is open again"
+    assert "Locked" not in text
+
+
+def test_the_one_time_link_authorizes_a_save_and_is_then_spent(telegram):
+    post_form({"action": "send-link"})
+    token = telegram.messages[0][2]["inline_keyboard"][0][0]["url"].split("secret=")[-1]
+
+    status, _, payload = post_form({"ADMIN_IDS": "424242,777", "SETUP_SECRET": token})
+    assert status == 200 and json.loads(payload)["ok"] is True
+    assert runtime_config.load()["ADMIN_IDS"] == "424242,777"
+
+    # …and the link in the admin's chat history cannot change the bot again
+    status, _, payload = post_form({"ADMIN_IDS": "1", "SETUP_SECRET": token})
+    assert status == 403 and b"locked" in payload
+    assert runtime_config.load()["ADMIN_IDS"] == "424242,777"
+
+
+def test_an_unknown_secret_still_does_not_open_a_running_bot(telegram):
+    status, _, payload = post_form({"ADMIN_IDS": "1", "SETUP_SECRET": "not-the-link"})
+    assert status == 403 and b"locked" in payload
+    assert runtime_config.load() == {}
+
+
+def test_a_link_is_refused_once_it_has_expired(telegram):
+    post_form({"action": "send-link"})
+    token = telegram.messages[0][2]["inline_keyboard"][0][0]["url"].split("secret=")[-1]
+
+    import serverless
+    serverless._pending_setup_link["expires"] = 1.0
+    bot_module = sys.modules.get("bot")
+    if bot_module is not None and "setup_link" in bot_module.state:
+        bot_module.state["setup_link"]["expires"] = 1.0
+
+    status, _, payload = post_form({"ADMIN_IDS": "1", "SETUP_SECRET": token})
+    assert status == 403 and b"locked" in payload
+    assert runtime_config.load() == {}
+
+
+def test_the_button_reports_when_telegram_cannot_be_reached(monkeypatch):
+    """A revoked token is the one case the link cannot cover — say so plainly."""
+    import serverless
+
+    class Silent(FakeApp):
+        async def send_message(self, chat_id=None, text=None, **kwargs):
+            raise RuntimeError("Forbidden: bot was blocked by the user")
+
+    monkeypatch.setattr(serverless, "get_application", lambda *a, **k: _await(Silent()))
+    monkeypatch.setattr(serverless, "public_base_url", lambda: "https://p2p-bot.vercel.app")
+
+    status, _, payload = post_form({"action": "send-link"})
+    text = payload.decode()
+
+    assert status == 502
+    assert "could not reach Telegram" in text
+    assert "python setup_cli.py" in text
+
+
+def test_the_status_page_links_to_the_setup_page():
+    status, _, payload = call(path="/api/webhook", params={"register": "0"},
+                              headers={"accept": "text/html"})
+    assert status == 200
+    assert 'href="/api/setup"' in payload.decode()
+
+
+def test_a_saved_setting_is_applied_to_the_running_instance(unconfigured, monkeypatch):
+    """Reconfiguring must not wait for the next cold start.
+
+    ``bot.TOKEN`` / ``bot.ADMINS`` are read once, at import time, so a warm
+    container would keep serving the old values forever without the reload.
+    """
+    import bot as bot_module
+    original = bot_module.TOKEN
+
+    status, _, payload = post_form({"BOT_TOKEN": "123456:BRANDNEW", "ADMIN_IDS": "424242"})
+    data = json.loads(payload)
+
+    assert status == 200 and data["ok"] is True
+    assert bot_module.TOKEN == "123456:BRANDNEW"      # the module itself moved on
+    assert any("no redeploy" in note for note in data["notes"])
+    assert original != "123456:BRANDNEW"
+
+
+def test_pressing_the_button_twice_does_not_spam_the_admins(telegram):
+    """The button is public — it must not become a way to message the admin in a loop."""
+    status, _, payload = post_form({"action": "send-link"})
+    assert status == 200 and len(telegram.messages) == 1
+
+    status, _, payload = post_form({"action": "send-link"})
+    text = payload.decode()
+
+    assert status == 200 and len(telegram.messages) == 1, "no second message was sent"
+    assert "already have a link" in text

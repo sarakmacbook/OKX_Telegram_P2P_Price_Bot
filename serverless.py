@@ -31,11 +31,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import importlib
 import json
 import logging
 import os
 import secrets
 import sys
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs
@@ -128,6 +130,56 @@ def state_status(store: Any = None) -> dict:
     return status
 
 
+# ── is the state database really there? ───────────────────────────────────
+# ``RedisStore.load()`` returns ``None`` both for "nothing saved yet" and for
+# "the database is gone" — and the bot reads that as an empty state, so the
+# group, the merchants and the prices quietly vanish while the setup checklist
+# keeps saying "connected".  Probing the store is the only way to tell the two
+# apart, so the answer is cached for a short while and never raises: a failed
+# probe is *reported*, not fatal.  Off Vercel a database is not a hard
+# requirement, so the probe is skipped there rather than billed to every page.
+STORE_PROBE_TTL = 60.0          # a healthy answer is trusted for a minute …
+STORE_PROBE_FAIL_TTL = 20.0     # … a failure less, so a blip costs seconds, not minutes
+STORE_PROBE_TIMEOUT = 4.0
+_store_probe: dict[str, Any] = {"at": 0.0, "key": "", "ok": True, "detail": ""}
+
+
+def reset_store_probe() -> None:
+    """Forget the cached probe result (tests, and right after a settings save)."""
+    _store_probe.update(at=0.0, key="")
+
+
+def _store_key() -> str:
+    """What the selected store depends on — cheap enough to compare per request.
+
+    Building the store just to describe it would log a line (and touch the disk)
+    on every request, so the cache is keyed on the configuration instead.
+    """
+    return "|".join([storage.state_backend(), str(storage.redis_config() or ""),
+                     env("P2P_STATE_KEY"), env("P2P_STATE_FILE"), env("P2P_DATA_DIR")])
+
+
+def store_health(force: bool = False) -> dict:
+    """Reachability of the selected state store: ``{ok, detail, backend}``."""
+    key = _store_key()
+    now = time.monotonic()
+    if not force and _store_probe["key"] == key:
+        age = now - _store_probe["at"]
+        if age < (STORE_PROBE_TTL if _store_probe["ok"] else STORE_PROBE_FAIL_TTL):
+            return {"ok": bool(_store_probe["ok"]), "detail": str(_store_probe["detail"]),
+                    "backend": str(_store_probe.get("backend") or "none"), "cached": True}
+    store = storage.build_store(ROOT)
+    ok, detail = storage.probe_store(store, timeout=STORE_PROBE_TIMEOUT)
+    if not ok and not force:
+        # One failure is not an outage: a single dropped connection must not
+        # take a working deployment down for the whole cache window.
+        ok, detail = storage.probe_store(store, timeout=STORE_PROBE_TIMEOUT)
+    _store_probe.update(at=now, key=key, ok=ok, detail=detail,
+                        backend=getattr(store, "backend", "none"))
+    return {"ok": bool(ok), "detail": str(detail),
+            "backend": getattr(store, "backend", "none"), "cached": False}
+
+
 def delete_webhook(bot_module=None) -> None:
     """Forget the registration bookkeeping (used when a webhook is removed)."""
     bot_module = bot_module or get_bot()
@@ -216,6 +268,11 @@ async def _application_locked(loop: asyncio.AbstractEventLoop):
         return app
     bot_module = get_bot()
     app = bot_module.build_application(polling=False)
+    # /setup hands the admins the one-time link that reopens the setup form.
+    # It lives here rather than in bot.py because a polling install configures
+    # itself from config.json and needs no browser round-trip.
+    from telegram.ext import CommandHandler
+    app.add_handler(CommandHandler("setup", setup_command), group=0)
     # Bot.initialize() calls getMe once: it verifies the token and caches the
     # bot's own user, so /start links work without a second API call.
     await app.initialize()
@@ -487,14 +544,22 @@ def _local_config_has_credentials() -> bool:
 
 
 def _setup_check(name: str, label: str, required: bool, ok: bool,
-                 detail: str, variables: tuple[str, ...], source: str = "") -> dict:
-    """Create a public, secret-free item for the setup checklist."""
+                 detail: str, variables: tuple[str, ...], source: str = "",
+                 broken: bool = False) -> dict:
+    """Create a public, secret-free item for the setup checklist.
+
+    ``broken`` marks something that *is* configured but does not work — a
+    database whose credentials are present yet unreachable.  It is shown with
+    its own badge so it is not mistaken for "never set up".
+    """
     return {
         "name": name,
         "label": label,
         "required": required,
         "ok": bool(ok),
-        "status": "ready" if ok else ("required" if required else "recommended"),
+        "broken": bool(broken) and not ok,
+        "status": ("broken" if broken and not ok else
+                   "ready" if ok else ("required" if required else "recommended")),
         "detail": detail,
         "variables": list(variables),
         "source": source,
@@ -569,6 +634,9 @@ def setup_status() -> dict:
     # Vercel has no durable file system, so a file choice there is a blocking
     # misconfiguration even when Redis credentials happen to be available.
     selected_backend = storage.state_backend()
+    wants_redis = selected_backend != "file"
+    health = store_health() if (on_vercel and redis_ok and wants_redis) else None
+    state_broken = bool(health is not None and not health["ok"])
     if selected_backend == "redis":
         state_ok = redis_ok
         state_detail = (redis_detail if redis_ok else
@@ -585,13 +653,25 @@ def setup_status() -> dict:
                         ("Auto mode will use data.json on this host. Set "
                          "P2P_STATE_BACKEND=redis and connect a KV store to share state."))
 
+    if state_broken:
+        # Credentials that are present but dead are the failure you never see:
+        # every page reports a healthy database while the bot has already
+        # forgotten its group, merchants and prices.  Say so — and keep the
+        # deployment "not ready" so the form that repairs it stays open.
+        state_ok = False
+        state_detail = (f"The database credentials are set, but the store does not answer "
+                        f"({health['detail']}). The bot forgets its group, merchants and "
+                        f"prices until it is reachable again — paste working credentials "
+                        f"into the form below, or connect a new database.")
+
     checks = [
         _setup_check("bot_token", "Telegram bot token", True, token_ok,
                      token_detail, ("BOT_TOKEN",), source("BOT_TOKEN")),
         _setup_check("admin_ids", "Telegram admin ID", True, admins_ok,
                      admins_detail, ("ADMIN_IDS",), source("ADMIN_IDS")),
         _setup_check("state_store", "State database", on_vercel, state_ok,
-                     state_detail, ("KV_REST_API_URL", "KV_REST_API_TOKEN", "P2P_STATE_BACKEND")),
+                     state_detail, ("KV_REST_API_URL", "KV_REST_API_TOKEN", "P2P_STATE_BACKEND"),
+                     broken=state_broken),
     ]
     blocking = [check for check in checks if check["required"] and not check["ok"]]
     if blocking:
@@ -602,6 +682,13 @@ def setup_status() -> dict:
                        "or set them in the deployment's environment variables and redeploy. "
                        "A KV/Redis store is required too: without it Vercel forgets the group, "
                        "the merchants and the prices between requests.")
+        elif state_broken:
+            names = "a reachable KV/Redis database"
+            message = ("The bot cannot work until its database answers again: the credentials "
+                       "are set, but the store does not respond, so the group, the merchants "
+                       "and the prices are being forgotten. Enter working KV / Redis "
+                       f"credentials in the form on {SETUP_PATH} (no redeploy needed), or "
+                       "connect a new database.")
         else:
             message = ("The deployment is missing a persistent KV/Redis store — set "
                        "KV_REST_API_URL and KV_REST_API_TOKEN by connecting Upstash for Redis "
@@ -630,13 +717,21 @@ def setup_status() -> dict:
 
     configured = bool(token) and bool(admins)
     locked = bool(env("SETUP_SECRET")) or not blocking
+    # "configured but not working" — the state that used to hide behind a green
+    # checklist and a locked form.  The setup page stays editable while it is
+    # set, because repairing the deployment is exactly what the form is for.
+    broken = [check["name"] for check in checks if check.get("broken")]
     return {
         "ready": not blocking,
+        "healthy": not blocking and not broken,
+        "broken": broken,
         "serverless": on_vercel,
         "checks": checks,
         "missing": names,
         "required_missing": [check["name"] for check in blocking],
         "message": message,
+        "store_health": health or ({"ok": None, "detail": "not checked",
+                                    "backend": selected_backend} if on_vercel else None),
         # what the browser form may do, and what it already holds (redacted)
         "setup_path": SETUP_PATH,
         "runtime": runtime_config.summary(ROOT),
@@ -665,6 +760,167 @@ def _bearer(request: "Request") -> str:
     return header[7:].strip() if header.lower().startswith("bearer ") else ""
 
 
+SETUP_LINK_KEY = "setup_link"
+SETUP_LINK_TTL = 15 * 60.0          # a reconfigure link is valid for 15 minutes
+SETUP_LINK_COOLDOWN = 60.0          # …and at most one is handed out per minute
+SETUP_LINK_FIELD = "action"
+SETUP_LINK_ACTION = "send-link"
+
+# The link that is currently out, kept in memory as well: if the state store is
+# the very thing that is broken, the record cannot be persisted — and that is
+# exactly when the owner needs the form.  A cold start simply starts over.
+_pending_setup_link: dict[str, Any] = {"token": "", "expires": 0.0}
+
+
+def _setup_link_record(bot_module) -> dict:
+    """The persisted one-time link record (``{}`` when there is none)."""
+    record = (bot_module.state.get(SETUP_LINK_KEY) if bot_module is not None else None)
+    return record if isinstance(record, dict) else {}
+
+
+def _active_setup_link() -> tuple[str, float]:
+    """``(token, expires)`` of a link this instance handed out and still honours."""
+    token = str(_pending_setup_link.get("token") or "")
+    expires = float(_pending_setup_link.get("expires") or 0.0)
+    if token and time.time() < expires:
+        return token, expires
+    return "", 0.0
+
+
+def issue_setup_link_token(bot_module=None) -> tuple[str, float, bool]:
+    """Create the one-time token a reconfigure link carries.
+
+    Returns ``(token, expires, fresh)``.  ``fresh`` is ``False`` while the
+    cooldown from the previous link is still running: the button is public, so
+    without that a stranger could make the bot message the admins in a loop.
+    """
+    if bot_module is None:
+        bot_module = sys.modules.get("bot")
+    record = _setup_link_record(bot_module)
+    issued_at = max(float(record.get("issued_at") or 0.0),
+                    float(_pending_setup_link.get("issued_at") or 0.0))
+    token, expires = _active_setup_link()
+    if token and time.time() - issued_at < SETUP_LINK_COOLDOWN:
+        return token, expires, False
+
+    token = secrets.token_urlsafe(32)
+    expires = time.time() + SETUP_LINK_TTL
+    _pending_setup_link.update(token=token, expires=expires, issued_at=time.time())
+    if bot_module is not None:
+        try:
+            # Only the fingerprint is stored: anybody who can read the database
+            # must not be able to rebuild the link from it.
+            bot_module.state[SETUP_LINK_KEY] = {
+                "fp": hashlib.sha256(token.encode()).hexdigest(),
+                "expires": expires,
+                "issued_at": time.time(),
+            }
+            bot_module.save()
+        except Exception as exc:                     # pragma: no cover - defensive
+            log.warning("the reconfigure link could not be stored: %s", exc)
+    return token, expires, True
+
+
+def setup_link_valid(token: str, bot_module=None) -> bool:
+    """Whether ``token`` is a live one-time reconfigure link."""
+    candidate = str(token or "").strip()
+    if not candidate:
+        return False
+    if bot_module is None:
+        bot_module = sys.modules.get("bot")
+    record = _setup_link_record(bot_module)
+    stored = str(record.get("fp") or "")
+    if stored:
+        if not secrets.compare_digest(stored, hashlib.sha256(candidate.encode()).hexdigest()):
+            return False
+        return time.time() < float(record.get("expires") or 0.0)
+    # Nothing persisted (the store is the thing that is broken): fall back to
+    # what this instance handed out, which is all one instance can honour.
+    active, expires = _active_setup_link()
+    return bool(active) and secrets.compare_digest(active, candidate) and time.time() < expires
+
+
+def consume_setup_link(token: str, bot_module=None) -> bool:
+    """Spend a one-time reconfigure link so it cannot be replayed."""
+    if not setup_link_valid(token, bot_module):
+        return False
+    if bot_module is None:
+        bot_module = sys.modules.get("bot")
+    if bot_module is not None:
+        try:
+            bot_module.state.pop(SETUP_LINK_KEY, None)
+            bot_module.save()
+        except Exception as exc:                     # pragma: no cover - defensive
+            log.warning("the reconfigure link could not be spent: %s", exc)
+    _pending_setup_link.update(token="", expires=0.0)
+    return True
+
+
+async def issue_setup_link(app=None) -> dict:
+    """One button worth of work: hand the owner a link that reopens the form.
+
+    The setup page is public, so it cannot simply unlock itself — anybody who
+    guessed ``/api/setup`` would be able to point the bot at their own admin id.
+    Instead the link is delivered **to the admins in Telegram**: only they can
+    receive it, it is single use and expires.  Returns a secret-free report.
+    """
+    bot_module = get_bot()
+    app = app or await get_application()
+    token, expires, fresh = issue_setup_link_token(bot_module)
+    try:
+        url = public_base_url() + SETUP_PATH + "?secret=" + token
+    except ConfigError as exc:                       # no PUBLIC_URL and no Vercel host
+        url = SETUP_PATH + "?secret=" + token
+        log.warning("reconfigure link without a public base URL: %s", exc)
+
+    if not fresh:
+        # A link is already out and the admins already have it — messaging them
+        # again on every click would turn a public button into a spam lever.
+        return {"ok": True, "url": url, "delivered": [], "errors": [], "resent": False,
+                "expires_in": int(max(0, expires - time.time()))}
+
+    delivered: list[str] = []
+    errors: list[str] = []
+    minutes = max(1, int(round((expires - time.time()) / 60.0)))
+    text = ("🔧 <b>Reconfigure the bot</b>\n\n"
+            "Tap the link to change its token, admins, pair or database. It works "
+            f"once and expires in {minutes} minutes — request a new one any time from "
+            f"{SETUP_PATH}.")
+    for admin in sorted(getattr(bot_module, "ADMINS", ()) or ()):
+        try:
+            await app.bot.send_message(chat_id=int(admin), text=text, parse_mode="HTML",
+                                       reply_markup={"inline_keyboard":
+                                                     [[{"text": "🔧 Reconfigure the bot",
+                                                        "url": url}]]},
+                                       disable_web_page_preview=True)
+            delivered.append(str(admin))
+        except Exception as exc:
+            errors.append(f"admin {admin}: {type(exc).__name__}: {exc}")
+    return {"ok": bool(delivered), "url": url, "delivered": delivered, "errors": errors,
+            "resent": True, "expires_in": int(max(0, expires - time.time()))}
+
+
+async def setup_command(update, context) -> None:
+    """``/setup`` in Telegram — the same link the web UI's button sends."""
+    user = getattr(update, "effective_user", None)
+    bot_module = get_bot()
+    if not user or not bot_module.is_admin(update):
+        return
+    try:
+        report = await issue_setup_link(app=getattr(context, "application", None))
+    except Exception as exc:                      # pragma: no cover - network, config
+        log.warning("/setup could not issue a link: %s", exc)
+        report = {"ok": False, "errors": [f"{type(exc).__name__}: {exc}"], "expires_in": 0}
+    if report["ok"]:
+        await update.message.reply_html(
+            "🔧 Here is your reconfigure link — it works once and expires in "
+            f"{max(1, report['expires_in'] // 60)} minutes:\n\n{html.escape(report['url'])}")
+    else:
+        await update.message.reply_html(
+            "⚠️ I could not send you the reconfigure link: "
+            f"{html.escape('; '.join(report['errors']) or 'unknown error')}")
+
+
 def setup_write_allowed(request: "Request", status: dict | None = None) -> tuple[bool, str]:
     """Who may store settings through ``POST /api/setup``.
 
@@ -673,24 +929,33 @@ def setup_write_allowed(request: "Request", status: dict | None = None) -> tuple
     * ``SETUP_SECRET`` set → the request must carry it (form field, ``?secret=``
       or ``Authorization: Bearer``).  This is the recommended way to lock the
       form *before* the first deployment.
-    * the deployment is **not** ready yet → anybody may finish the setup.  It is
-      unusable until then, and stored values never overrule environment
-      variables, so there is nothing to take over.
-    * the deployment **is** ready → refused.  An anonymous form must not be able
-      to point a running bot at somebody else's admin id.
+    * a **one-time reconfigure link** (the ⚙️/🔧 button) → accepted.  Only the
+      admins receive one, in Telegram, so proving the secret proves the admin.
+    * the deployment is **not** ready, or something it needs is **broken** →
+      anybody may finish or repair the setup.  It is unusable until then, and
+      stored values never overrule environment variables, so there is nothing
+      to take over.
+    * the deployment **is** ready and healthy → refused.  An anonymous form must
+      not be able to point a running bot at somebody else's admin id.
     """
     status = status or setup_status()
+    given = (request.form().get("SETUP_SECRET") or request.query.get("secret")
+             or _bearer(request))
     secret = env("SETUP_SECRET")
+    if secret and matches(given, secret):
+        return True, ""
+    if setup_link_valid(given):
+        return True, ""
     if secret:
-        given = request.form().get("SETUP_SECRET") or request.query.get("secret") or _bearer(request)
-        if matches(given, secret):
-            return True, ""
         return False, ("SETUP_SECRET is set for this deployment — send it with the request "
-                       "(form field, ?secret= or 'Authorization: Bearer') to change the settings.")
-    if status["ready"]:
-        return False, ("The deployment is configured already, so the form is locked. Set "
-                       "SETUP_SECRET in the environment to allow changes from the browser, or "
-                       "run  python setup_cli.py  in a terminal — it writes to the same store.")
+                       "(form field, ?secret= or 'Authorization: Bearer') to change the settings, "
+                       "or press 🔧 Reconfigure on the setup page to get a link in Telegram.")
+    if status["ready"] and not status.get("broken"):
+        return False, ("locked: this deployment is configured and working, so the form is "
+                       "closed — an open page must not be able to change a running bot. "
+                       "Press 🔧 Reconfigure on the setup page to get a one-time link in "
+                       "Telegram, set SETUP_SECRET in the environment, or run "
+                       " python setup_cli.py  in a terminal — it writes to the same store.")
     return True, ""
 
 
@@ -706,6 +971,35 @@ def _probe_redis(url: str, token: str) -> tuple[bool, str]:
         return True, "the store answered"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
+
+
+def _reload_bot() -> bool:
+    """Re-run ``bot.py`` so a changed token, admin id or pair take effect.
+
+    ``bot.TOKEN``, ``bot.ADMINS``, ``bot.ASSET`` and ``bot.STORE`` are set once,
+    at import time, and a warm container keeps that module for its whole life.
+    Without this a saved setting would be written to the store and then ignored
+    until the next cold start — the reconfigure form would look like it did
+    nothing.  ``importlib.reload`` re-executes the module in place, so the
+    references other modules already hold stay valid.
+    """
+    global _bot
+    module = sys.modules.get("bot")
+    if module is None:                            # nothing imported yet — nothing to redo
+        return False
+    _apps.clear()                                 # the cached PTB app holds the old token
+    _locks.clear()
+    try:
+        importlib.reload(module)
+    except Exception as exc:                      # pragma: no cover - defensive
+        log.warning("bot.py could not be reloaded after a settings change: %s", exc)
+        return False
+    _bot = module
+    try:
+        module.refresh_state()
+    except Exception as exc:                      # pragma: no cover - defensive
+        log.debug("state refresh after reload failed: %s", exc)
+    return True
 
 
 def _refresh_store() -> None:
@@ -818,7 +1112,19 @@ def save_setup_values(values: dict, verify: bool = True) -> dict:
         notes.append("This instance now talks to that store; other instances and cold starts "
                      "need KV_REST_API_URL + KV_REST_API_TOKEN in the deployment environment.")
     runtime_config.invalidate()
-    _refresh_store()
+    reset_store_probe()
+    # bot.py read its configuration at import time, so a warm container would
+    # keep serving the *old* token, admins and pair until the next cold start.
+    # Reload it (and drop the cached PTB application) when something changed
+    # that only a fresh import can pick up.
+    if cleaned or kv_url:
+        try:
+            if _reload_bot():
+                notes.append("This instance picked up the new settings at once — no redeploy "
+                             "needed.")
+        except Exception as exc:                  # pragma: no cover - defensive
+            log.warning("applying the new settings to this instance failed: %s", exc)
+        _refresh_store()
 
     for name in shadowed:
         warnings.append(f"{name} is also set in the deployment environment — other instances keep "
@@ -912,21 +1218,41 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
     needs_secret = bool(status.get("setup_secret")) or bool(status["ready"])
     selected_backend = str(values.get("P2P_STATE_BACKEND") or
                            runtime.get("state_backend") or storage.state_backend())
-    redis_connected = bool(storage.redis_config())
+    # A pair that is present but dead is not "connected" — the form has to ask
+    # for the credentials again, otherwise the page that reports the outage is
+    # the one page that cannot fix it.
+    redis_connected = bool(storage.redis_config()) and "state_store" not in (
+        status.get("broken") or [])
 
     # A configured deployment is editable in the browser when the owner has
-    # supplied SETUP_SECRET.  ``edit_authorized`` is set only after the GET
-    # request proves the secret; it is deliberately not persisted in status.
-    if status["ready"] and not status.get("setup_secret"):
+    # supplied SETUP_SECRET, or arrived with a one-time reconfigure link.
+    # ``edit_authorized`` is set only after the GET request proves one of them;
+    # it is deliberately not persisted in status.
+    if status["ready"] and not status.get("setup_secret") and not status.get("edit_authorized"):
+        broken_marks = status.get("broken") or []
+        if broken_marks:
+            lead = ("🔧 <b>Something needs repairing</b> — the form below is open so you can "
+                    "fix it without a redeploy.")
+        else:
+            lead = ("🔒 <b>Everything is in place, so the form is closed</b> — an open page "
+                    "must not be able to change a running bot.")
         return (
             '<section class="panel" aria-labelledby="form-title">'
             '<div class="panel-heading"><div><h2 id="form-title">Reconfigure the bot</h2>'
-            '<p class="subtle">Locked — this deployment is configured.</p></div></div>'
-            f'<p class="locked">🔒 Everything is in place, so the form is closed: an open page '
-            f'must not be able to change a running bot. To edit settings from the browser, '
-            f'set <code>SETUP_SECRET</code> in the deployment environment, then open '
-            f'<code>{html.escape(SETUP_PATH)}?secret=…</code>. In a terminal, '
-            f'<code>python setup_cli.py</code> writes to the same store.</p></section>')
+            f'<p class="subtle">{"Needs repair" if broken_marks else "Locked"} — this '
+            f'deployment is configured.</p></div></div>'
+            f'<p class="locked">{lead} Press the button and the bot sends you a '
+            f'one-time link in Telegram — it works once and expires, so it is the only thing '
+            f'that can reopen this form.</p>'
+            f'<form method="post" action="{html.escape(SETUP_PATH)}" class="actions">'
+            f'<input type="hidden" name="{SETUP_LINK_FIELD}" value="{SETUP_LINK_ACTION}">'
+            f'<button class="button" type="submit">🔧 Reconfigure — send me a link</button>'
+            f'</form>'
+            f'<p class="where">The link goes to the admin(s) listed in '
+            f'<code>ADMIN_IDS</code> — if Telegram cannot be reached, run '
+            f'<code>python setup_cli.py</code> in a terminal (same store), or set '
+            f'<code>SETUP_SECRET</code> in the deployment environment and open '
+            f'<code>{html.escape(SETUP_PATH)}?secret=…</code>.</p></section>')
 
     if status.get("edit_authorized"):
         # Keep the authorization across the form submit without putting the
@@ -1108,6 +1434,9 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     for check in checks:
         if check.get("ok"):
             icon, badge, css = "✓", "Ready", "ready"
+        elif check.get("broken"):
+            # Configured, but not working — an outage, not a missing setting.
+            icon, badge, css = "✕", "Not responding", "broken"
         elif check.get("required"):
             icon, badge, css = "!", "Needs action", "required"
         else:
@@ -1126,7 +1455,10 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     checks_markup = "\n".join(cards)
     banner_markup = _banner(banner)
     form_markup = _setup_form(status, form_values)
-    database_connected = storage.database_connected()
+    # A database that is configured but unreachable needs the guide just as
+    # much as a missing one — this is the page that has to repair it.
+    database_connected = storage.database_connected() and "state_store" not in (
+        status.get("broken") or [])
     db_guide_markup = "" if database_connected else _db_guide_panel()
     connect_link_markup = (
         "" if database_connected else
@@ -1183,6 +1515,7 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     .check-icon {{ flex: 0 0 auto; display: grid; place-items: center; width: 27px; height: 27px; border-radius: 50%; font-weight: 900; }}
     .ready .check-icon {{ color: #06261a; background: var(--green); }}
     .required .check-icon {{ color: #35100e; background: var(--red); }}
+    .broken .check-icon {{ color: #35100e; background: var(--red); }}
     .optional .check-icon {{ color: #3b2700; background: var(--amber); }}
     .check-copy {{ min-width: 0; flex: 1; }}
     .check h3 {{ margin: 0; font-size: 15px; }}
@@ -1191,6 +1524,7 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
     .badge {{ flex: 0 0 auto; margin-top: 2px; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 750; white-space: nowrap; }}
     .ready .badge {{ color: #73f0bf; background: #35d3991a; }}
     .required .badge {{ color: #ffabab; background: #ff8c8c1a; }}
+    .broken .badge {{ color: #ffabab; background: #ff8c8c1a; }}
     .optional .badge {{ color: #ffd27c; background: #f7b9551a; }}
     code {{ color: #d8dcff; background: #090d1977; border: 1px solid #3b4770; border-radius: 6px; padding: 1px 5px; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }}
     .steps {{ display: grid; gap: 11px; margin-top: 18px; }}
@@ -1345,10 +1679,15 @@ def page(title: str, rows: list[tuple[str, Any]], notes: list[str] | None = None
         for name, value in rows)
     warn = "".join(f'\n    <p class="warn">⚠️ {html.escape(w)}</p>' for w in warnings or [])
     extra = "".join(f"\n    <p>{html.escape(n)}</p>" for n in notes or [])
-    buttons = "".join(
-        f'\n    <a class="button" href="{html.escape(url, quote=True)}" target="_blank" '
-        f'rel="noopener">{html.escape(label)}</a>'
-        for label, url in links or [])
+    # Same-origin links (the setup page, a re-check) stay in this tab; only the
+    # fixed platform/documentation URLs open a new one.
+    rendered = []
+    for label, url in links or []:
+        same_origin = str(url).startswith("/")
+        target = "" if same_origin else ' target="_blank" rel="noopener"'
+        rendered.append(f'\n    <a class="button" href="{html.escape(url, quote=True)}"'
+                        f'{target}>{html.escape(label)}</a>')
+    buttons = "".join(rendered)
     actions = f'\n    <p class="actions">{buttons}</p>' if buttons else ""
     return f"""<!DOCTYPE html>
 <html lang="en">

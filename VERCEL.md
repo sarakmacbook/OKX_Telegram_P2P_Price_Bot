@@ -55,7 +55,41 @@ variables always win over stored values, and `CRON_SECRET` stays
 environment-only (Vercel's cron sends it from there).
 
 > 🔒 The form is public, so it closes as soon as the deployment is configured —
-> and if you set `SETUP_SECRET`, every submission must carry it. See §10.
+> and if you set `SETUP_SECRET`, every submission must carry it. To change a
+> setting later, use the 🔧 **Reconfigure** button described just below. See §10.
+
+### Changing a setting later — the 🔧 Reconfigure button
+
+A running deployment is reconfigured **without a redeploy and without the
+Vercel dashboard**:
+
+1. Open `https://<your-app>.vercel.app/api/setup` (or press **⚙️ Reconfigure
+   setup** on the status page).
+2. Press **🔧 Reconfigure — send me a link**.
+3. The bot sends you a **one-time link** in Telegram, to the admin(s) in
+   `ADMIN_IDS`. It works once and expires after 15 minutes.
+4. Open that link: the form is editable again. Save, and the running instance
+   picks the new values up immediately.
+
+Sending `/setup` to the bot in Telegram does the same thing without opening the
+browser at all.
+
+Why a link instead of an open form? `/api/setup` is a public URL — a form that
+unlocked itself would let anybody who guesses it point your bot at their own
+admin id. The link is only ever delivered to the admins, so pressing the button
+costs nothing and proving the link proves the admin. `SETUP_SECRET` still works
+exactly as before if you prefer a fixed secret.
+
+> ⚠️ Two cases the link cannot cover, because both need a working bot token:
+> Telegram is unreachable, or the token was revoked. The page says so and points
+> at `python setup_cli.py` — which writes to the same store — and at
+> `SETUP_SECRET` in the environment.
+
+The form also opens by itself whenever the deployment **cannot work**: a missing
+token, or — the one that used to be invisible — a database whose credentials are
+set but which no longer answers (see §9). In both states there is nothing to
+protect and everything to repair, so the page that reports the problem is the
+page that fixes it.
 
 ## 2. Deploy
 
@@ -207,7 +241,8 @@ want that choice to survive every cold start.
 | `/api/webhook` | `GET` | first-start setup UI when `BOT_TOKEN`/`ADMIN_IDS`/KV are missing; otherwise the health page (JSON for scripts, HTML in a browser) that registers the webhook; `?register=1` forces it, `?register=0` only reports |
 | `/api/webhook?check=1` | `GET` | status page + a live price fetch for every merchant — open this when prices are empty to see the per-merchant error |
 | `/api/setup` | `GET` | the first-start page: readiness checklist + a form for what is missing (rendered whether or not the bot can start, so it is also where you change a setting later) |
-| `/api/setup` | `POST` | stores the submitted settings (JSON or form-encoded) and applies them at once; 403 when the deployment is configured and no `SETUP_SECRET` is sent, 400 with a readable reason when a value is wrong or Telegram rejects the token |
+| `/api/setup` | `POST` | stores the submitted settings (JSON or form-encoded) and applies them at once; 403 when the deployment is healthy and no authorization is sent, 400 with a readable reason when a value is wrong or Telegram rejects the token |
+| `/api/setup` | `POST` `action=send-link` | the 🔧 **Reconfigure** button: sends the admins a one-time link in Telegram that reopens the form (see §6) |
 | `/api/tick` | `GET` | one cron round: keep the webhook registered → post prices if they changed → delete stale group messages |
 | anything else | – | `404` (JSON) — the deployment is one catch-all function, so the router answers what the platform's 404 used to |
 
@@ -269,7 +304,9 @@ want that choice to survive every cold start.
 | `vercel build` fails with *No python entrypoint found in default locations* | the entry point moved, or `pyproject.toml` lost its `[tool.vercel] entrypoint = "api.app:app"` → restore it (the file must be `api/app.py` and export a top-level `app`), then redeploy |
 | `vercel build` installs nothing / `ModuleNotFoundError: telegram` | `pyproject.toml` outranks `requirements.txt` on Vercel — the two dependency lists must match (see §8) |
 | Page shows ⚙️ *Setup needed* (or a 500 JSON with a *hint*) | `BOT_TOKEN`/`ADMIN_IDS`/KV missing or added **after** the last deploy → add them in the form on the page (or `python setup_cli.py`) — no redeploy needed; only environment variables need one |
-| `POST /api/setup` answers `403 … the form is locked` | the deployment is configured → send `SETUP_SECRET` (and set it in the environment first), or change the value with `python setup_cli.py` / in the dashboard |
+| `POST /api/setup` answers `403 … the form is locked` | the deployment is configured and healthy → press **🔧 Reconfigure — send me a link** to get a one-time link in Telegram, send `SETUP_SECRET` (set it in the environment first), or change the value with `python setup_cli.py` / in the dashboard |
+| The bot forgot its group, merchants and prices, but every page says the database is connected | the database credentials are set yet the store no longer answers (deleted/rotated Upstash database, wrong region). `/api/setup` now shows **Not responding** instead of a green tick and reopens the form — paste working credentials (or connect a new database) and save |
+| 🔧 Reconfigure says *the bot could not reach Telegram* | the token is wrong, revoked, or the admin never pressed *Start* on the bot — so the link cannot be delivered. Fix the token with `python setup_cli.py`, or set `SETUP_SECRET` in the environment and open `/api/setup?secret=…` |
 | The form saved the settings but the next cold start forgot them | they went to the instance's temporary storage because no KV/Redis is connected → connect Upstash/KV, add the pair to the environment and redeploy |
 | Prices are `—`, or `⚠️ …451…` / *restricted* / *forbidden* | the exchange geo-blocks the function's region → keep `"regions": ["fra1"]` in `vercel.json` (EU) and redeploy; diagnose with `/api/webhook?check=1` |
 | Deployment URL shows a Vercel 404 | only `/` (redirects to the status page) and `/api/*` exist — check the URL |
@@ -289,10 +326,16 @@ want that choice to survive every cold start.
   `VERCEL_*` variables — never from the request's `Host` header, so a forged
   request cannot point your bot's updates at somebody else's server.
 * `CRON_SECRET` keeps `/api/tick` (which can post to your group) private.
-* `POST /api/setup` (the settings form) accepts a submission only while the
-  deployment is **not** configured, and always when it carries `SETUP_SECRET`.
-  A configured deployment can therefore never be re-pointed at somebody else's
-  admin id by a stranger who finds the URL.
+* `POST /api/setup` (the settings form) accepts a submission while the
+  deployment is **not** configured, while something it needs is **broken**, and
+  whenever the request carries an authorization: `SETUP_SECRET`, or a one-time
+  reconfigure link. A healthy, configured deployment can therefore never be
+  re-pointed at somebody else's admin id by a stranger who finds the URL.
+* The one-time reconfigure link is 256 bits of randomness, is stored **only as a
+  SHA-256 fingerprint** (so a leak of the database cannot rebuild it), expires
+  after 15 minutes, is spent by the save it authorizes, and is never shown to
+  the person who pressed the button — it is delivered to the admins in Telegram,
+  which is what makes it safe for the button to be public.
 * The token you submit is checked with Telegram (`getMe`) before it is stored, it
   is stored in your own KV/Redis (never in the code or the logs), and it is never
   echoed back — the checklist shows a redacted copy only.

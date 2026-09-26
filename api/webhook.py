@@ -206,6 +206,8 @@ def _status_page(data: dict) -> str:
                      "Redis → Connect to this project → Redeploy.")
         # The one-click way there, right under the warning that says it is needed.
         links.append(("🔌 Connect database ↗", database_link()))
+    # Change the token, the admins, the pair or the database without a redeploy.
+    links.append(("⚙️ Reconfigure setup", "/api/setup"))
     links.append(("↻ Check the webhook again", "/api/webhook?register=1"))
     if "prices" in data:
         price_rows, price_warnings = _price_check_presentation(data["prices"] or {},
