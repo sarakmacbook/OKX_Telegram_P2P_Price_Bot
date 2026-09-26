@@ -252,16 +252,20 @@ docker compose up -d --build
    - `https://www.okx.com/p2p/ads-merchant?publicUserId=…`
    - `https://www.bitget.com/p2p/merchant/…`
 4. Tap **🟢 Auto: ON** — prices are posted whenever they change.
+5. Optional: **📢 Set channel** to post into a channel too, and check **🛡 Anti-scam**
+   so newcomers have to type a random word before they can post.
 
 ### Panel buttons
 
 | Button | What it does |
 |---|---|
-| 📊 **Post prices now** | Posts all merchant prices to the group immediately |
+| 📊 **Post prices now** | Posts all merchant prices to the group **and the channel** immediately |
 | 🟢/🔴 **Auto** | Toggle automatic posting on price change |
 | 📋 **Merchants** | List merchants — tap one to remove |
 | 👥 **Set group** | One click: choose the group that receives updates |
-| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup**, **🖼 button icons & post banner** |
+| 📢 **Set channel** | One click: add the bot to a channel and post the prices there too |
+| 🛡 **Anti-scam** | Mute newcomers until they type a random word — see [🛡 Anti-scam verification](#-anti-scam-verification) |
+| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup**, **📤 auto-forward**, **🖼 button icons & post banner** |
 | 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
 | 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer |
 | 👁 **Preview** | See exactly how the group post will look |
@@ -489,6 +493,112 @@ The bot deletes Telegram’s **“X joined the group”** and **“X left the gr
 
 ---
 
+## 📢 Post to a channel (in addition to the group)
+
+The same price post can go to a **channel** as well as to your group — handy when
+you want a public rate channel and a discussion group.
+
+1. Open your bot → `/start` → **📢 Set channel** and pick your channel. Telegram adds
+   the bot with the rights it needs (post / edit / delete messages).
+   *Prefer the terminal?* Add the bot to the channel as an admin yourself, then send
+   `/setchannel` inside the channel.
+2. That is it: from now on **every price post goes to both** chats.
+
+| | |
+|---|---|
+| Independent | The group and the channel each keep their **own** last message — the previous post is deleted in each chat separately, and the ⏰ auto-delete timer applies to both. |
+| Adding later | Setting a channel does **not** repost to the group; only the new chat gets a post. |
+| Removing | Remove the bot from a chat and it is unset automatically. |
+| Permissions | In a channel the bot must be an **admin** with the right to post and delete messages. |
+
+---
+
+## 📤 Auto-forward what you send the bot
+
+Anything you send to the bot in your **private chat** that the menus did not ask for
+is reposted to your group / channel — text, photo, video, sticker, file, voice note…
+
+1. Send the message (or **forward** one into the bot chat).
+2. The bot copies it into the destination and answers with a **🗑 Undo** button —
+   tap it to delete the copy again (the undo stays available for 48 hours).
+3. Choose where it goes in ⚙️ **Settings → 📤 Auto-forward**, which cycles:
+
+| Setting | Meaning |
+|---|---|
+| `GROUP` (default) | Everything you send is reposted to the group |
+| `CHANNEL` | Reposted to the channel instead |
+| `GROUP + CHANNEL` | Reposted to both |
+| `OFF` | Nothing is reposted — the bot only answers your menus again |
+
+Not forwarded: **commands** (`/start`, `/cancel`, …), answers the bot asked for
+(a banner photo, a button label, an edited header…) and **merchant URLs**, which are
+still added as merchants.
+
+> 📋 An **album** (several photos sent as one message) is reposted photo by photo;
+> everything else keeps its caption and formatting.
+
+---
+
+## 🛡 Anti-scam verification
+
+Scammer bots join P2P groups in waves and post “admin”, “support” and fake-deal
+links within seconds. Turn the check on and **every new member is muted until they
+type a random word**:
+
+1. Someone joins → the bot mutes them (they can still **type**, but links, photos,
+   stickers and polls are blocked) and posts a challenge with a random word.
+2. They type the word → the bot unmutes them, deletes the challenge and welcomes them.
+3. Wrong word → their message is deleted at once and the challenge shows how many
+   attempts are left.
+4. Out of attempts or out of time → the bot applies what you configured and **asks
+   you** what to do with a ✅ **Approve** / 🚫 **Kick** message.
+
+Open the bot → **🛡 Anti-scam**:
+
+| Setting | Values |
+|---|---|
+| Verification | ON ✅ / OFF ❌ |
+| Wrong words allowed | 1 · 2 · **3** · 5 · 10 |
+| Time limit | 1 · 2 · **5** · 10 · 30 minutes |
+| On failure | **Mute until I approve** 🔇 · Kick (they can rejoin) 👢 · Ban permanently 🚫 |
+
+### Your own challenge message
+
+Tap **📝 Edit challenge message** and write anything you like — it must contain
+`{WORD}`, that is where the random word goes:
+
+| Placeholder | Replaced with |
+|---|---|
+| `{WORD}` | The random word the member has to type (required) |
+| `{MENTION}` | A clickable mention of the new member |
+| `{NAME}` | Their name as plain text |
+| `{GROUP}` | The group title |
+| `{MINUTES}` | The time limit |
+| `{LEFT}` / `{ATTEMPTS}` | Attempts left / total attempts |
+| `{ASSET}` `{FIAT}` `{PAIR}` | e.g. `USDT`, `USD`, `USDT/USD` |
+
+Default:
+
+```
+🛡 Anti-scam check
+
+{MENTION} welcome to {GROUP}! Scammer bots are everywhere, so type this word to unlock the group:
+
+{WORD}
+
+⏳ You have {MINUTES} minutes · {LEFT} attempts left.
+```
+
+Send `default` while editing to go back to it. **👁 Preview challenge** shows you the
+exact message with a sample word.
+
+⚠️ The bot must be a **group admin** with **Restrict members** (to mute) and
+**Delete messages** (to remove wrong answers). Without them it logs a warning and
+simply skips the check instead of failing. Admins of the bot and other bots are
+never challenged.
+
+---
+
 ## 🧯 Troubleshooting
 
 ### ``syntax error near unexpected token `newline'`` / `` `<!DOCTYPE html>' ``
@@ -552,8 +662,9 @@ pip install -r requirements.txt pytest
 python -m pytest tests -q
 ```
 
-The suite covers the ad-link templates, the Buy/Sell button targets, clickable prices and the
-state backends — no Telegram calls are made.
+The suite covers the ad-link templates, the Buy/Sell button targets, clickable prices, the
+group/channel destinations, 📤 auto-forward, the 🛡 anti-scam check and the state backends —
+no Telegram calls are made.
 
 ---
 
