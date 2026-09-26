@@ -125,8 +125,9 @@ Telegram pushes every update to `/api/webhook` and a **Vercel Cron** calls
 
 1. **Import** this repository into Vercel ([deploy button](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot) or `npx vercel`).
 2. **Add a KV/Redis store** (Vercel → Storage → *Upstash for Redis* → connect to the project) and the **environment variables** `BOT_TOKEN` + `ADMIN_IDS`.
-3. **Deploy**, then open `https://<your-app>.vercel.app/`. On a first deployment the URL shows a guided setup web UI with a redacted checklist for `BOT_TOKEN`, `ADMIN_IDS`, and the KV pair; after you add anything missing, redeploy and reopen it. Once ready, the health page registers the Telegram webhook by itself.
-4. In Telegram: `/start` → **👥 Set group** → paste a merchant URL → **🟢 Auto: ON**.
+3. **Deploy**, then open `https://<your-app>.vercel.app/`. On a first deployment the URL shows a guided setup web UI: a redacted checklist for `BOT_TOKEN`, `ADMIN_IDS` and the KV pair, **plus a form that stores whatever is missing** — no redeploy needed. Once ready, the health page registers the Telegram webhook by itself.
+4. Prefer a terminal? `python setup_cli.py` asks for the same values and writes them to the same store. Every question can be skipped with **Enter** — and `python setup_cli.py --skip` skips the whole thing and prints the web UI address, so you can finish in the browser later (`--show` prints what is stored, redacted).
+5. In Telegram: `/start` → **👥 Set group** → paste a merchant URL → **🟢 Auto: ON**.
 
 > 🌍 The functions run in `fra1` (EU): the exchange P2P APIs geo-block US IPs
 > (Binance answers HTTP 451 there), so Vercel's default US region serves no
@@ -480,9 +481,12 @@ cp ~/p2p-bot-backup-*/config.json ~/p2p-bot-backup-*/data.json <install-dir>/
 | `exchanges.py` | Binance / Bybit / OKX / Bitget adapters + URL parser |
 | `adlinks.py` | Exact-ad deep-link templates (Binance / Bybit / OKX / Bitget) |
 | `storage.py` | State backends: `data.json` file, optional Upstash/Redis REST, read-only fallback |
-| `serverless.py` | Serverless mode: ASGI glue, first-start setup UI, webhook + cron helpers, one PTB app per warm container |
-| `api/app.py` | Vercel entry point: one ASGI app that routes `/api/webhook`, `/api/tick` and `/` |
+| `runtime_config.py` | The settings the setup page / `setup_cli.py` store (KV key or `runtime_config.json`), validated and applied before `bot.py` starts |
+| `setup_cli.py` | Terminal setup wizard — every question skippable (`--skip`, `--show`, `--clear`, `--vercel-env`) |
+| `serverless.py` | Serverless mode: ASGI glue, first-start setup UI + settings form, webhook + cron helpers, one PTB app per warm container |
+| `api/app.py` | Vercel entry point: one ASGI app that routes `/api/webhook`, `/api/setup`, `/api/tick` and `/` |
 | `api/webhook.py` | Telegram updates (`POST`) + status page (`GET /api/webhook`) |
+| `api/setup.py` | First-start page + the form that stores the required settings (`GET`/`POST /api/setup`) |
 | `api/tick.py` | The cron round that replaces the JobQueue (`/api/tick`) |
 | `vercel.json` | Vercel config: function limits + the `/api/tick` cron schedule |
 | `pyproject.toml` | Vercel build config: the Python entry point + dependencies (mirrors `requirements.txt`) |

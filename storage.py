@@ -36,7 +36,12 @@ REDIS_ENV_PAIRS = (
 )
 
 
-def _redis_config() -> tuple[str, str] | None:
+def redis_config() -> tuple[str, str] | None:
+    """The first complete ``(url, token)`` pair in the environment, if any.
+
+    Public because ``runtime_config.py`` stores the settings the setup page and
+    ``setup_cli.py`` collected in the same Redis, under a key of its own.
+    """
     for url_var, token_var in REDIS_ENV_PAIRS:
         url = (os.getenv(url_var) or "").strip().rstrip("/")
         token = (os.getenv(token_var) or "").strip()
@@ -140,7 +145,8 @@ class NullStore:
         return "none (state lives only in memory)"
 
 
-def _writable(path: Path) -> bool:
+def writable(path: Path) -> bool:
+    """Whether ``path``'s directory can be created and written to."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         probe = path.parent / ".p2p-write-test"
@@ -155,7 +161,7 @@ def build_store(base_dir: str | Path, default_name: str = "data.json"):
     """Pick the best available backend for this environment."""
     key = (os.getenv("P2P_STATE_KEY") or DEFAULT_KEY).strip() or DEFAULT_KEY
 
-    redis = _redis_config()
+    redis = redis_config()
     if redis:
         store = RedisStore(redis[0], redis[1], key=key)
         log.info("State backend: %s", store.describe())
@@ -170,12 +176,12 @@ def build_store(base_dir: str | Path, default_name: str = "data.json"):
     else:
         path = Path(base_dir) / default_name
 
-    if _writable(path):
+    if writable(path):
         store = FileStore(path)
     else:
         fallback = Path(tempfile.gettempdir()) / default_name
         store = FileStore(fallback)
-        if _writable(fallback):
+        if writable(fallback):
             log.warning("State file %s is not writable — falling back to %s "
                         "(ephemeral: add KV_REST_API_URL / UPSTASH_REDIS_REST_URL for "
                         "persistent state)", path, fallback)

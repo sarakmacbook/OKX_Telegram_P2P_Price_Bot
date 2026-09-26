@@ -15,6 +15,9 @@ request is a separate Python invocation, so this module supplies what
 ``GET  /api/tick``      The Vercel Cron entry point that replaces PTB's
                         in-process JobQueue: post prices when they changed,
                         delete stale group messages, keep the webhook alive.
+``GET|POST /api/setup`` The same first-start page, plus the form that stores
+                        what is missing (``runtime_config``) without a redeploy —
+                        the browser twin of ``python setup_cli.py``.
 
 It also keeps one initialized PTB ``Application`` per warm container and re-reads
 the shared state store before every request, because Vercel may run several
@@ -41,10 +44,14 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:                     # api/*.py lives one level down
     sys.path.insert(0, str(ROOT))
 
+import runtime_config                              # noqa: E402  (setup page + setup_cli.py)
+import storage                                     # noqa: E402
+
 log = logging.getLogger("p2p-bot.serverless")
 
 WEBHOOK_PATH = "/api/webhook"
 TICK_PATH = "/api/tick"
+SETUP_PATH = "/api/setup"
 TELEGRAM_SECRET_HEADER = "x-telegram-bot-api-secret-token"
 MARKER_KEY = "webhook"
 
@@ -363,6 +370,18 @@ class Request:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def form(self) -> dict:
+        """A ``application/x-www-form-urlencoded`` body — the setup page's form."""
+        if "application/x-www-form-urlencoded" not in self.header("content-type", "").lower():
+            return {}
+        return {key: values[-1] for key, values
+                in parse_qs(self.body.decode("utf-8", "replace"),
+                            keep_blank_values=True).items()}
+
+    def submitted(self) -> dict:
+        """Everything the client sent as data (form fields win over a JSON body)."""
+        return {**self.json(), **self.form()}
+
 
 class Response:
     """A minimal ASGI response."""
@@ -465,7 +484,7 @@ def _local_config_has_credentials() -> bool:
 
 
 def _setup_check(name: str, label: str, required: bool, ok: bool,
-                 detail: str, variables: tuple[str, ...]) -> dict:
+                 detail: str, variables: tuple[str, ...], source: str = "") -> dict:
     """Create a public, secret-free item for the setup checklist."""
     return {
         "name": name,
@@ -475,24 +494,39 @@ def _setup_check(name: str, label: str, required: bool, ok: bool,
         "status": "ready" if ok else ("required" if required else "recommended"),
         "detail": detail,
         "variables": list(variables),
+        "source": source,
     }
 
 
 def setup_status() -> dict:
     """Inspect first-start requirements without importing the bot.
 
+    Settings that were saved on ``/api/setup`` or by ``python setup_cli.py`` count
+    as present: ``runtime_config.apply`` copies them into the environment before
+    anything reads it, which is also what makes the deployment work without a
+    redeploy.
+
     The returned object deliberately contains no token, admin id, Redis URL, or
     other secret.  It is safe to include in the JSON diagnostics response and in
     the browser UI.  KV is a hard requirement only when the code is actually
     running on Vercel; file state remains the correct default for VPS/Docker.
     """
+    stored = runtime_config.load(ROOT)
+    runtime_config.apply(ROOT)                  # environment variables still win
+    from_store = runtime_config.injected()
+
+    def source(name: str) -> str:
+        """Where a value came from — the dashboard, or the setup page/wizard."""
+        return "setup" if name in stored and name in from_store else "environment"
+
     token = env("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TOKEN")
     admins = env("ADMIN_IDS", "ADMINS")
     on_vercel = _looks_like_vercel()
 
     token_ok = bool(token and token.count(":") == 1 and token.split(":", 1)[0].isdigit())
     if token_ok:
-        token_detail = "BOT_TOKEN is present."
+        token_detail = ("BOT_TOKEN is present (saved through the setup page)."
+                        if source("BOT_TOKEN") == "setup" else "BOT_TOKEN is present.")
     elif token:
         token_detail = "BOT_TOKEN is present but does not look like a Telegram token (it should contain a numeric id followed by a colon)."
     else:
@@ -501,7 +535,8 @@ def setup_status() -> dict:
     admin_parts = [part.strip() for part in admins.split(",") if part.strip()]
     admins_ok = bool(admin_parts) and all(part.isdigit() for part in admin_parts)
     if admins_ok:
-        admins_detail = "ADMIN_IDS is present."
+        admins_detail = ("ADMIN_IDS is present (saved through the setup page)."
+                         if source("ADMIN_IDS") == "setup" else "ADMIN_IDS is present.")
     elif admins:
         admins_detail = "Use one or more numeric Telegram IDs separated by commas."
     else:
@@ -528,9 +563,9 @@ def setup_status() -> dict:
 
     checks = [
         _setup_check("bot_token", "Telegram bot token", True, token_ok,
-                     token_detail, ("BOT_TOKEN",)),
+                     token_detail, ("BOT_TOKEN",), source("BOT_TOKEN")),
         _setup_check("admin_ids", "Telegram admin ID", True, admins_ok,
-                     admins_detail, ("ADMIN_IDS",)),
+                     admins_detail, ("ADMIN_IDS",), source("ADMIN_IDS")),
         _setup_check("state_store", "Persistent state store", on_vercel, redis_ok,
                      redis_detail, ("KV_REST_API_URL", "KV_REST_API_TOKEN")),
     ]
@@ -538,14 +573,16 @@ def setup_status() -> dict:
     if blocking:
         names = ", ".join(check["variables"][0] for check in blocking)
         if any(check["name"] in ("bot_token", "admin_ids") for check in blocking):
-            message = ("bot.py refused to start — set BOT_TOKEN and ADMIN_IDS in the "
-                       "deployment's environment variables (see .env.example) and redeploy. "
+            message = ("bot.py refused to start — BOT_TOKEN and ADMIN_IDS are missing. Add them "
+                       f"in the form on {SETUP_PATH}, or run  python setup_cli.py  in a terminal, "
+                       "or set them in the deployment's environment variables and redeploy. "
                        "A KV/Redis store is required too: without it Vercel forgets the group, "
                        "the merchants and the prices between requests.")
         else:
             message = ("The deployment is missing a persistent KV/Redis store — set "
                        "KV_REST_API_URL and KV_REST_API_TOKEN by connecting Upstash for Redis "
-                       "or Vercel KV, then redeploy.")
+                       f"or Vercel KV (the form on {SETUP_PATH} accepts them as well, but only a "
+                       "redeploy makes them apply to every instance).")
     else:
         names = ""
         message = ""
@@ -563,9 +600,12 @@ def setup_status() -> dict:
     checks.append(_setup_check(
         "cron_secret", "Cron endpoint secret", False, bool(env("CRON_SECRET")),
         "CRON_SECRET protects /api/tick." if env("CRON_SECRET") else
-        "Recommended: set CRON_SECRET so nobody else can trigger a price post.",
+        "Recommended: set CRON_SECRET so nobody else can trigger a price post "
+        "(environment variable only — Vercel's cron sends it from there).",
         ("CRON_SECRET",)))
 
+    configured = bool(token) and bool(admins)
+    locked = bool(env("SETUP_SECRET")) or not blocking
     return {
         "ready": not blocking,
         "serverless": on_vercel,
@@ -573,27 +613,347 @@ def setup_status() -> dict:
         "missing": names,
         "required_missing": [check["name"] for check in blocking],
         "message": message,
+        # what the browser form may do, and what it already holds (redacted)
+        "setup_path": SETUP_PATH,
+        "runtime": runtime_config.summary(ROOT),
+        "setup_secret": bool(env("SETUP_SECRET")),
+        "configured": configured,
+        "locked": locked,
     }
 
 
 SETUP_STEPS = [
-    "1. Vercel dashboard → your project → Settings → Environment Variables: set BOT_TOKEN "
-    "(from @BotFather) and ADMIN_IDS (your Telegram id, from @userinfobot).",
+    f"1. Add BOT_TOKEN (from @BotFather) and ADMIN_IDS (your Telegram id, from @userinfobot) — "
+    f"in the form on {SETUP_PATH}, with  python setup_cli.py  in a terminal, or in the Vercel "
+    "dashboard (Settings → Environment Variables).",
     "2. Storage → add Upstash for Redis (or Vercel KV) → Connect to this project — this sets "
     "KV_REST_API_URL + KV_REST_API_TOKEN so the bot remembers its group and merchants.",
-    "3. Redeploy (Deployments → ⋯ → Redeploy — changed variables only apply to new deploys), "
-    "then reopen this page: it registers the Telegram webhook by itself.",
+    "3. Redeploy (Deployments → ⋯ → Redeploy — changed *environment variables* only apply to new "
+    f"deploys), then reopen this page: it registers the Telegram webhook by itself. Settings saved "
+    f"on {SETUP_PATH} are applied immediately, no redeploy needed.",
 ]
 
 
-def _setup_page(message: str, status: dict) -> str:
+# ── saving the required settings (browser form + terminal wizard) ──────────
+def _bearer(request: "Request") -> str:
+    header = request.header("authorization")
+    return header[7:].strip() if header.lower().startswith("bearer ") else ""
+
+
+def setup_write_allowed(request: "Request", status: dict | None = None) -> tuple[bool, str]:
+    """Who may store settings through ``POST /api/setup``.
+
+    The page is public, so the rule is deliberately blunt:
+
+    * ``SETUP_SECRET`` set → the request must carry it (form field, ``?secret=``
+      or ``Authorization: Bearer``).  This is the recommended way to lock the
+      form *before* the first deployment.
+    * the deployment is **not** ready yet → anybody may finish the setup.  It is
+      unusable until then, and stored values never overrule environment
+      variables, so there is nothing to take over.
+    * the deployment **is** ready → refused.  An anonymous form must not be able
+      to point a running bot at somebody else's admin id.
+    """
+    status = status or setup_status()
+    secret = env("SETUP_SECRET")
+    if secret:
+        given = request.form().get("SETUP_SECRET") or request.query.get("secret") or _bearer(request)
+        if matches(given, secret):
+            return True, ""
+        return False, ("SETUP_SECRET is set for this deployment — send it with the request "
+                       "(form field, ?secret= or 'Authorization: Bearer') to change the settings.")
+    if status["ready"]:
+        return False, ("The deployment is configured already, so the form is locked. Set "
+                       "SETUP_SECRET in the environment to allow changes from the browser, or "
+                       "run  python setup_cli.py  in a terminal — it writes to the same store.")
+    return True, ""
+
+
+def _probe_redis(url: str, token: str) -> tuple[bool, str]:
+    """Whether a KV/Redis REST endpoint answers — before anything is written to it."""
+    import httpx
+
+    try:
+        reply = httpx.post(url, json=["GET", runtime_config.config_key()], timeout=6.0,
+                           headers={"Authorization": f"Bearer {token}",
+                                    "Content-Type": "application/json"})
+        reply.raise_for_status()
+        return True, "the store answered"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _refresh_store() -> None:
+    """A KV pair that arrived after ``bot.py`` was imported must rebuild its store."""
+    if _bot is None:
+        return
+    try:
+        _bot.STORE = storage.build_store(ROOT)
+        log.info("state store rebuilt: %s", _bot.STORE.describe())
+    except Exception as exc:                      # pragma: no cover - defensive
+        log.warning("could not rebuild the state store: %s", exc)
+
+
+def _next_steps(status: dict) -> list[str]:
+    """What to do after a save — the page and the JSON answer say the same thing."""
+    if not status["ready"]:
+        return [f"Still missing: {status['missing']} — add it here, or in a terminal "
+                f"(python setup_cli.py), then reopen {WEBHOOK_PATH}."]
+    steps = [f"Open {WEBHOOK_PATH} — it registers the Telegram webhook and shows the status page."]
+    if not status["runtime"]["persistent"] and status["serverless"]:
+        steps.append("Connect Upstash for Redis (or Vercel KV) and redeploy, or everything — "
+                     "including these settings — is forgotten with this instance.")
+    steps.append("In Telegram: /start → 👥 Set group → paste a merchant URL → 🟢 Auto: ON.")
+    return steps
+
+
+def save_setup_values(values: dict, verify: bool = True) -> dict:
+    """Store what the browser form (or ``setup_cli.py``) submitted.
+
+    Returns a public, secret-free report: what was saved (redacted), where it was
+    saved, what is still missing, and what to do next.  Values that are already
+    set in the deployment environment are **not** overruled — the report says so
+    instead, because that is a surprise worth naming.
+    """
+    cleaned, errors = runtime_config.validate(values or {})
+    notes: list[str] = []
+    warnings: list[str] = []
+
+    kv_url = str((values or {}).get("KV_REST_API_URL") or "").strip().rstrip("/")
+    kv_token = str((values or {}).get("KV_REST_API_TOKEN") or "").strip()
+    if bool(kv_url) != bool(kv_token):
+        errors.append("The KV REST URL and its token belong together — send both, or neither.")
+    elif kv_url and not kv_url.startswith(("http://", "https://")):
+        errors.append("The KV REST URL must start with https:// (Upstash shows the full endpoint).")
+
+    if errors:
+        return _save_report(False, errors=errors, warnings=warnings, notes=notes)
+
+    if verify and cleaned.get("BOT_TOKEN"):
+        ok, detail = runtime_config.verify_bot_token(cleaned["BOT_TOKEN"])
+        if ok is False:
+            return _save_report(False, errors=[detail + " Nothing was saved."],
+                                warnings=warnings, notes=notes)
+        notes.append(detail)
+
+    if kv_url and kv_token:
+        reachable, detail = _probe_redis(kv_url, kv_token)
+        if not reachable:
+            return _save_report(False, errors=[f"The KV/Redis store did not accept the "
+                                               f"connection ({detail}). Nothing was saved."],
+                                warnings=warnings, notes=notes)
+        if not storage.redis_config() and cleaned:
+            # The environment has no KV pair, so this instance cannot read that
+            # store on a cold start.  Keep a copy there anyway: as soon as the two
+            # variables are added and the project redeployed, everything is in place.
+            storage.RedisStore(kv_url, kv_token, key=runtime_config.config_key()).save(cleaned)
+            notes.append("A copy was written to that store as well — add KV_REST_API_URL + "
+                         "KV_REST_API_TOKEN to the deployment environment and redeploy, and the "
+                         "settings survive every cold start.")
+
+    if not cleaned and not kv_url:
+        return _save_report(False, errors=["Nothing to save — the form was empty."],
+                            warnings=warnings, notes=notes)
+
+    store_before = runtime_config.describe(ROOT)
+    saved = runtime_config.save(cleaned, ROOT)
+    if any(saved.get(name) != value for name, value in cleaned.items()):
+        warnings.append(f"The settings could not be written to {store_before['store']} — "
+                        "the deployment may have no writable storage at all.")
+
+    # Environment variables keep priority, so name the ones this save cannot beat.
+    shadowed = [name for name in cleaned
+                if (os.getenv(name) or "").strip()
+                and name not in runtime_config.injected()
+                and (os.getenv(name) or "").strip() != cleaned[name]]
+    for name, value in cleaned.items():
+        os.environ[name] = value                  # this instance uses the new value right away
+    runtime_config.mark(saved)                    # the checklist now says where they came from
+    if kv_url and kv_token:
+        os.environ["KV_REST_API_URL"], os.environ["KV_REST_API_TOKEN"] = kv_url, kv_token
+        notes.append("This instance now talks to that store; other instances and cold starts "
+                     "need KV_REST_API_URL + KV_REST_API_TOKEN in the deployment environment.")
+    runtime_config.invalidate()
+    _refresh_store()
+
+    for name in shadowed:
+        warnings.append(f"{name} is also set in the deployment environment — other instances keep "
+                        f"using that value until you change or remove it there.")
+    if store_before["backend"] != "redis" and _looks_like_vercel():
+        warnings.append("No KV/Redis is connected, so these settings live in this instance's "
+                        "temporary storage only: connect a store (form field above, or "
+                        "Vercel → Storage → Upstash for Redis) and redeploy to keep them.")
+
+    status = setup_status()
+    return _save_report(True, errors=[], warnings=warnings, notes=notes,
+                        saved=[name for name in runtime_config.SUPPORTED if name in cleaned],
+                        status=status)
+
+
+def _save_report(ok: bool, errors: list[str] | None = None, warnings: list[str] | None = None,
+                 notes: list[str] | None = None, saved: list[str] | None = None,
+                 status: dict | None = None) -> dict:
+    """The uniform answer of a save — rendered as HTML or JSON by api/setup.py."""
+    status = status or setup_status()
+    return {
+        "ok": bool(ok),
+        "saved": list(saved or []),
+        "errors": [str(item) for item in errors or []],
+        "warnings": [str(item) for item in warnings or []],
+        "notes": [str(item) for item in notes or []],
+        "store": status["runtime"],
+        "status": status,
+        "next": _next_steps(status),
+    }
+
+
+def _banner(banner: tuple[str, str] | None) -> str:
+    """The result of the last form submission (``(kind, text)``)."""
+    if not banner:
+        return ""
+    kind, text = banner
+    css = {"ok": "ok", "error": "error"}.get(kind, "info")
+    icon = {"ok": "✅", "error": "⚠️"}.get(kind, "ℹ️")
+    return (f'<div class="banner {css}" role="status"><span aria-hidden="true">{icon}</span>'
+            f'<p>{html.escape(str(text))}</p></div>')
+
+
+def _field(name: str, label: str, hint: str, *, secret: bool = False, value: str = "",
+           placeholder: str = "", stored: str = "") -> str:
+    """One labelled input of the setup form (``name`` is the environment variable)."""
+    kind = "password" if secret else "text"
+    note = f'<small>{html.escape(hint)}</small>'
+    if stored:
+        note = (f'<small>{html.escape(hint)} <b>stored:</b> '
+                f'<code>{html.escape(stored)}</code></small>')
+    return (f'<label class="field"><span>{html.escape(label)} '
+            f'<code>{html.escape(name)}</code></span>'
+            f'<input type="{kind}" name="{html.escape(name)}" value="{html.escape(value)}" '
+            f'placeholder="{html.escape(placeholder)}" autocomplete="off" '
+            f'spellcheck="false">{note}</label>')
+
+
+def _setup_form(status: dict, values: dict | None = None) -> str:
+    """The browser half of the setup: add the required settings, no redeploy.
+
+    The values go to ``POST /api/setup``, which stores them where ``storage.py``
+    can keep them (the connected KV/Redis, or ``runtime_config.json``) and applies
+    them to this instance immediately.  ``SETUP_SECRET`` locks the form; without
+    it the form closes as soon as the deployment is ready.
+    """
+    values = values or {}
+    runtime = status.get("runtime") or {}
+    masked = runtime.get("masked") or {}
+    checks = {check["name"]: check for check in status.get("checks") or []}
+    needs_secret = bool(status.get("setup_secret")) or bool(status["ready"])
+    wants_kv = not checks.get("state_store", {}).get("ok", False)
+
+    if status["ready"] and not status.get("setup_secret"):
+        return (
+            '<section class="panel" aria-labelledby="form-title">'
+            '<div class="panel-heading"><div><h2 id="form-title">Add the required settings</h2>'
+            '<p class="subtle">Locked — this deployment is configured.</p></div></div>'
+            f'<p class="locked">🔒 Everything is in place, so the form is closed: an open page '
+            f'must not be able to change a running bot. To change a setting from the browser, '
+            f'set <code>SETUP_SECRET</code> in the deployment environment and reopen '
+            f'<code>{html.escape(SETUP_PATH)}</code>. In a terminal, '
+            f'<code>python setup_cli.py</code> writes to the same store.</p></section>')
+
+    fields = [
+        _field("BOT_TOKEN", "Telegram bot token", "From @BotFather → /newbot.",
+               secret=True, placeholder="123456:ABCdef…", stored=masked.get("BOT_TOKEN", "")),
+        _field("ADMIN_IDS", "Your Telegram ID(s)",
+               "Numeric, comma-separated — @userinfobot tells you yours.",
+               value=values.get("ADMIN_IDS", ""), placeholder="123456789",
+               stored=masked.get("ADMIN_IDS", "")),
+    ]
+    if wants_kv:
+        fields += [
+            _field("KV_REST_API_URL", "KV / Redis REST URL",
+                   "Upstash for Redis → REST API → endpoint. Optional, but without it "
+                   "nothing survives a restart on Vercel.",
+                   value=values.get("KV_REST_API_URL", ""),
+                   placeholder="https://eu1-….upstash.io"),
+            _field("KV_REST_API_TOKEN", "KV / Redis REST token",
+                   "The token that belongs to the URL above.", secret=True,
+                   placeholder="A…"),
+        ]
+    advanced = "".join([
+        _field("ASSET", "Asset", "What is traded.", value=values.get("ASSET", ""),
+               placeholder="USDT"),
+        _field("FIAT", "Fiat", "The currency prices are shown in.",
+               value=values.get("FIAT", ""), placeholder="USD"),
+        _field("INTERVAL", "Check every N seconds", "Polling installs only; Vercel uses its cron.",
+               value=values.get("INTERVAL", ""), placeholder="60"),
+    ])
+    if needs_secret:
+        fields.append(_field("SETUP_SECRET", "Setup secret",
+                             "This deployment protects the form with SETUP_SECRET.",
+                             secret=True, placeholder="the value of SETUP_SECRET"))
+
+    store = runtime.get("store") or "the connected store"
+    persistent = runtime.get("persistent")
+    where = ("Stored in the connected KV/Redis — it survives restarts and redeploys."
+             if persistent else
+             "Stored next to the bot's state file. On Vercel that is temporary storage: "
+             "connect a KV/Redis store to keep it across restarts.")
+    return f"""
+    <section class="panel" aria-labelledby="form-title">
+      <div class="panel-heading">
+        <div><h2 id="form-title">Add the required settings here</h2>
+          <p class="subtle">Or do it in a terminal — both write to the same place.</p></div>
+        <span class="badge {'ready' if persistent else 'optional'}">{'persistent store' if persistent else 'temporary store'}</span>
+      </div>
+      <form method="post" action="{html.escape(SETUP_PATH)}" class="form">
+        {''.join(fields)}
+        <details class="advanced"><summary>Optional: asset, fiat and interval</summary>{advanced}</details>
+        <p class="where">💾 {html.escape(str(store))} — {html.escape(where)} Values are never
+          shown again; only a redacted copy appears in the checklist.</p>
+        <div class="actions"><button class="button" type="submit">💾 Save settings</button>
+          <a class="button secondary" href="{html.escape(WEBHOOK_PATH)}">Open the status page</a></div>
+      </form>
+    </section>"""
+
+
+def _terminal_panel(status: dict) -> str:
+    """The terminal half of the setup — including the way to skip it."""
+    runtime = status.get("runtime") or {}
+    missing = ", ".join(status.get("required_missing") or []) or "nothing required"
+    return f"""
+    <section class="panel" aria-labelledby="terminal-title">
+      <div class="panel-heading"><div><h2 id="terminal-title">…or do it in a terminal</h2>
+        <p class="subtle">Same store, same values — pick whichever you prefer.</p></div></div>
+      <pre class="shell"><code># asks for what is missing; press Enter on a question to skip it
+python setup_cli.py
+
+# nothing to enter now — the wizard prints this page's address and exits
+python setup_cli.py --skip
+
+# one line, no prompts
+python setup_cli.py --token 123456:ABC-your-token --admins 123456789 --yes
+
+# what is stored right now (redacted), and where
+python setup_cli.py --show</code></pre>
+      <p class="subtle">Currently missing: <code>{html.escape(missing)}</code> · stored in
+        <code>{html.escape(str(runtime.get('store') or '—'))}</code>. The wizard verifies the token
+        with Telegram before saving, and <code>--vercel-env</code> additionally writes the values
+        into the deployment's environment variables with the Vercel CLI.</p>
+    </section>"""
+
+
+def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = None,
+                form_values: dict | None = None) -> str:
     """Render a polished, actionable first-start web UI.
 
-    This intentionally does not contain a form for secrets. Vercel environment
-    variables are immutable from inside a function, and accepting a bot token in
-    a public page would be unsafe. The UI links to the place where the owner can
-    set them, gives a redacted readiness checklist, and can be refreshed after a
-    redeploy.
+    Three ways to finish, all on one page: the form (``POST /api/setup`` →
+    ``runtime_config``, applied without a redeploy), a terminal
+    (``python setup_cli.py``, which can be skipped with ``--skip`` and writes to
+    the very same store), and the deployment's environment variables — the only
+    option for ``CRON_SECRET``, which Vercel's cron reads from there.
+
+    Secrets are accepted over HTTPS and stored in the deployment's own state
+    store; they are never echoed back, and the form closes (or requires
+    ``SETUP_SECRET``) as soon as the deployment is ready.
     """
     checks = status.get("checks") or []
     cards = []
@@ -606,15 +966,19 @@ def _setup_page(message: str, status: dict) -> str:
             icon, badge, css = "·", "Recommended", "optional"
         variables = " · ".join(f"<code>{html.escape(str(item))}</code>"
                               for item in check.get("variables") or [])
+        source = (f' · <i>from the setup page</i>' if check.get("source") == "setup" else "")
         cards.append(
             f'<article class="check {css}">'
             f'<span class="check-icon" aria-hidden="true">{icon}</span>'
             f'<div class="check-copy"><h3>{html.escape(str(check.get("label", "")))}</h3>'
             f'<p>{html.escape(str(check.get("detail", "")))}</p>'
-            f'<small>{variables}</small></div>'
+            f'<small>{variables}{source}</small></div>'
             f'<span class="badge">{badge}</span></article>')
 
     checks_markup = "\n".join(cards)
+    banner_markup = _banner(banner)
+    form_markup = _setup_form(status, form_values)
+    terminal_markup = _terminal_panel(status)
     missing = status.get("missing") or "the required environment variables"
     deployment_note = (
         "This deployment is running on Vercel, so persistent storage is required."
@@ -689,6 +1053,25 @@ def _setup_page(message: str, status: dict) -> str:
     .button {{ display: inline-flex; align-items: center; justify-content: center; min-height: 42px; padding: 9px 15px; border-radius: 11px; color: white; background: linear-gradient(135deg, #6676f5, #8a67df); font-weight: 800; text-decoration: none; box-shadow: 0 8px 22px #6676f533; }}
     .button.secondary {{ color: #d4daff; background: #1b2642; border: 1px solid #3b4770; box-shadow: none; }}
     .foot {{ color: #7f8ba8; margin: 24px 2px 0; font-size: 13px; }}
+    .banner {{ display: grid; grid-template-columns: 30px 1fr; gap: 12px; align-items: start; padding: 16px 18px; margin-bottom: 18px; border-radius: 15px; border: 1px solid var(--line); background: var(--panel-2); }}
+    .banner p {{ margin: 0; }}
+    .banner.ok {{ border-color: #35d39955; background: #35d39914; }}
+    .banner.error {{ border-color: #ff8c8c55; background: #ff8c8c14; }}
+    .form {{ display: grid; gap: 13px; }}
+    .field {{ display: grid; gap: 6px; }}
+    .field span {{ font-weight: 700; }}
+    .field input {{ min-height: 44px; padding: 10px 13px; border-radius: 11px; border: 1px solid var(--line); background: #0b1122; color: var(--text); font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .field input:focus {{ outline: 2px solid var(--accent); outline-offset: 1px; }}
+    .field small {{ color: var(--muted); }}
+    .advanced summary {{ cursor: pointer; color: #c7ceff; font-weight: 700; }}
+    .advanced[open] {{ display: grid; gap: 13px; padding-top: 13px; }}
+    .where {{ color: var(--muted); margin: 2px 0 0; font-size: 13px; }}
+    .locked {{ color: var(--muted); margin: 0; }}
+    .shell-code, pre.shell {{ overflow-x: auto; margin: 0; padding: 16px; border-radius: 15px; border: 1px solid var(--line); background: #080c17; }}
+    pre.shell code {{ color: #d9e2ff; background: none; border: 0; padding: 0; font: 12.5px/1.75 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }}
+    .badge.ready {{ color: #73f0bf; background: #35d3991a; }}
+    .badge.optional {{ color: #ffd27c; background: #f7b9551a; }}
+    .check i {{ color: #a9b4d6; font-style: normal; }}
     @media (max-width: 650px) {{ .shell {{ width: min(100% - 22px, 960px); padding-top: 24px; }} .hero {{ grid-template-columns: 1fr; gap: 13px; }} .panel-heading {{ display: block; }} .badge {{ margin-left: auto; }} .why {{ grid-template-columns: 1fr; }} .check {{ flex-wrap: wrap; }} .check-copy {{ min-width: calc(100% - 42px); }} .check .badge {{ margin-left: 40px; }} }}
     @media (prefers-reduced-motion: no-preference) {{ .hero {{ animation: rise .35s ease-out both; }} @keyframes rise {{ from {{ opacity: 0; transform: translateY(6px); }} to {{ opacity: 1; transform: none; }} }} }}
   </style>
@@ -696,26 +1079,29 @@ def _setup_page(message: str, status: dict) -> str:
 <body>
   <main class="shell">
     <header class="brand"><div class="logo" aria-hidden="true">🤖</div><div><p class="eyebrow">First deployment</p><h1>P2P Price Bot</h1></div></header>
+    {banner_markup}
     <section class="hero" aria-labelledby="setup-title">
       <div class="hero-symbol" aria-hidden="true">⚙️</div>
       <div><h2 id="setup-title">Setup needed</h2>
         <p><strong>What happened:</strong> the bot is not running yet. {html.escape(message)}</p>
-        <p style="margin-top:10px"><strong>Fix:</strong> set the variables shown below in the deployment, then redeploy.</p>
+        <p style="margin-top:10px"><strong>Fix:</strong> add what is missing below — in the browser form, in a terminal (<code>python setup_cli.py</code>), or in the deployment's environment variables.</p>
         <p style="margin-top:10px">{html.escape(deployment_note)} Missing: <code>{html.escape(str(missing))}</code></p>
       </div>
     </section>
+    {form_markup}
 
     <section class="panel" aria-labelledby="check-title">
       <div class="panel-heading"><div><h2 id="check-title">Environment checklist</h2><p class="subtle">Values are checked without displaying any secrets.</p></div></div>
       <div class="checks">{checks_markup}</div>
     </section>
+    {terminal_markup}
 
     <section class="panel" aria-labelledby="steps-title">
       <h2 id="steps-title">Finish setup in Vercel</h2>
       <div class="steps">
-        <article class="step"><span class="number">1</span><div><h3>Set the Telegram credentials</h3><p>In <b>Vercel dashboard → your project → Settings → Environment Variables</b>, set <code>BOT_TOKEN</code> from <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> and <code>ADMIN_IDS</code> from <a href="https://t.me/userinfobot" target="_blank" rel="noopener">@userinfobot</a>.</p><a href="https://vercel.com/dashboard" target="_blank" rel="noopener">Open Vercel dashboard ↗</a></div></article>
+        <article class="step"><span class="number">1</span><div><h3>Set the Telegram credentials</h3><p>Use the form above, or <b>Vercel dashboard → your project → Settings → Environment Variables</b>: <code>BOT_TOKEN</code> from <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> and <code>ADMIN_IDS</code> from <a href="https://t.me/userinfobot" target="_blank" rel="noopener">@userinfobot</a>.</p><a href="https://vercel.com/dashboard" target="_blank" rel="noopener">Open Vercel dashboard ↗</a></div></article>
         <article class="step"><span class="number">2</span><div><h3>Connect persistent storage</h3><p>Open <b>Storage</b> → add <b>Upstash for Redis</b> (or Vercel KV) → <b>Connect to this project</b>. This sets <code>KV_REST_API_URL</code> + <code>KV_REST_API_TOKEN</code> so the bot remembers its group, merchants, and prices between requests.</p></div></article>
-        <article class="step"><span class="number">3</span><div><h3>Redeploy, then return here</h3><p>Go to <b>Deployments → ⋯ → Redeploy</b>. Changed variables only apply to new deployments. Reopen this page after the redeploy; it registers the Telegram webhook automatically.</p></div></article>
+        <article class="step"><span class="number">3</span><div><h3>Redeploy only if you changed variables</h3><p>Settings saved on this page apply at once. Environment variables need <b>Deployments → ⋯ → Redeploy</b>, because they only apply to new deployments. Then reopen this page: it registers the Telegram webhook automatically.</p></div></article>
       </div>
     </section>
 
@@ -725,8 +1111,8 @@ def _setup_page(message: str, status: dict) -> str:
       <article><h3>🔗 Automatic webhook</h3><p>Once the variables are present, opening this page checks the token and registers <code>/api/webhook</code>.</p></article>
     </section>
 
-    <div class="actions"><a class="button" href="/api/webhook">↻ Check setup again</a><a class="button secondary" href="/api/webhook?register=0">View diagnostics</a><a class="button secondary" href="https://github.com/sarakmacbook/OKX_Telegram_P2P_Price_Bot/blob/main/VERCEL.md" target="_blank" rel="noopener">Deployment guide ↗</a></div>
-    <p class="foot">Secrets are read from the deployment environment only; this page never asks you to paste a bot token into the browser.</p>
+    <div class="actions"><a class="button" href="/api/setup">↻ Check setup again</a><a class="button secondary" href="/api/webhook?register=0">View diagnostics</a><a class="button secondary" href="https://github.com/sarakmacbook/OKX_Telegram_P2P_Price_Bot/blob/main/VERCEL.md" target="_blank" rel="noopener">Deployment guide ↗</a></div>
+    <p class="foot">The form posts over HTTPS to <code>/api/setup</code> and stores what you enter in this deployment's own state store — the same place <code>python setup_cli.py</code> writes to. Values are never shown again (the checklist shows a redacted copy), environment variables always win over stored ones, and the form asks for <code>SETUP_SECRET</code> — or closes — once the deployment is configured.</p>
   </main>
 </body>
 </html>"""
@@ -739,7 +1125,8 @@ def config_error_response(request: Request, message: str,
     if request.wants_html:
         return Response.html(_setup_page(message, status), status=500)
     return Response.json({"ok": False, "error": message, "hint": CONFIG_HINT,
-                          "status": "setup_required", "setup": status}, 500)
+                          "status": "setup_required", "setup": status,
+                          "steps": SETUP_STEPS, "setup_page": SETUP_PATH}, 500)
 
 
 def internal_error_response(request: Request, message: str) -> Response:
