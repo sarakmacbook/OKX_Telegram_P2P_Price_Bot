@@ -170,6 +170,7 @@ in its answer) — anyone who knows the URL could then trigger a post, so set it
 | `ADMIN_IDS` | ✅ | your Telegram ID(s), comma-separated |
 | `KV_REST_API_URL` + `KV_REST_API_TOKEN` | ✅ | state store (set automatically by the Upstash/KV integration) |
 | `UPSTASH_REDIS_REST_URL` + `…_TOKEN`, `REDIS_REST_URL` + `…_TOKEN` | alt. | other Redis-REST providers, same idea |
+| `P2P_STATE_BACKEND` | – (`auto`) | choose `auto`, `redis`, or `file`; use `redis` on Vercel. `file` is intentionally not accepted as persistent Vercel state even when a KV pair exists (`P2P_STORAGE_BACKEND` is an alias) |
 | `P2P_STATE_KEY` | – | key the state lives under (default `p2p-price-bot:state`) |
 | `SETUP_SECRET` | – (recommended) | locks the `/api/setup` form: every submission must carry it (form field, `?secret=`, or `Authorization: Bearer`). Without it the form is open while the deployment is unconfigured and closes once it is ready |
 | `P2P_CONFIG_KEY` | – | key the settings saved by the form / `setup_cli.py` live under (default `p2p-price-bot:config`) |
@@ -183,7 +184,9 @@ in its answer) — anyone who knows the URL could then trigger a post, so set it
 
 Changing a variable only affects the **next** deployment — after editing
 **Settings → Environment Variables**, redeploy (`npx vercel --prod` or *Redeploy*
-in the dashboard).
+in the dashboard). The setup page can select the backend for the current instance,
+but add `P2P_STATE_BACKEND=redis` to the deployment environment as well when you
+want that choice to survive every cold start.
 
 ## 7. Endpoints
 

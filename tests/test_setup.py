@@ -503,3 +503,21 @@ def test_the_web_ui_address_is_taken_from_the_platform(monkeypatch):
     assert setup_cli.web_ui_url() == "https://p2p-bot.vercel.app/api/setup"
     monkeypatch.delenv("VERCEL_PROJECT_PRODUCTION_URL")
     assert "<your-app>" in setup_cli.web_ui_url()
+
+
+def test_state_database_choice_is_validated_and_stored():
+    cleaned, errors = runtime_config.validate({"P2P_STATE_BACKEND": "KV"})
+    assert errors == []
+    assert cleaned == {"P2P_STATE_BACKEND": "redis"}
+
+    cleaned, errors = runtime_config.validate({"P2P_STATE_BACKEND": "postgres"})
+    assert cleaned == {}
+    assert errors == ["P2P_STATE_BACKEND must be auto, file, or redis."]
+
+
+def test_setup_page_exposes_state_database_selector(unconfigured):
+    status, _, payload = call()
+    text = payload.decode()
+    assert 'name="P2P_STATE_BACKEND"' in text
+    assert 'value="auto" selected' in text
+    assert 'value="file"' in text and 'value="redis"' in text

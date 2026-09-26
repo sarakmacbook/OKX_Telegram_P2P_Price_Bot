@@ -84,3 +84,36 @@ def test_readonly_dir_falls_back_to_tmp(tmp_path, monkeypatch):
     if store.backend == "file" and store.path.parent == readonly:
         pytest.skip("directory is writable in this environment")
     assert store.backend in ("file", "none")
+
+
+def test_file_selection_overrides_available_redis(tmp_path, monkeypatch):
+    """An explicit local database choice must beat auto-detected KV credentials."""
+    monkeypatch.setenv("P2P_STATE_BACKEND", "file")
+    monkeypatch.setenv("P2P_STATE_FILE", str(tmp_path / "data.json"))
+    monkeypatch.setenv("KV_REST_API_URL", "https://kv.example")
+    monkeypatch.setenv("KV_REST_API_TOKEN", "tok")
+
+    store = storage.build_store(tmp_path)
+
+    assert store.backend == "file"
+    assert store.path == tmp_path / "data.json"
+
+
+def test_explicit_redis_never_silently_falls_back_to_file(tmp_path, monkeypatch):
+    """A typo/outage in a selected shared database must not split bot state."""
+    monkeypatch.setenv("P2P_STATE_BACKEND", "redis")
+    monkeypatch.delenv("KV_REST_API_URL", raising=False)
+    monkeypatch.delenv("KV_REST_API_TOKEN", raising=False)
+
+    store = storage.build_store(tmp_path)
+
+    assert store.backend == "none"
+    assert "Redis was selected" in store.describe()
+
+
+def test_backend_aliases_are_normalized(monkeypatch):
+    monkeypatch.setenv("P2P_STORAGE_BACKEND", "kv")
+    monkeypatch.delenv("P2P_STATE_BACKEND", raising=False)
+    assert storage.state_backend() == "redis"
+    assert storage.normalize_backend("json") == "file"
+    assert storage.normalize_backend("postgres") is None

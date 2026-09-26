@@ -19,9 +19,11 @@ Where the values live follows ``storage.py``:
            so ``python setup_cli.py`` and the setup page never touch groups,
            merchants or prices).  This is the persistent option on Vercel.
 ``file``   ``runtime_config.json`` next to ``data.json`` (override with
-           ``P2P_RUNTIME_CONFIG_FILE``).  Persistent on a VPS/Docker/local
-           install; **ephemeral** on Vercel, whose filesystem is thrown away with
-           the instance — the setup page says so when it saves there.
+           ``P2P_RUNTIME_CONFIG_FILE``).  It is also used when
+           ``P2P_STATE_BACKEND=file`` explicitly selects the JSON state database.
+           Persistent on a VPS/Docker/local install; **ephemeral** on Vercel,
+           whose filesystem is thrown away with the instance — the setup page
+           says so when it saves there.
 
 Nothing here ever raises: an unreadable store logs a warning and yields ``{}``,
 because a deployment that cannot read its settings must still be able to render
@@ -46,7 +48,9 @@ log = logging.getLogger("p2p-bot.config")
 #: stays environment-only on purpose — ``CRON_SECRET`` for example is sent by
 #: Vercel's own cron from the *deployment* environment, so a stored copy would
 #: lock the cron out instead of protecting it.
-SUPPORTED = ("BOT_TOKEN", "ADMIN_IDS", "ASSET", "FIAT", "INTERVAL")
+# P2P_STATE_BACKEND is stored too so the browser selector and terminal wizard
+# can make the same choice as a deployment environment variable.
+SUPPORTED = ("BOT_TOKEN", "ADMIN_IDS", "ASSET", "FIAT", "INTERVAL", "P2P_STATE_BACKEND")
 REQUIRED = ("BOT_TOKEN", "ADMIN_IDS")
 SECRETS = ("BOT_TOKEN",)
 
@@ -88,9 +92,17 @@ def config_path(base_dir: str | Path | None = None) -> Path:
 
 
 def config_store(base_dir: str | Path | None = None):
-    """The store object for these settings (Redis key, or the JSON file)."""
+    """The store object for these settings, following the selected state backend.
+
+    The configuration file remains a deliberate bootstrap fallback when Redis
+    was selected but its credentials are absent: it lets the setup UI explain
+    what is missing instead of making a first-run deployment impossible to
+    configure.  The bot state itself never makes that fallback for an explicit
+    Redis selection (see ``storage.build_store``).
+    """
+    choice = storage.state_backend()
     redis = storage.redis_config()
-    if redis:
+    if choice != "file" and redis:
         return storage.RedisStore(redis[0], redis[1], key=config_key())
     return storage.FileStore(config_path(base_dir))
 
@@ -144,6 +156,7 @@ def describe(base_dir: str | Path | None = None) -> dict:
     """Public, secret-free description of where the settings would be kept."""
     store = config_store(base_dir)
     return {"store": store.describe(), "backend": store.backend,
+            "state_backend": storage.state_backend(),
             "persistent": store.backend == "redis"}
 
 
@@ -263,6 +276,14 @@ def validate(values: dict) -> tuple[dict[str, str], list[str]]:
             cleaned[name] = raw
         else:
             errors.append(f"{name} should be a short code such as USDT or USD.")
+
+    backend = str(values.get("P2P_STATE_BACKEND") or "").strip()
+    if backend:
+        normal = storage.normalize_backend(backend)
+        if normal is None:
+            errors.append("P2P_STATE_BACKEND must be auto, file, or redis.")
+        else:
+            cleaned["P2P_STATE_BACKEND"] = normal
 
     interval = str(values.get("INTERVAL") or "").strip()
     if interval:
