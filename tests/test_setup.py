@@ -521,3 +521,15 @@ def test_setup_page_exposes_state_database_selector(unconfigured):
     assert 'name="P2P_STATE_BACKEND"' in text
     assert 'value="auto" selected' in text
     assert 'value="file"' in text and 'value="redis"' in text
+
+
+def test_setup_page_explains_how_to_insert_the_database(unconfigured):
+    """The page walks through getting the KV pair, not just naming the fields."""
+    _, _, payload = call()
+    text = payload.decode()
+    assert "How to insert the database" in text
+    assert "console.upstash.com" in text                    # where the database is created
+    assert "REST API" in text                               # where the pair is shown
+    assert "KV_REST_API_URL" in text and "KV_REST_API_TOKEN" in text
+    assert "Storage" in text and "Connect to this project" in text   # the Vercel path too
+    assert "Save settings" in text                          # and it ends at the form's button

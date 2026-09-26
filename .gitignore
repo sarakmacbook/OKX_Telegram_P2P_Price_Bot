@@ -33,3 +33,4 @@ Thumbs.db
 
 # tests
 .pytest_cache/
+preview/
