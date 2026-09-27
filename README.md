@@ -179,7 +179,7 @@ Telegram pushes every update to `/api/webhook` and a **Vercel Cron** calls
 
 1. **Import** this repository into Vercel ([deploy button](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot) or `npx vercel`).
 2. **Add a KV/Redis store** (Vercel → Storage → *Upstash for Redis* → connect to the project) and the **environment variables** `BOT_TOKEN` + `ADMIN_IDS`.
-3. **Deploy**, then open `https://<your-app>.vercel.app/`. On a first deployment the URL shows a guided setup web UI: a redacted checklist for `BOT_TOKEN`, `ADMIN_IDS` and the KV pair, **plus a form that stores whatever is missing** — no redeploy needed. Once ready, the health page registers the Telegram webhook by itself.
+3. **Deploy**, then open `https://<your-app>.vercel.app/`. On a first deployment the URL shows a guided setup web UI: a redacted checklist for `BOT_TOKEN`, `ADMIN_IDS` and the KV pair, **plus a form that stores whatever is missing** — no redeploy needed. Once ready, the health page registers the Telegram webhook by itself. The page **detects** the database first (in the environment, then on Vercel itself) and **skips** the database step when one is already there — it says where it found it, and, if only the credentials are missing, that a redeploy delivers them instead of a second store.
 4. Prefer a terminal? `python setup_cli.py` asks for the same values and writes them to the same store. Every question can be skipped with **Enter** — and `python setup_cli.py --skip` skips the whole thing and prints the web UI address, so you can finish in the browser later (`--show` prints what is stored, redacted).
 5. In Telegram: `/start` → **👥 Set group** → paste a merchant URL → **🟢 Auto: ON**.
 

@@ -40,7 +40,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:                     # api/*.py lives one level down
@@ -526,6 +526,242 @@ def _looks_like_vercel() -> bool:
                     "VERCEL_PROJECT_PRODUCTION_URL"))
 
 
+# ── is a database already there? (Vercel storage + this deployment's env) ──
+# Two places know about the database.  The deployment environment holds a
+# complete KV/Redis REST pair — the only thing the bot can actually use.  Vercel
+# itself knows one step *earlier* which store is connected to the project, even
+# while its credentials have not reached this deployment yet (the classic
+# "connected, but not redeployed" case).  Asking both is what lets the setup
+# page say "your database is already there — skip this step" instead of walking
+# the owner through creating a second one.
+#
+# The Vercel look-up is read-only, best-effort and never fatal: no token means
+# no call (and a note saying so), a refused token or an offline host is reported
+# rather than raised, and the answer is cached because a page view is not a
+# reason to spend two API round-trips.
+VERCEL_API = "https://api.vercel.com"
+DB_DETECT_TIMEOUT = 3.0
+DB_DETECT_TTL = 300.0            # a database that is there stays there for a while …
+DB_DETECT_FAIL_TTL = 45.0        # … a "none found" answer is re-checked sooner
+_REDIS_STORE_TYPES = ("redis", "kv", "valkey", "upstash", "redis-rest")
+_KV_URL_VARS = tuple(url_name for url_name, _token_name, _label in _REDIS_ENV_PAIRS)
+_db_detect: dict[str, Any] = {"at": 0.0, "key": "", "result": {}}
+
+
+def reset_database_detection() -> None:
+    """Forget the cached answer (tests, and right after a settings save)."""
+    _db_detect.update(at=0.0, key="")
+
+
+def _vercel_api_token() -> str:
+    """A credential for the Vercel REST API, when this deployment offers one.
+
+    ``VERCEL_TOKEN`` is an access token the owner adds to the environment
+    themselves; ``VERCEL_OIDC_TOKEN`` is the short-lived token Vercel issues to
+    the function.  Both are tried on a best-effort basis — "not authorized" is
+    *reported*, never raised.
+    """
+    return env("VERCEL_TOKEN", "P2P_VERCEL_TOKEN", "VERCEL_OIDC_TOKEN")
+
+
+def _vercel_project() -> tuple[str, str]:
+    """``(project id or name, team id)`` for the Vercel API — ``("", "")`` if unknown."""
+    return (env("VERCEL_PROJECT_ID", "P2P_VERCEL_PROJECT_ID", "VERCEL_PROJECT_NAME"),
+            env("VERCEL_TEAM_ID", "P2P_VERCEL_TEAM_ID"))
+
+
+def _vercel_get(path: str, token: str, params: dict | None = None) -> tuple[int, Any]:
+    """One read-only Vercel API call: ``(status, payload)`` — it never raises.
+
+    ``status`` is ``0`` when the call itself failed (offline, timeout, DNS); the
+    payload then holds the reason instead of a parsed body.
+    """
+    import httpx
+
+    query = {name: value for name, value in (params or {}).items() if value}
+    try:
+        reply = httpx.get(f"{VERCEL_API}{path}", params=query, timeout=DB_DETECT_TIMEOUT,
+                          headers={"Authorization": f"Bearer {token}",
+                                   "Accept": "application/json"})
+    except Exception as exc:                              # offline, timeout, DNS …
+        return 0, f"{type(exc).__name__}: {exc}"
+    try:
+        return int(reply.status_code), reply.json()
+    except Exception:                                     # pragma: no cover - non-JSON reply
+        return int(reply.status_code), {}
+
+
+def _vercel_error(status: int, body: Any, what: str) -> str:
+    """Why a Vercel look-up did not answer — public, so it holds no secret."""
+    if status == 0:
+        return f"the Vercel API could not be reached ({body})"
+    if status in (401, 403):
+        return f"the Vercel API refused the token (HTTP {status}) — {what} was not checked"
+    detail = ""
+    if isinstance(body, dict):
+        error = body.get("error") or {}
+        detail = str(error.get("message") or error.get("code") or "")
+    return f"the Vercel API answered HTTP {status} for {what}" + (f" ({detail})" if detail else "")
+
+
+def _store_is_redis(store: dict) -> bool:
+    """Whether a store Vercel lists is the KV/Redis database this bot needs.
+
+    A Blob or Postgres store is *not* an answer here: the bot keeps one small
+    JSON document in a Redis-compatible REST store.
+    """
+    kind = str(store.get("type") or store.get("kind") or "").strip().lower()
+    if kind:
+        return kind in _REDIS_STORE_TYPES or "redis" in kind
+    # Older payloads carry no type — fall back to the name and the product.
+    haystack = " ".join(str(store.get(key) or "")
+                        for key in ("name", "productId", "integrationProductId", "slug")).lower()
+    return any(word in haystack for word in ("redis", "kv", "upstash"))
+
+
+def _vercel_connected_stores(token: str, project: str,
+                             team: str) -> tuple[list[str], str, int]:
+    """Redis/KV stores Vercel reports for this project: ``(names, error, status)``."""
+    status, body = _vercel_get("/v1/storage/stores", token,
+                               {"projectId": project, "teamId": team})
+    if status != 200:
+        return [], _vercel_error(status, body, "the project's stores"), status
+    stores = (body or {}).get("stores") if isinstance(body, dict) else None
+    if not isinstance(stores, list):
+        return [], "", status
+    names: list[str] = []
+    for store in stores:
+        if isinstance(store, dict) and _store_is_redis(store):
+            name = str(store.get("name") or store.get("id") or "").strip()
+            if name and name not in names:
+                names.append(name)
+    return names, "", status
+
+
+def _vercel_env_database(token: str, project: str, team: str) -> tuple[str, str]:
+    """``(variable, store)`` when the *project* itself holds a KV/Redis variable.
+
+    The second look-up, used when the store list does not answer: the project's
+    environment variables are listed without their values, so a connected
+    database shows up here even when the store list is not readable.
+    """
+    status, body = _vercel_get(f"/v1/projects/{quote(project, safe='')}/env", token,
+                               {"teamId": team})
+    if status != 200:
+        return "", ""
+    items = (body or {}).get("envs") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        return "", ""
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("key") or "").strip().upper()
+        hint = item.get("contentHint") or {}
+        redis_hint = str(hint.get("type") or "").strip().lower() in (
+            "redis-url", "redis_rest_url", "redis")
+        if name in _KV_URL_VARS or redis_hint:
+            return (name or "KV_REST_API_URL"), str(hint.get("storeId") or "").strip()
+    return "", ""
+
+
+def detect_database(force: bool = False) -> dict:
+    """Find the database the bot should use — and say where it was detected.
+
+    The answer is public (no URL, token or secret ever leaves this function):
+
+    ``found``    a database exists: a complete KV/Redis REST pair in this
+                 deployment's environment, *or* a store Vercel reports as
+                 connected to the project.
+    ``wired``    this deployment can use it — the credentials are in *its* own
+                 environment.  ``found`` without ``wired`` is one redeploy away,
+                 not a missing database.
+    ``source``   ``environment`` | ``vercel-storage`` | ``vercel-env`` | ``""``
+    ``where``    one human sentence naming *where* it was detected.
+    ``skipped``  the setup page skips the database step when ``found`` is set.
+
+    Off Vercel nothing is queried over the network: a polling install is allowed
+    to keep its state in ``data.json``, so "no credentials" is a valid answer
+    there rather than a problem to investigate.
+    """
+    pair = storage.redis_config()
+    provider = next((label for url_name, token_name, label in _REDIS_ENV_PAIRS
+                     if env(url_name) and env(token_name)), "")
+    token = _vercel_api_token()
+    project, team = _vercel_project()
+    on_vercel = _looks_like_vercel()
+    key = "|".join([str(pair or ""), provider, str(on_vercel), project, team,
+                    "token" if token else ""])
+    now = time.monotonic()
+    if not force and _db_detect["key"] == key:
+        age = now - float(_db_detect["at"])
+        if age < (DB_DETECT_TTL if _db_detect["result"].get("found") else DB_DETECT_FAIL_TTL):
+            return dict(_db_detect["result"])
+
+    result: dict[str, Any] = {"found": False, "wired": False, "usable": False, "source": "",
+                              "provider": provider, "where": "", "detail": "", "stores": [],
+                              "checked": False, "error": "", "skipped": False}
+
+    if pair:
+        # The environment is the answer that counts: it is what the bot reads,
+        # so there is nothing to look up on Vercel and no reason to spend a call.
+        result.update(found=True, wired=True, usable=True, source="environment",
+                      provider=provider or "KV / Redis",
+                      where=(f"a complete {provider or 'KV / Redis'} pair in this "
+                             "deployment's environment"),
+                      detail=("A KV/Redis database is already connected through "
+                              f"{provider or 'KV / Redis'} — the bot uses it automatically."))
+    elif not on_vercel:
+        result.update(detail="No KV/Redis credentials in the environment; this host keeps "
+                             "its state in data.json.")
+    elif not project or not token:
+        result.update(detail="No KV/Redis credentials in this deployment's environment.",
+                      error=("Vercel could not be asked which database is connected: "
+                             "VERCEL_PROJECT_ID (or VERCEL_PROJECT_NAME) is not exposed to "
+                             "this deployment"
+                             if not project else
+                             "no Vercel credential in the environment — add VERCEL_TOKEN "
+                             "(or P2P_VERCEL_TOKEN) and the page detects the project's "
+                             "connected store by itself"))
+    else:
+        names, error, status = _vercel_connected_stores(token, project, team)
+        variable, store = ("", "")
+        if not names and status not in (401, 403):
+            # The store list is not always readable (a token without the storage
+            # scope, an older project).  The project's own variables are the
+            # second answer, and they are listed without their values.
+            variable, store = _vercel_env_database(token, project, team)
+        result["checked"] = True
+        if names:
+            result.update(found=True, error="", source="vercel-storage", stores=list(names),
+                          where=f"Vercel → Storage: {', '.join(names)} (connected to this "
+                                "project)")
+        elif variable:
+            result.update(found=True, error="", source="vercel-env",
+                          where=f"{variable} on the Vercel project"
+                                + (f" (store {store})" if store else ""))
+        else:
+            result.update(
+                error=error,
+                detail=("No KV/Redis credentials in this deployment's environment. "
+                        + ("" if error else
+                           "Vercel reports no KV/Redis store connected to this project, so "
+                           "connect one below.")))
+
+    if result["found"]:
+        result["skipped"] = True
+        if not result["wired"]:
+            # Connected on Vercel, invisible to this deployment: a redeploy is
+            # the fix, and creating a second database is the wrong one.
+            result["detail"] = (
+                f"Detected on {result['where']} — this deployment has no "
+                "KV_REST_API_URL + KV_REST_API_TOKEN yet, so it cannot use it yet. "
+                "No new database is needed: press Connect to this project again in "
+                "Vercel → Storage (that is what writes the two variables) and redeploy.")
+
+    _db_detect.update(at=now, key=key, result=result)
+    return dict(result)
+
+
 def _local_config_has_credentials() -> bool:
     """Preserve the config.json path for local/VM deployments.
 
@@ -545,12 +781,15 @@ def _local_config_has_credentials() -> bool:
 
 def _setup_check(name: str, label: str, required: bool, ok: bool,
                  detail: str, variables: tuple[str, ...], source: str = "",
-                 broken: bool = False) -> dict:
+                 broken: bool = False, detected: str = "") -> dict:
     """Create a public, secret-free item for the setup checklist.
 
     ``broken`` marks something that *is* configured but does not work — a
     database whose credentials are present yet unreachable.  It is shown with
     its own badge so it is not mistaken for "never set up".
+
+    ``detected`` names *where* a value was found (the deployment environment, or
+    Vercel itself), so the checklist can say why a step is being skipped.
     """
     return {
         "name": name,
@@ -563,6 +802,7 @@ def _setup_check(name: str, label: str, required: bool, ok: bool,
         "detail": detail,
         "variables": list(variables),
         "source": source,
+        "detected": detected,
     }
 
 
@@ -629,6 +869,17 @@ def setup_status() -> dict:
         redis_ok = False
         redis_detail = "Connect Upstash for Redis or Vercel KV so group, merchant, and price state survives requests."
 
+    # Is a database already there?  In this deployment's environment, or — one
+    # step earlier — on Vercel, which knows which store is connected to the
+    # project even before its credentials reach the environment.
+    database = detect_database()
+    detected_elsewhere = bool(database["found"] and not database["wired"])
+    if detected_elsewhere:
+        # "Connected but not redeployed" is not "nothing is connected": it is
+        # one redeploy away, and the page must not talk the owner into a second
+        # database they do not need.
+        redis_detail = database["detail"]
+
     # A complete KV pair is not enough when the owner explicitly chose the file
     # database: honour that choice rather than silently switching databases.
     # Vercel has no durable file system, so a file choice there is a blocking
@@ -649,7 +900,7 @@ def setup_status() -> dict:
                         "Choose redis and connect a KV/Redis REST store.")
     else:
         state_ok = redis_ok if on_vercel else True
-        state_detail = (redis_detail if redis_ok else
+        state_detail = (redis_detail if (redis_ok or detected_elsewhere) else
                         ("Auto mode will use data.json on this host. Set "
                          "P2P_STATE_BACKEND=redis and connect a KV store to share state."))
 
@@ -671,7 +922,8 @@ def setup_status() -> dict:
                      admins_detail, ("ADMIN_IDS",), source("ADMIN_IDS")),
         _setup_check("state_store", "State database", on_vercel, state_ok,
                      state_detail, ("KV_REST_API_URL", "KV_REST_API_TOKEN", "P2P_STATE_BACKEND"),
-                     broken=state_broken),
+                     broken=state_broken,
+                     detected=database["where"] if database["found"] else ""),
     ]
     blocking = [check for check in checks if check["required"] and not check["ok"]]
     if blocking:
@@ -689,6 +941,14 @@ def setup_status() -> dict:
                        "and the prices are being forgotten. Enter working KV / Redis "
                        f"credentials in the form on {SETUP_PATH} (no redeploy needed), or "
                        "connect a new database.")
+        elif detected_elsewhere:
+            names = "KV_REST_API_URL, KV_REST_API_TOKEN"
+            message = (f"This project already has a database — detected on {database['where']} "
+                       "— but this deployment cannot see its credentials yet. No new database "
+                       "is needed: press Connect to this project again in Vercel → Storage "
+                       "(that is what writes KV_REST_API_URL + KV_REST_API_TOKEN into the "
+                       "environment) and redeploy. Opening this page again then registers the "
+                       "Telegram webhook by itself.")
         else:
             message = ("The deployment is missing a persistent KV/Redis store — set "
                        "KV_REST_API_URL and KV_REST_API_TOKEN by connecting Upstash for Redis "
@@ -732,6 +992,8 @@ def setup_status() -> dict:
         "message": message,
         "store_health": health or ({"ok": None, "detail": "not checked",
                                     "backend": selected_backend} if on_vercel else None),
+        # where the database was detected — and whether that step is skipped
+        "database": database,
         # what the browser form may do, and what it already holds (redacted)
         "setup_path": SETUP_PATH,
         "runtime": runtime_config.summary(ROOT),
@@ -752,6 +1014,27 @@ SETUP_STEPS = [
     f"deploys), then reopen this page: it registers the Telegram webhook by itself. Settings saved "
     f"on {SETUP_PATH} are applied immediately, no redeploy needed.",
 ]
+
+
+def setup_steps(status: dict | None = None) -> list[str]:
+    """The three steps above — with step 2 skipped when a database is already there.
+
+    A database Vercel already reports as connected must not be connected a second
+    time, so that step is replaced by a line naming where it was detected (and,
+    when its credentials have not reached this deployment yet, by the redeploy
+    that delivers them).
+    """
+    steps = list(SETUP_STEPS)
+    database = (status or {}).get("database") or {}
+    if database.get("found"):
+        where = str(database.get("where") or "the connected store")
+        steps[1] = (f"2. Database detected — skipped: {where}. "
+                    + ("Nothing to do — the bot uses it."
+                       if database.get("wired") else
+                       "No new database is needed: press Connect to this project again in "
+                       "Vercel → Storage and redeploy, so KV_REST_API_URL + "
+                       "KV_REST_API_TOKEN reach this deployment."))
+    return steps
 
 
 # ── saving the required settings (browser form + terminal wizard) ──────────
@@ -1113,6 +1396,7 @@ def save_setup_values(values: dict, verify: bool = True) -> dict:
                      "need KV_REST_API_URL + KV_REST_API_TOKEN in the deployment environment.")
     runtime_config.invalidate()
     reset_store_probe()
+    reset_database_detection()          # a store that was just connected is detected at once
     # bot.py read its configuration at import time, so a warm container would
     # keep serving the *old* token, admins and pair until the next cold start.
     # Reload it (and drop the cached PTB application) when something changed
@@ -1218,10 +1502,13 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
     needs_secret = bool(status.get("setup_secret")) or bool(status["ready"])
     selected_backend = str(values.get("P2P_STATE_BACKEND") or
                            runtime.get("state_backend") or storage.state_backend())
-    # A pair that is present but dead is not "connected" — the form has to ask
-    # for the credentials again, otherwise the page that reports the outage is
-    # the one page that cannot fix it.
-    redis_connected = bool(storage.redis_config()) and "state_store" not in (
+    # A database that was detected — here, or on Vercel — is not something to
+    # connect again, so the form skips the credential inputs and says where it
+    # was found instead.  A detected database that stopped answering is *not*
+    # skipped: the form has to ask for the credentials again, otherwise the page
+    # that reports the outage is the one page that cannot fix it.
+    detection = status.get("database") or {}
+    database_found = bool(detection.get("found")) and "state_store" not in (
         status.get("broken") or [])
 
     # A configured deployment is editable in the browser when the owner has
@@ -1275,27 +1562,46 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
     fields.append(_select_field(
         "P2P_STATE_BACKEND", "State database",
         ("A Redis / KV database is already connected; no credentials need to be entered."
-         if redis_connected else
+         if database_found and detection.get("wired") else
+         "A Redis / KV database was detected, but its credentials are not in this "
+         "deployment yet — a redeploy brings them; no second database is needed."
+         if database_found else
          "Auto chooses Redis when credentials exist, otherwise data.json. File always uses data.json; Redis requires the URL and token below."),
         (("auto", "Auto — Redis when configured, otherwise file"),
          ("file", "File — always use local data.json"),
          ("redis", "Redis / KV — shared persistent database")),
         selected_backend))
-    if redis_connected:
-        fields.append(
-            '<p class="where">✓ A KV / Redis database is already connected through the '
-            'deployment environment. The bot will use it automatically; no database '
-            'URL or token input is needed.</p>')
+
+    kv_fields = [
+        _field("KV_REST_API_URL", "KV / Redis REST URL",
+               "Required when Redis is selected. Upstash for Redis → REST API → endpoint.",
+               value=values.get("KV_REST_API_URL", ""),
+               placeholder="https://eu1-….upstash.io"),
+        _field("KV_REST_API_TOKEN", "KV / Redis REST token",
+               "The token that belongs to the URL above.", secret=True,
+               placeholder="A…"),
+    ]
+    if database_found:
+        where = html.escape(str(detection.get("where") or "the deployment environment"))
+        if detection.get("wired"):
+            fields.append(
+                f'<p class="where">✓ A KV / Redis database is already connected — detected from '
+                f'<b>{where}</b>. The bot uses it automatically; no database URL or token input '
+                f'is needed.</p>')
+        else:
+            # Detected on Vercel, invisible here: the fix is the redeploy that
+            # brings the credentials over, not a second database.  Typing them
+            # in by hand stays possible, but it is no longer the headline.
+            fields.append(
+                f'<p class="where">✓ A KV / Redis database was detected — <b>{where}</b> — but '
+                f'this deployment has no <code>KV_REST_API_URL</code> + '
+                f'<code>KV_REST_API_TOKEN</code> yet, so the bot cannot use it until they '
+                f'arrive. The fields below are optional: the fix is the redeploy described '
+                f'above.</p>')
+            fields.append('<details class="advanced"><summary>Enter KV / Redis credentials '
+                          'by hand</summary>' + "".join(kv_fields) + "</details>")
     else:
-        fields += [
-            _field("KV_REST_API_URL", "KV / Redis REST URL",
-                   "Required when Redis is selected. Upstash for Redis → REST API → endpoint.",
-                   value=values.get("KV_REST_API_URL", ""),
-                   placeholder="https://eu1-….upstash.io"),
-            _field("KV_REST_API_TOKEN", "KV / Redis REST token",
-                   "The token that belongs to the URL above.", secret=True,
-                   placeholder="A…"),
-        ]
+        fields += kv_fields
     advanced = "".join([
         _field("ASSET", "Asset", "What is traded.", value=values.get("ASSET", ""),
                placeholder="USDT"),
@@ -1330,6 +1636,49 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
         <div class="actions"><button class="button" type="submit">💾 Save settings</button>
           <a class="button secondary" href="{html.escape(WEBHOOK_PATH)}">Open the status page</a></div>
       </form>
+    </section>"""
+
+
+def _database_detected_panel(detection: dict) -> str:
+    """The "skip this step" panel: the database is there — and here is where it was found.
+
+    Rendered instead of the "How to insert the database" guide whenever a
+    database was detected, whether in this deployment's environment or on Vercel
+    itself.  The point is the second half of the answer — *where* it was
+    detected — so an owner who is told to skip a step can see it was skipped
+    for a reason, and can see which redeploy delivers the credentials when the
+    store is connected but not yet wired into this deployment.
+    """
+    where = html.escape(str(detection.get("where") or "this deployment"))
+    detail = html.escape(str(detection.get("detail") or ""))
+    stores = detection.get("stores") or []
+    wired = bool(detection.get("wired"))
+    badge = "skipped" if wired else "one redeploy away"
+    css = "ready" if wired else "optional"
+    subtitle = ("Nothing to insert — the bot is using it."
+                if wired else
+                "No new database is needed — this project already has one.")
+    follow_up = (""
+                 if not wired else
+                 '<p class="where">Nothing to insert and nothing to redeploy: the bot picked '
+                 "it up from the environment.</p>")
+    store_list = (""
+                  if not stores else
+                  f'<p class="where">Store{"s" if len(stores) > 1 else ""}: <code>'
+                  + html.escape(", ".join(str(item) for item in stores)) + "</code></p>")
+    storage_link = (f'<a class="button secondary" href="'
+                    f'{html.escape(storage.database_link(), quote=True)}" target="_blank" '
+                    f'rel="noopener">Open Vercel Storage ↗</a>')
+    return f"""
+    <section class="panel" aria-labelledby="db-detected-title">
+      <div class="panel-heading"><div><h2 id="db-detected-title">💾 Database detected — step skipped</h2>
+        <p class="subtle">{subtitle}</p></div>
+        <span class="badge {css}">{badge}</span></div>
+      <p><b>Detected from</b> <code>{where}</code>.</p>
+      {store_list}
+      <p class="where">{detail}</p>
+      {follow_up}
+      <div class="actions">{storage_link}</div>
     </section>"""
 
 
@@ -1444,28 +1793,60 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
         variables = " · ".join(f"<code>{html.escape(str(item))}</code>"
                               for item in check.get("variables") or [])
         source = (f' · <i>from the setup page</i>' if check.get("source") == "setup" else "")
+        detected = (f' · <i>detected: {html.escape(str(check.get("detected", "")))}</i>'
+                    if check.get("detected") else "")
         cards.append(
             f'<article class="check {css}">'
             f'<span class="check-icon" aria-hidden="true">{icon}</span>'
             f'<div class="check-copy"><h3>{html.escape(str(check.get("label", "")))}</h3>'
             f'<p>{html.escape(str(check.get("detail", "")))}</p>'
-            f'<small>{variables}{source}</small></div>'
+            f'<small>{variables}{source}{detected}</small></div>'
             f'<span class="badge">{badge}</span></article>')
 
     checks_markup = "\n".join(cards)
     banner_markup = _banner(banner)
     form_markup = _setup_form(status, form_values)
     # A database that is configured but unreachable needs the guide just as
-    # much as a missing one — this is the page that has to repair it.
-    database_connected = storage.database_connected() and "state_store" not in (
-        status.get("broken") or [])
-    db_guide_markup = "" if database_connected else _db_guide_panel()
+    # much as a missing one — this is the page that has to repair it.  One that
+    # was *detected* (here, or on Vercel) skips it: the page says where it came
+    # from instead of asking for a second one.
+    detection = status.get("database") or {}
+    database_connected = bool(detection.get("found") or storage.database_connected()) and (
+        "state_store" not in (status.get("broken") or []))
+    db_guide_markup = (_database_detected_panel(detection) if database_connected
+                       else _db_guide_panel())
     connect_link_markup = (
         "" if database_connected else
         f'<a class="button" href="{html.escape(storage.database_link(), quote=True)}" '
         f'target="_blank" rel="noopener">🔌 Connect database ↗</a>')
     terminal_markup = _terminal_panel(status)
     missing = status.get("missing") or "the required environment variables"
+    # Step 2 of the walkthrough is "connect a database" — skipped, and marked as
+    # skipped, when one was detected (see _database_detected_panel).  A detected
+    # database that stopped answering is *not* skipped: that step is the one
+    # that repairs it.
+    if database_connected:
+        where = html.escape(str(detection.get("where") or "the connected store"))
+        if detection.get("wired"):
+            storage_step_markup = (
+                f'<article class="step"><span class="number">✓</span><div>'
+                f'<h3>Database detected — skipped</h3><p>Found in {where}. The bot uses it '
+                f'automatically, so there is nothing to connect.</p></div></article>')
+        else:
+            storage_step_markup = (
+                f'<article class="step"><span class="number">✓</span><div>'
+                f'<h3>Database detected — redeploy to apply it</h3><p>Found in {where}, but this '
+                f'deployment has no <code>KV_REST_API_URL</code> + '
+                f'<code>KV_REST_API_TOKEN</code> yet. No new database is needed: press '
+                f'<b>Connect to this project</b> again in Vercel → Storage and redeploy — '
+                f'environment variables only reach new deployments.</p></div></article>')
+    else:
+        storage_step_markup = (
+            '<article class="step"><span class="number">2</span><div><h3>Connect persistent '
+            'storage</h3><p>Open <b>Storage</b> → add <b>Upstash for Redis</b> (or Vercel KV) → '
+            '<b>Connect to this project</b>. This sets <code>KV_REST_API_URL</code> + '
+            '<code>KV_REST_API_TOKEN</code> so the bot remembers its group, merchants, and '
+            'prices between requests.</p></div></article>')
     deployment_note = (
         "This deployment is running on Vercel, so persistent storage is required."
         if status.get("serverless") else
@@ -1590,7 +1971,7 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
       <h2 id="steps-title">Finish setup in Vercel</h2>
       <div class="steps">
         <article class="step"><span class="number">1</span><div><h3>Set the Telegram credentials</h3><p>Use the form above, or <b>Vercel dashboard → your project → Settings → Environment Variables</b>: <code>BOT_TOKEN</code> from <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> and <code>ADMIN_IDS</code> from <a href="https://t.me/userinfobot" target="_blank" rel="noopener">@userinfobot</a>.</p><a href="https://vercel.com/dashboard" target="_blank" rel="noopener">Open Vercel dashboard ↗</a></div></article>
-        <article class="step"><span class="number">2</span><div><h3>Connect persistent storage</h3><p>Open <b>Storage</b> → add <b>Upstash for Redis</b> (or Vercel KV) → <b>Connect to this project</b>. This sets <code>KV_REST_API_URL</code> + <code>KV_REST_API_TOKEN</code> so the bot remembers its group, merchants, and prices between requests.</p></div></article>
+        {storage_step_markup}
         <article class="step"><span class="number">3</span><div><h3>Redeploy only if you changed variables</h3><p>Settings saved on this page apply at once. Environment variables need <b>Deployments → ⋯ → Redeploy</b>, because they only apply to new deployments. Then reopen this page: it registers the Telegram webhook automatically.</p></div></article>
       </div>
     </section>
@@ -1616,7 +1997,7 @@ def config_error_response(request: Request, message: str,
         return Response.html(_setup_page(message, status), status=500)
     return Response.json({"ok": False, "error": message, "hint": CONFIG_HINT,
                           "status": "setup_required", "setup": status,
-                          "steps": SETUP_STEPS, "setup_page": SETUP_PATH,
+                          "steps": setup_steps(status), "setup_page": SETUP_PATH,
                           "connect_database": storage.database_link()}, 500)
 
 

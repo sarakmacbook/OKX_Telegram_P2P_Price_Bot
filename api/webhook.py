@@ -87,6 +87,9 @@ async def _status(request: Request) -> Response:
         "webhook_secret": webhook_secret_note(),
         # Scripts get the same "connect a database" link the page renders.
         "connect_database": database_link(),
+        # Where the database was detected — the environment, or Vercel's own
+        # store list — and whether this deployment can already use it.
+        "database": setup.get("database") or {},
     }
     if check_webhook:
         try:
@@ -187,6 +190,8 @@ def _status_page(data: dict) -> str:
         ("Webhook secret", data.get("webhook_secret")),
         ("State store", f"{state.get('backend')} — "
                         f"{'persistent ✅' if state.get('persistent') else 'NOT persistent ❌'}"),
+        ("Database detected", (data.get("database") or {}).get("where")
+                              or "none found — connect a KV/Redis store"),
         ("Group", data.get("group_title") or data.get("group") or "not set"),
         ("Merchants", data.get("merchants")),
         ("Auto posting", data.get("auto_posting")),
