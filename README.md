@@ -538,6 +538,12 @@ you want a public rate channel and a discussion group.
 New messages in the chats **you select** are forwarded into your group. This is
 separate from the private-chat **📤 Auto-forward** option below.
 
+**Every relayed message carries the channel name.** `📢 Channel` (or `👥 Group`)
+is written above the text or the media caption, so the group always sees where a
+post came from. Content Telegram refuses to copy that way (stickers, polls,
+protected posts) goes out as a real forward instead — Telegram's own
+"Forwarded from" header then shows the name.
+
 | | |
 |---|---|
 | Switch | **⚙️ Settings → ↪️ Channel → group** (ON by default) |

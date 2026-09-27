@@ -717,6 +717,22 @@ def forward_source_summary() -> str:
         return title if len(title) <= 22 else title[:21] + "…"
     return f"{len(sources)} chats"
 
+def relay_header(chat) -> str:
+    """``📢 <b>News</b>`` — the source chat's name, written atop every relay.
+
+    "Forward from channel to group with channel name": the name is part of the
+    message the group receives, not only Telegram's own "Forwarded from" note.
+    The live title from the update wins; the stored ones are the fallback.
+    """
+    record = forward_sources().get(str(getattr(chat, "id", ""))) or {}
+    title = str(getattr(chat, "title", "") or "").strip()
+    if not title:
+        title = str(record.get("title") or "").strip()
+    if not title and getattr(chat, "id", None) == state.get("channel"):
+        title = str(state.get("channel_title") or "").strip()
+    icon = FORWARD_SOURCE_ICONS.get(getattr(chat, "type", "") or record.get("type", ""), "💬")
+    return f"{icon} <b>{html_escape(title or str(getattr(chat, 'id', '')))}</b>"
+
 def cycle_forward_target() -> str:
     """📤 Auto-forward button: group → channel → both → off."""
     order = ("group", "channel", "both", "off")
@@ -1220,6 +1236,7 @@ def forward_sources_text() -> str:
         f"<i>/setprivacy</i> → <b>Disable</b>, otherwise it cannot read the messages.\n"
         f"• Tap a chat below to stop forwarding from it "
         f"({len(records)}/{MAX_FORWARD_SOURCES} selected).\n"
+        f"• Every relayed message carries the source chat's name at the top.\n"
         f"• The price post itself is never echoed back, and the destination group cannot be a "
         f"source."
     )
@@ -1808,7 +1825,8 @@ def settings_text():
         f"   GROUP → CHANNEL → GROUP + CHANNEL → OFF.\n\n"
         f"↪️ Channel → group: <b>{'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}</b>\n"
         f"   Forwarding from: <b>{html_escape(forward_source_summary())}</b>\n"
-        f"   New posts in the selected channel(s)/group(s) are forwarded into the group.\n"
+        f"   New posts in the selected channel(s)/group(s) are forwarded into the group,\n"
+        f"   each topped with the source chat's name (📢 <b>Channel</b>).\n"
         f"   With nothing selected, the configured channel is relayed.\n"
         f"   The bot must be an admin in the source chat and able to send messages in the\n"
         f"   group. Tap ↪️ Forward from to pick the chats.\n\n"
@@ -2358,6 +2376,12 @@ def is_own_post(msg, chat, bot=None) -> bool:
 async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
     """↪️ Forward one message from a selected channel/group into the group.
 
+    Every relayed message is sent *with the channel name*: ``📢 <b>News</b>``
+    is written above the text (or media caption), so the group always sees
+    where the post came from.  Content Telegram refuses to copy with a new
+    caption (stickers, polls, protected posts…) goes out as a real forward
+    instead — Telegram's own "Forwarded from" header then shows the name.
+
     Returns True when the message reached the group.  The source chats are the
     ones the admin picked (⚙️ Settings → ↪️ Forward from); with none picked the
     configured channel is relayed, as before this option existed.
@@ -2369,24 +2393,39 @@ async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
     if is_own_post(msg, chat, getattr(c, "bot", None)):
         return False
     group = state["group"]
+    header = relay_header(chat)
+    text = getattr(msg, "text", None)
     try:
-        await c.bot.forward_message(chat_id=group, from_chat_id=chat.id, message_id=msg.message_id)
-        log.info("Forwarded %s message %s from %s to group %s",
+        if text is not None:
+            body = getattr(msg, "text_html", None) or html_escape(text)
+            await c.bot.send_message(chat_id=group, text=f"{header}\n\n{body}",
+                                     parse_mode="HTML")
+        else:
+            caption = getattr(msg, "caption", None) or ""
+            body = getattr(msg, "caption_html", None) or html_escape(caption)
+            await c.bot.copy_message(chat_id=group, from_chat_id=chat.id,
+                                     message_id=msg.message_id,
+                                     caption=f"{header}\n\n{body}" if body else header,
+                                     parse_mode="HTML")
+        log.info("Relayed %s message %s from %s to group %s with its name",
                  chat.type, msg.message_id, chat.id, group)
         return True
-    except Exception as forward_error:
-        # Copy is a useful fallback for content Telegram permits copying but not
-        # forwarding. Protected channel content is rejected by both API methods.
+    except Exception as copy_error:
+        # A real forward is the fallback for content Telegram will not copy
+        # with a caption (stickers, polls, protected posts…) — its "Forwarded
+        # from" header shows the source name too, so the name is there either
+        # way.  Protected channel content is rejected by both API methods.
         try:
-            await c.bot.copy_message(chat_id=group, from_chat_id=chat.id,
-                                     message_id=msg.message_id)
-            log.info("Copied %s message %s from %s to group %s after forward failed",
+            await c.bot.forward_message(chat_id=group, from_chat_id=chat.id,
+                                        message_id=msg.message_id)
+            log.info("Forwarded %s message %s from %s to group %s",
                      chat.type, msg.message_id, chat.id, group)
             return True
-        except Exception as copy_error:
-            log.warning("Could not forward %s message %s from %s to group %s: "
-                        "forward failed (%s); copy failed (%s)",
-                        chat.type, msg.message_id, chat.id, group, forward_error, copy_error)
+        except Exception as forward_error:
+            log.warning("Could not relay %s message %s from %s to group %s: "
+                        "copy failed (%s); forward failed (%s)",
+                        chat.type, msg.message_id, chat.id, group,
+                        copy_error, forward_error)
             return False
 
 async def on_channel_post(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
