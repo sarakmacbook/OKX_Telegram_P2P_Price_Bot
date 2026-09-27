@@ -350,3 +350,39 @@ def test_a_message_in_a_selected_channel_is_relayed(router):
     assert calls["send_message"].await_args.kwargs["chat_id"] == GROUP
     assert calls["send_message"].await_args.kwargs["text"] == \
         "📢 <b>Source</b>\n\nchannel announcement"
+
+# ── ↪️ bidirectional group / channel relay ──────────────────────────────────
+def test_group_to_channel_opt_in_and_no_echo(router):
+    router.bot.state["channel"] = CHANNEL
+    calls = router.send(_group("group news"))
+    calls["send_message"].assert_not_awaited()
+
+    router.bot.state["settings"]["group_to_channel"] = True
+    calls = router.send(_group("group news"))
+    assert calls["send_message"].await_args.kwargs["chat_id"] == CHANNEL
+    assert calls["send_message"].await_args.kwargs["text"] == "👥 <b>Rates</b>\n\ngroup news"
+    assert router.bot.is_own_message(CHANNEL, 42)
+    calls = router.send(_chat_message(CHANNEL, "channel", "echo", message_id=42))
+    calls["send_message"].assert_not_awaited()
+
+
+def test_group_to_channel_skips_commands_and_captcha(router):
+    router.bot.state["channel"] = CHANNEL
+    router.bot.state["settings"]["group_to_channel"] = True
+    calls = router.send(_chat_message(GROUP, "supergroup", "/preview", command=True))
+    assert not any(call.kwargs.get("chat_id") == CHANNEL
+                   for call in calls["send_message"].await_args_list)
+    router.send(_join())
+    word = router.bot.pending_captcha(GROUP, NEWCOMER)["word"]
+    calls = router.send(_group(word))
+    assert router.bot.pending_captcha(GROUP, NEWCOMER) is None
+    assert not any(call.kwargs.get("chat_id") == CHANNEL
+                   for call in calls["send_message"].await_args_list)
+
+
+def test_group_to_channel_media(router):
+    router.bot.state["channel"] = CHANNEL
+    router.bot.state["settings"]["group_to_channel"] = True
+    calls = router.send(_chat_message(GROUP, "supergroup", message_id=50, photo=[
+        {"file_id": "AgACAgIAAxkBAAICbig", "file_unique_id": "u3", "width": 1, "height": 1}]))
+    assert calls["copy_message"].await_args.kwargs["chat_id"] == CHANNEL

@@ -315,6 +315,7 @@ DEFAULT_SETTINGS = {
     # ── ↪️ reposting new messages from the selected chats into the group ──
     # which chats: state["forward_sources"] (empty = the configured channel)
     "channel_to_group": True,
+    "group_to_channel": False,     # opt in: ordinary group posts to price channel
     # ── anti-scam verification for new members ──
     "captcha_enabled": True,       # mute new members until they type a random word
     "captcha_message": "",         # empty = DEFAULT_CAPTCHA_MESSAGE
@@ -624,6 +625,16 @@ def channel_to_group_enabled() -> bool:
 def toggle_channel_to_group() -> bool:
     enabled = not channel_to_group_enabled()
     state["settings"]["channel_to_group"] = enabled
+    save()
+    return enabled
+
+def group_to_channel_enabled() -> bool:
+    value = get_settings().get("group_to_channel")
+    return value if isinstance(value, bool) else DEFAULT_SETTINGS["group_to_channel"]
+
+def toggle_group_to_channel() -> bool:
+    enabled = not group_to_channel_enabled()
+    state["settings"]["group_to_channel"] = enabled
     save()
     return enabled
 
@@ -996,6 +1007,8 @@ def load():
         data["settings"]["forward_target"] = DEFAULT_SETTINGS["forward_target"]
     if not isinstance(data["settings"].get("channel_to_group"), bool):
         data["settings"]["channel_to_group"] = DEFAULT_SETTINGS["channel_to_group"]
+    if not isinstance(data["settings"].get("group_to_channel"), bool):
+        data["settings"]["group_to_channel"] = DEFAULT_SETTINGS["group_to_channel"]
     data["settings"]["captcha_message"] = clean_captcha_message(data["settings"].get("captcha_message"))
     data["settings"]["captcha_attempts"] = _clean_choice(
         data["settings"].get("captcha_attempts"),
@@ -1354,6 +1367,8 @@ def settings_kb():
          B("🖼 Post banner", callback_data="banner_menu")],
         [set_channel_button(), B("🛡 Anti-scam", callback_data="antiscam")],
         [B(f"📤 Auto-forward: {forward_label()}", callback_data="toggle_forward_target")],
+        [B(f"↪️ Group → channel: {'ON ✅' if group_to_channel_enabled() else 'OFF ❌'}",
+           callback_data="toggle_group_to_channel")],
         [B(f"↪️ Channel → group: {'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}",
            callback_data="toggle_channel_to_group"),
          B(f"↪️ Forward from: {forward_source_summary()}", callback_data="forward_sources")],
@@ -2432,7 +2447,7 @@ def is_own_post(msg, chat, bot=None) -> bool:
     sender, bot_id = getattr(msg, "from_user", None), getattr(bot, "id", None)
     return bool(sender is not None and bot_id is not None and sender.id == bot_id)
 
-async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
+async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE, destination=None) -> bool:
     """↪️ Forward one message from a selected channel/group into the group.
 
     Every relayed message is sent *with the channel name*: ``📢 <b>News</b>``
@@ -2447,25 +2462,26 @@ async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     msg, chat = message_of(u), u.effective_chat
     if (not msg or not chat or chat.type not in FORWARD_SOURCE_TYPES
-            or not is_forward_source(chat.id)):
+            or (destination is None and not is_forward_source(chat.id))):
         return False
     if is_own_post(msg, chat, getattr(c, "bot", None)):
         return False
-    group = state["group"]
+    group = destination if destination is not None else state["group"]
     header = relay_header(chat)
     text = getattr(msg, "text", None)
     try:
         if text is not None:
             body = getattr(msg, "text_html", None) or html_escape(text)
-            await c.bot.send_message(chat_id=group, text=f"{header}\n\n{body}",
-                                     parse_mode="HTML")
+            sent = await c.bot.send_message(chat_id=group, text=f"{header}\n\n{body}",
+                                            parse_mode="HTML")
         else:
             caption = getattr(msg, "caption", None) or ""
             body = getattr(msg, "caption_html", None) or html_escape(caption)
-            await c.bot.copy_message(chat_id=group, from_chat_id=chat.id,
+            sent = await c.bot.copy_message(chat_id=group, from_chat_id=chat.id,
                                      message_id=msg.message_id,
                                      caption=f"{header}\n\n{body}" if body else header,
                                      parse_mode="HTML")
+        remember_own_message(group, sent.message_id)
         log.info("Relayed %s message %s from %s to group %s with its name",
                  chat.type, msg.message_id, chat.id, group)
         return True
@@ -2475,8 +2491,9 @@ async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
         # from" header shows the source name too, so the name is there either
         # way.  Protected channel content is rejected by both API methods.
         try:
-            await c.bot.forward_message(chat_id=group, from_chat_id=chat.id,
+            sent = await c.bot.forward_message(chat_id=group, from_chat_id=chat.id,
                                         message_id=msg.message_id)
+            remember_own_message(group, sent.message_id)
             log.info("Forwarded %s message %s from %s to group %s",
                      chat.type, msg.message_id, chat.id, group)
             return True
@@ -2494,6 +2511,25 @@ async def on_channel_post(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
 async def on_source_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
     """↪️ Relay each new message of a selected group into the group."""
     return await relay_to_group(u, c)
+
+async def on_group_to_channel(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg, chat = message_of(u), u.effective_chat
+    if (not group_to_channel_enabled() or not msg or not chat
+            or chat.id != state.get("group") or not isinstance(state.get("channel"), int)
+            or state["channel"] == chat.id):
+        return False
+    user = u.effective_user
+    if user and pending_captcha(chat.id, user.id):
+        # Never publish verification answers or messages from a locked newcomer.
+        await on_group_text(u, c)
+        return False
+    return await relay_to_group(u, c, destination=state["channel"])
+
+class GroupToChannelFilter(filters.MessageFilter):
+    def filter(self, message):
+        return (group_to_channel_enabled() and state.get("channel") is not None
+                and message.chat_id == state.get("group"))
+
 
 class ForwardSourceFilter(filters.MessageFilter):
     """Matches a message sent in one of the ↪️ selected relay chats.
@@ -3340,6 +3376,11 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    elif d == "toggle_group_to_channel":
+        enabled = toggle_group_to_channel()
+        await q.answer(f"↪️ Group → channel: {'ON' if enabled else 'OFF'}")
+        return await q.edit_message_text(settings_text(), parse_mode="HTML", reply_markup=settings_kb())
+
     elif d == "toggle_channel_to_group":
         enabled = toggle_channel_to_group()
         await q.answer(f"↪️ Channel → group: {'ON' if enabled else 'OFF'}")
@@ -4032,6 +4073,9 @@ def register_handlers(app):
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGES & ForwardSourceFilter()
                                    & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
                                    on_source_message))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & GroupToChannelFilter()
+                                   & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+                                   on_group_to_channel))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("preview", preview_cmd))
     app.add_handler(CommandHandler(["database", "db"], database_cmd))

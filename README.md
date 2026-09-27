@@ -578,6 +578,10 @@ is echoed back into the group.
 
 ---
 
+### ↪️ Forward group posts to the channel
+
+In **⚙️ Settings → ↪️ Group → channel**, turn on the independent group-to-channel relay (OFF by default). Ordinary text and media from the configured group are copied to the configured price channel with the group name above them. Commands, join/leave notices, verification answers, and the bot’s own posts are not relayed. Both directions may be enabled at once without echoing the bot’s relayed copies. The bot needs permission to read group messages (admin or privacy mode disabled) and post in the channel.
+
 ## 📤 Auto-forward what you send the bot
 
 Anything you send to the bot in your **private chat** that the menus did not ask for
