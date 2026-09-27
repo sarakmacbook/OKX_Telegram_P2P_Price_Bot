@@ -261,7 +261,7 @@ in its answer) — anyone who knows the URL could then trigger a post, so set it
 | `PUBLIC_URL` | – | public URL used to register the webhook; auto-detected from `VERCEL_PROJECT_PRODUCTION_URL`/`VERCEL_URL`, set it for a custom domain or if the page says it cannot tell |
 | `WEBHOOK_SECRET` | – | secret Telegram must send with every update; derived from `BOT_TOKEN` when empty |
 | `CRON_SECRET` | – (recommended) | locks `/api/tick` down |
-| `WEBHOOK_DROP_PENDING` | – | `1` (default) drops updates Telegram queued while you were offline, `0` replays them after a redeploy |
+| `WEBHOOK_DROP_PENDING` | – | `0` (default) preserves queued updates, including /start; set `1` only to deliberately discard them |
 | `ASSET`, `FIAT`, `INTERVAL` | – | pair + description only (on Vercel the cron sets the real interval) |
 | `AD_LINK_TEMPLATES` | – | per-exchange deep-link overrides (JSON), same as the polling installs |
 
@@ -381,3 +381,11 @@ want that choice to survive every cold start.
 * `config.json`, `data.json`, `runtime_config.json` and `.env` are git-ignored; on
   Vercel everything secret lives in the project's environment variables or in the
   KV store the deployment already trusts.
+
+### Setup activates Telegram delivery
+
+Saving a complete Vercel setup now registers the webhook before returning. No
+extra status-page visit is needed. Failed activation is reported as a warning;
+the settings remain saved. The webhook must use a public production domain,
+not a deployment URL protected by Vercel login. Set `PUBLIC_URL` to that domain
+if the automatically selected domain is not publicly accessible.

@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # repo root (b
 from serverless import (                                          # noqa: E402
     SETUP_LINK_ACTION, SETUP_LINK_FIELD, SETUP_PATH, WEBHOOK_PATH, Request, Response,
     _setup_page, asgi_dispatch, consume_setup_link, issue_setup_link, save_setup_values,
-    setup_link_valid, setup_status, setup_write_allowed, env, matches,
+    setup_link_valid, setup_status, setup_write_allowed, env, matches, ensure_webhook,
 )
 
 log = logging.getLogger("p2p-bot.serverless.setup")
@@ -81,6 +81,8 @@ def _headline(result: dict) -> str:
     if not result["ok"]:
         return " · ".join(result["errors"])
     saved = ", ".join(result["saved"]) or "the KV/Redis connection"
+    if result.get("webhook"):
+        return f"Saved {saved} — Telegram connected. Send /start to the bot in private chat."
     missing = result["status"].get("missing") or ""
     if not result["status"]["ready"]:
         return (f"Saved {saved}, but setup is not complete. "
@@ -128,6 +130,17 @@ async def handle(request: Request) -> Response:
 
     values = request.submitted()
     result = save_setup_values(values)
+    # Activate delivery in this request; serverless background tasks may be
+    # frozen as soon as the response is sent. Never require a second page visit.
+    if result["ok"] and result["status"]["ready"] and result["status"].get("serverless"):
+        try:
+            result["webhook"] = await ensure_webhook()
+        except Exception:
+            log.exception("Settings saved but Telegram webhook activation failed")
+            result["warnings"].append(
+                "Settings saved, but Telegram delivery could not be activated. "
+                "Check the deployment logs and public URL; the webhook must be "
+                "accessible without Vercel login. Retry at /api/webhook?register=1.")
     headline = _headline(result)
     log.info("setup save %s: %s", "ok" if result["ok"] else "rejected",
              ", ".join(result["saved"]) or "; ".join(result["errors"]))

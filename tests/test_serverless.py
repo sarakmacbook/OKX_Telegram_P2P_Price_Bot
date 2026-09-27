@@ -391,7 +391,7 @@ def test_tick_endpoint_runs_the_real_cron_path(serverless, tick, monkeypatch):
     assert status == 200 and data["ok"] is True
     assert url == "https://p2p-test.vercel.app/api/webhook"
     assert kwargs["secret_token"] == serverless.webhook_secret()
-    assert kwargs["drop_pending_updates"] is True
+    assert kwargs["drop_pending_updates"] is False
     assert "getUpdates" not in kwargs.get("allowed_updates", [])   # webhook mode, no polling
     assert data["posted"] is True and data["deleted_stale_message"] is False
     assert data["webhook"]["url"] == url
