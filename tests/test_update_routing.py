@@ -183,13 +183,16 @@ def test_an_unrelated_channel_message_changes_nothing(router):
     assert router.bot.state["channel"] is None
 
 
-def test_a_post_in_the_configured_channel_is_forwarded_into_the_group(router):
+def test_a_post_in_the_configured_channel_is_relayed_with_the_channel_name(router):
     router.bot.state["channel"] = CHANNEL
 
     calls = router.send(_channel_post("channel announcement"))
 
-    calls["forward_message"].assert_awaited_once_with(
-        chat_id=GROUP, from_chat_id=CHANNEL, message_id=14)
+    calls["send_message"].assert_awaited_once()
+    assert calls["send_message"].await_args.kwargs["chat_id"] == GROUP
+    assert calls["send_message"].await_args.kwargs["text"] == \
+        "📢 <b>Rates channel</b>\n\nchannel announcement"
+    calls["forward_message"].assert_not_awaited()
 
 
 def test_channel_setup_commands_are_not_forwarded_to_the_group(router):
@@ -236,8 +239,9 @@ def test_a_message_in_a_selected_group_is_relayed_into_the_group(router):
 
     calls = router.send(_chat_message(SIGNALS, "supergroup", "buy now"))
 
-    calls["forward_message"].assert_awaited_once_with(
-        chat_id=GROUP, from_chat_id=SIGNALS, message_id=11)
+    calls["send_message"].assert_awaited_once()
+    assert calls["send_message"].await_args.kwargs["chat_id"] == GROUP
+    assert calls["send_message"].await_args.kwargs["text"] == "👥 <b>Source</b>\n\nbuy now"
 
 
 def test_a_photo_in_a_selected_group_is_relayed_and_not_read_as_a_banner(router):
@@ -246,7 +250,8 @@ def test_a_photo_in_a_selected_group_is_relayed_and_not_read_as_a_banner(router)
     calls = router.send(_chat_message(SIGNALS, "supergroup", message_id=12, photo=[
         {"file_id": "AgACAgIAAxkBAAICbig", "file_unique_id": "u3", "width": 1, "height": 1}]))
 
-    calls["forward_message"].assert_awaited_once()
+    calls["copy_message"].assert_awaited_once()
+    assert calls["copy_message"].await_args.kwargs["caption"] == "👥 <b>Source</b>"
     assert router.bot.post_banner() == ""
 
 
@@ -257,6 +262,7 @@ def test_only_the_selected_chats_are_relayed(router):
 
     calls["forward_message"].assert_not_awaited()
     calls["copy_message"].assert_not_awaited()
+    calls["send_message"].assert_not_awaited()
 
 
 def test_commands_in_a_selected_group_stay_there(router):
@@ -266,6 +272,7 @@ def test_commands_in_a_selected_group_stay_there(router):
 
     assert router.bot.source_selected(SIGNALS) is True      # it registered the chat…
     calls["forward_message"].assert_not_awaited()           # …and was not relayed
+    calls["copy_message"].assert_not_awaited()
 
 
 def test_the_registered_group_keeps_its_anti_scam_handler(router):
@@ -278,6 +285,7 @@ def test_the_registered_group_keeps_its_anti_scam_handler(router):
 
     assert router.bot.pending_captcha(GROUP, NEWCOMER) is None   # the 🛡 handler answered
     calls["forward_message"].assert_not_awaited()
+    calls["copy_message"].assert_not_awaited()
 
 
 def test_the_bot_does_not_relay_its_own_confirmation(router):
@@ -291,10 +299,12 @@ def test_the_bot_does_not_relay_its_own_confirmation(router):
     calls = router.send(_chat_message(NEWS, "channel", "✅ New messages …", message_id=42))
 
     calls["forward_message"].assert_not_awaited()
+    calls["copy_message"].assert_not_awaited()
 
     calls = router.send(_chat_message(NEWS, "channel", "a real post", message_id=43))
-    calls["forward_message"].assert_awaited_once_with(
-        chat_id=GROUP, from_chat_id=NEWS, message_id=43)
+    assert calls["send_message"].await_args.kwargs["chat_id"] == GROUP
+    assert calls["send_message"].await_args.kwargs["text"] == "📢 <b>Source</b>\n\na real post"
+    calls["forward_message"].assert_not_awaited()
 
 
 def test_a_message_in_a_selected_channel_is_relayed(router):
@@ -302,5 +312,7 @@ def test_a_message_in_a_selected_channel_is_relayed(router):
 
     calls = router.send(_chat_message(NEWS, "channel", "channel announcement", message_id=13))
 
-    calls["forward_message"].assert_awaited_once_with(
-        chat_id=GROUP, from_chat_id=NEWS, message_id=13)
+    calls["send_message"].assert_awaited_once()
+    assert calls["send_message"].await_args.kwargs["chat_id"] == GROUP
+    assert calls["send_message"].await_args.kwargs["text"] == \
+        "📢 <b>Source</b>\n\nchannel announcement"

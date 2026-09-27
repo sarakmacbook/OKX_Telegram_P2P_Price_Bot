@@ -331,30 +331,56 @@ def test_an_unknown_forward_target_falls_back(manager, target):
     assert manager.forward_target() == "group"
 
 
-def _channel_update(message_id=34, chat_id=CHANNEL):
-    message = SimpleNamespace(message_id=message_id)
-    chat = SimpleNamespace(id=chat_id, type="channel")
+def _channel_update(message_id=34, chat_id=CHANNEL, text=None, title="Rates channel"):
+    message = SimpleNamespace(message_id=message_id, text=text)
+    chat = SimpleNamespace(id=chat_id, type="channel", title=title)
     return SimpleNamespace(effective_message=message, message=None, effective_chat=chat)
 
 
-def test_channel_posts_are_forwarded_to_the_configured_group_by_default(manager):
+def test_channel_posts_reach_the_group_with_the_channel_name_by_default(manager):
     manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
     fake = _bot()
 
     assert manager.channel_to_group_enabled() is True
     assert asyncio.run(manager.on_channel_post(_channel_update(), SimpleNamespace(bot=fake))) is True
 
-    fake.forward_message.assert_awaited_once_with(
-        chat_id=GROUP, from_chat_id=CHANNEL, message_id=34)
-    fake.copy_message.assert_not_awaited()
+    fake.copy_message.assert_awaited_once()
+    assert fake.copy_message.await_args.kwargs["chat_id"] == GROUP
+    assert fake.copy_message.await_args.kwargs["caption"] == "📢 <b>Rates channel</b>"
+    fake.forward_message.assert_not_awaited()
 
 
-def test_channel_posts_only_forward_from_the_configured_channel(manager):
+def test_relayed_channel_text_keeps_the_name_above_it(manager):
+    manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
+    fake = _bot()
+
+    assert asyncio.run(manager.on_channel_post(
+        _channel_update(text="Markets are up"), SimpleNamespace(bot=fake))) is True
+
+    fake.send_message.assert_awaited_once()
+    assert fake.send_message.await_args.kwargs["chat_id"] == GROUP
+    assert fake.send_message.await_args.kwargs["text"] == "📢 <b>Rates channel</b>\n\nMarkets are up"
+    fake.forward_message.assert_not_awaited()
+
+
+def test_the_channel_name_is_html_escaped(manager):
+    manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
+    fake = _bot()
+
+    asyncio.run(manager.on_channel_post(
+        _channel_update(title="R&D <news>"), SimpleNamespace(bot=fake)))
+
+    assert fake.copy_message.await_args.kwargs["caption"] == "📢 <b>R&amp;D &lt;news&gt;</b>"
+
+
+def test_channel_posts_only_relay_from_the_configured_channel(manager):
     manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
     fake = _bot()
 
     assert asyncio.run(manager.on_channel_post(
         _channel_update(chat_id=CHANNEL - 1), SimpleNamespace(bot=fake))) is False
+    fake.send_message.assert_not_awaited()
+    fake.copy_message.assert_not_awaited()
     fake.forward_message.assert_not_awaited()
 
 
@@ -364,6 +390,8 @@ def test_channel_to_group_forwarding_can_be_disabled(manager):
     fake = _bot()
 
     assert asyncio.run(manager.on_channel_post(_channel_update(), SimpleNamespace(bot=fake))) is False
+    fake.send_message.assert_not_awaited()
+    fake.copy_message.assert_not_awaited()
     fake.forward_message.assert_not_awaited()
 
 
@@ -373,16 +401,19 @@ def test_the_channel_price_report_is_not_echoed_back_to_the_group(manager):
     fake = _bot()
 
     assert asyncio.run(manager.on_channel_post(_channel_update(), SimpleNamespace(bot=fake))) is False
+    fake.send_message.assert_not_awaited()
+    fake.copy_message.assert_not_awaited()
     fake.forward_message.assert_not_awaited()
 
 
-def test_channel_forward_falls_back_to_copy(manager):
+def test_the_relay_falls_back_to_a_real_forward(manager):
+    """"Forwarded from" then shows the channel name — stickers, polls, …."""
     manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
     fake = _bot()
-    fake.forward_message = AsyncMock(side_effect=RuntimeError("forward unavailable"))
+    fake.copy_message = AsyncMock(side_effect=RuntimeError("copy unavailable"))
 
     assert asyncio.run(manager.on_channel_post(_channel_update(), SimpleNamespace(bot=fake))) is True
-    fake.copy_message.assert_awaited_once_with(
+    fake.forward_message.assert_awaited_once_with(
         chat_id=GROUP, from_chat_id=CHANNEL, message_id=34)
 
 

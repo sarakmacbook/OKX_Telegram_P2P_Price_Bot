@@ -41,9 +41,10 @@ def _chat(chat_id, chat_type="channel", title="Source"):
     return SimpleNamespace(id=chat_id, type=chat_type, title=title)
 
 
-def _update(chat_id, chat_type="channel", message_id=34, title="Source", user=None):
+def _update(chat_id, chat_type="channel", message_id=34, title="Source", user=None,
+            text=None, caption=None):
     """A message (or channel post) sent inside ``chat_id``."""
-    message = SimpleNamespace(message_id=message_id,
+    message = SimpleNamespace(message_id=message_id, text=text, caption=caption,
                               reply_html=AsyncMock(return_value=SimpleNamespace(message_id=77)),
                               reply_text=AsyncMock())
     return SimpleNamespace(effective_message=message, message=message,
@@ -78,8 +79,9 @@ def test_a_selected_group_is_relayed_into_the_group(manager):
 
     assert asyncio.run(manager.on_source_message(
         _update(SIGNALS_GROUP, "supergroup", title="Signals"), SimpleNamespace(bot=fake))) is True
-    fake.forward_message.assert_awaited_once_with(
-        chat_id=GROUP, from_chat_id=SIGNALS_GROUP, message_id=34)
+    fake.copy_message.assert_awaited_once()
+    assert fake.copy_message.await_args.kwargs["chat_id"] == GROUP
+    assert fake.copy_message.await_args.kwargs["caption"] == "👥 <b>Signals</b>"
 
 
 def test_a_selected_channel_is_relayed_too(manager):
@@ -88,7 +90,8 @@ def test_a_selected_channel_is_relayed_too(manager):
 
     assert asyncio.run(manager.on_channel_post(
         _update(NEWS_CHANNEL, title="News"), SimpleNamespace(bot=fake))) is True
-    fake.forward_message.assert_awaited_once()
+    fake.copy_message.assert_awaited_once()
+    assert fake.copy_message.await_args.kwargs["caption"] == "📢 <b>News</b>"
 
 
 def test_selecting_a_source_replaces_the_channel_default(manager):
@@ -99,7 +102,66 @@ def test_selecting_a_source_replaces_the_channel_default(manager):
     assert manager.is_forward_source(CHANNEL) is False
     assert asyncio.run(manager.on_channel_post(
         _update(CHANNEL, title="Rates channel"), SimpleNamespace(bot=fake))) is False
+    fake.copy_message.assert_not_awaited()
     fake.forward_message.assert_not_awaited()
+
+
+# ── every relayed message carries the source chat's name ───────────────────
+def test_relayed_text_carries_the_source_name_above_it(manager):
+    manager.add_forward_source(NEWS_CHANNEL, "News", "channel")
+    fake = _bot()
+
+    assert asyncio.run(manager.on_channel_post(
+        _update(NEWS_CHANNEL, title="News", text="Bitcoin pumps"),
+        SimpleNamespace(bot=fake))) is True
+
+    assert fake.send_message.await_args.kwargs["chat_id"] == GROUP
+    assert fake.send_message.await_args.kwargs["text"] == "📢 <b>News</b>\n\nBitcoin pumps"
+    fake.forward_message.assert_not_awaited()
+
+
+def test_relayed_media_keeps_its_caption_below_the_name(manager):
+    manager.add_forward_source(NEWS_CHANNEL, "News", "channel")
+    fake = _bot()
+
+    assert asyncio.run(manager.on_channel_post(
+        _update(NEWS_CHANNEL, title="News", caption="chart attached"),
+        SimpleNamespace(bot=fake))) is True
+
+    assert fake.copy_message.await_args.kwargs["caption"] == "📢 <b>News</b>\n\nchart attached"
+
+
+def test_the_stored_title_names_the_relay_when_the_update_has_none(manager):
+    """The classic default (nothing selected) still shows the channel name."""
+    manager.state["channel"], manager.state["channel_title"] = CHANNEL, "Rates channel"
+    fake = _bot()
+
+    asyncio.run(manager.on_channel_post(
+        _update(CHANNEL, title=""), SimpleNamespace(bot=fake)))
+
+    assert fake.copy_message.await_args.kwargs["caption"] == "📢 <b>Rates channel</b>"
+
+
+def test_the_source_name_is_html_escaped(manager):
+    manager.add_forward_source(NEWS_CHANNEL, "R&D <news>", "channel")
+    fake = _bot()
+
+    asyncio.run(manager.on_channel_post(
+        _update(NEWS_CHANNEL, title="R&D <news>"), SimpleNamespace(bot=fake)))
+
+    assert fake.copy_message.await_args.kwargs["caption"] == "📢 <b>R&amp;D &lt;news&gt;</b>"
+
+
+def test_a_real_forward_is_the_fallback_when_the_copy_fails(manager):
+    """"Forwarded from" then shows the name — stickers, polls, protected posts."""
+    manager.add_forward_source(NEWS_CHANNEL, "News", "channel")
+    fake = _bot()
+    fake.copy_message = AsyncMock(side_effect=RuntimeError("can't copy"))
+
+    assert asyncio.run(manager.on_channel_post(
+        _update(NEWS_CHANNEL, title="News"), SimpleNamespace(bot=fake))) is True
+    fake.forward_message.assert_awaited_once_with(
+        chat_id=GROUP, from_chat_id=NEWS_CHANNEL, message_id=34)
 
 
 def test_several_chats_are_relayed_at_the_same_time(manager):
