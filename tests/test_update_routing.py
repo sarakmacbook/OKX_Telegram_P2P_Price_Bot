@@ -161,12 +161,46 @@ def test_a_command_is_not_reposted(router):
 
 def test_a_photo_that_the_banner_editor_wanted_is_not_reposted(router):
     router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
-                        "awaiting_custom", "banner_photo")
+                        "awaiting_custom", "banner_media")
     calls = router.send(_private(photo=[{"file_id": "AgACAgIAAxkBAAICbig",
                                          "file_unique_id": "u2", "width": 1, "height": 1}]))
 
     assert calls["copy_message"].await_count == 0
     assert router.bot.post_banner() == "AgACAgIAAxkBAAICbig"
+    assert router.bot.banner_kind() == "photo"
+
+
+def test_a_gif_the_banner_editor_wanted_is_saved_as_an_animation(router):
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+    calls = router.send(_private(animation={"file_id": "CgACAgIAAxkBAAIBnGif",
+                                            "file_unique_id": "u3",
+                                            "width": 1, "height": 1, "duration": 1}))
+
+    assert calls["copy_message"].await_count == 0
+    assert router.bot.post_banner() == "CgACAgIAAxkBAAIBnGif"
+    assert router.bot.banner_kind() == "animation"
+
+
+def test_a_gif_sent_as_a_file_is_saved_as_an_animation_too(router):
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+    calls = router.send(_private(document={"file_id": "BQACAgIAAxkBAAIBnGif",
+                                           "file_unique_id": "u4",
+                                           "mime_type": "image/gif", "file_name": "rates.gif"}))
+
+    assert calls["copy_message"].await_count == 0
+    assert router.bot.post_banner() == "BQACAgIAAxkBAAIBnGif"
+    assert router.bot.banner_kind() == "animation"
+
+
+def test_a_gif_nobody_asked_for_is_reposted(router):
+    calls = router.send(_private(animation={"file_id": "CgACAgIAAxkBAAIBnGif",
+                                            "file_unique_id": "u3",
+                                            "width": 1, "height": 1, "duration": 1}))
+
+    calls["copy_message"].assert_awaited_once()
+    assert router.bot.post_banner() == ""
 
 
 # ── 📢 the channel ─────────────────────────────────────────────────────────
