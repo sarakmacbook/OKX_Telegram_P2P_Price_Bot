@@ -227,6 +227,18 @@ MAX_FORWARD_HISTORY = 20          # how many 📤 Undo buttons stay valid
 FORWARD_HISTORY_TTL = 48 * 3600   # …and for how long (seconds)
 MAX_CAPTCHA_LENGTH = 1000         # the custom anti-scam challenge text
 
+# ── ↪️ relay: which chats are forwarded *into* the group ────────────────────
+# The admin picks the source chats: any channel or group the bot can read.
+# With nothing picked the configured channel is relayed, which is what the bot
+# did before this option existed — an upgrade changes nobody's setup.
+FORWARD_SOURCE_TYPES = ("channel", "group", "supergroup")
+FORWARD_SOURCE_ICONS = {"channel": "📢", "group": "👥", "supergroup": "👥"}
+MAX_FORWARD_SOURCES = 10          # how many chats may be relayed at once
+MAX_SOURCE_TITLE = 120            # titles are only ever shown in a menu
+OWN_MESSAGE_LIMIT = 30            # bot messages in a source chat not to relay back
+# /start payloads that register a chat (deep links: startgroup= / startchannel=)
+SETUP_ACTIONS = ("setgroup", "setchannel", "forwardfrom")
+
 # ── anti-scam verification (captcha) ────────────────────────────────────────
 # A new member is muted and has to type a random word.  While pending they may
 # only send plain text (no links, media or stickers), so a scammer cannot post
@@ -298,7 +310,8 @@ DEFAULT_SETTINGS = {
     "post_photo": "",              # banner for the group post: file_id or https URL
     # ── reposting what the admin sends in the private chat ──
     "forward_target": "group",     # "off" | "group" | "channel" | "both"
-    # ── reposting new posts from the configured channel into the group ──
+    # ── ↪️ reposting new messages from the selected chats into the group ──
+    # which chats: state["forward_sources"] (empty = the configured channel)
     "channel_to_group": True,
     # ── anti-scam verification for new members ──
     "captcha_enabled": True,       # mute new members until they type a random word
@@ -565,6 +578,145 @@ def toggle_channel_to_group() -> bool:
     save()
     return enabled
 
+
+# ── ↪️ relay sources: which channel/group is forwarded into the group ────────
+def normalize_forward_sources(value) -> dict:
+    """Keep the usable source records — a broken one must never stop a relay."""
+    clean: dict = {}
+    if not isinstance(value, dict):
+        return clean
+    for key, record in value.items():
+        if not isinstance(record, dict) or record.get("type") not in FORWARD_SOURCE_TYPES:
+            continue
+        try:
+            chat_id = int(record.get("chat_id", key))
+        except (TypeError, ValueError):
+            continue
+        title = str(record.get("title") or "").strip()[:MAX_SOURCE_TITLE]
+        try:
+            added = int(record.get("added") or 0)
+        except (TypeError, ValueError):
+            added = 0
+        clean[str(chat_id)] = {"chat_id": chat_id, "title": title,
+                               "type": record["type"], "added": added}
+        if len(clean) >= MAX_FORWARD_SOURCES:
+            break
+    return clean
+
+def forward_sources() -> dict:
+    """The chats the admin selected, keyed by chat id ({} = relay the channel)."""
+    return normalize_forward_sources(state.get("forward_sources"))
+
+def forward_source_records() -> list[dict]:
+    """The selected sources in the order they were added (oldest first)."""
+    records = list(forward_sources().values())
+    records.sort(key=lambda r: r.get("added") or 0)
+    return records
+
+def forward_source_ids() -> set[int]:
+    """Every chat whose messages are relayed into the group."""
+    ids = {record["chat_id"] for record in forward_sources().values()}
+    if not ids and isinstance(state.get("channel"), int):
+        ids = {state["channel"]}      # nothing chosen yet → the classic behaviour
+    return ids
+
+def is_forward_source(chat_id) -> bool:
+    """Whether messages from this chat are relayed — also the PTB filter's answer.
+
+    The destination group is never a source: relaying it into itself is
+    pointless, and matching it here would take its messages away from the
+    🛡 anti-scam handler (PTB runs only the first handler that matches).
+    """
+    if not channel_to_group_enabled() or not isinstance(state.get("group"), int):
+        return False
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return False
+    return chat_id != state["group"] and chat_id in forward_source_ids()
+
+def add_forward_source(chat_id, title="", kind="") -> bool:
+    """Select a channel/group to forward from; False when it already was one."""
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return False
+    sources = forward_sources()
+    if str(chat_id) in sources:
+        return False
+    if len(sources) >= MAX_FORWARD_SOURCES:
+        log.warning("Forward source limit reached (%s) — %s was not added",
+                    MAX_FORWARD_SOURCES, chat_id)
+        return False
+    sources[str(chat_id)] = {"chat_id": chat_id, "title": str(title or "").strip()[:MAX_SOURCE_TITLE],
+                             "type": kind if kind in FORWARD_SOURCE_TYPES else "channel",
+                             "added": int(time.time())}
+    state["forward_sources"] = sources
+    save()
+    return True
+
+def remove_forward_source(chat_id) -> bool:
+    """Stop forwarding from a chat; False when it was not selected."""
+    sources = forward_sources()
+    try:
+        removed = sources.pop(str(int(chat_id)), None) is not None
+    except (TypeError, ValueError):
+        return False
+    state["forward_sources"] = sources
+    save()
+    return removed
+
+def source_selected(chat_id) -> bool:
+    """Whether this chat was picked by the admin (not just the channel default)."""
+    try:
+        return str(int(chat_id)) in forward_sources()
+    except (TypeError, ValueError):
+        return False
+
+# The bot answers inside a source chat ("✅ forwarding from here"), and Telegram
+# hands that answer back as an ordinary update — without a note of who sent it,
+# because a channel post has no ``from_user``.  So the ids the bot posted itself
+# are remembered for a moment and skipped by the relay.
+def own_messages() -> dict:
+    records = state.get("own_messages")
+    return records if isinstance(records, dict) else {}
+
+def remember_own_message(chat_id, message_id) -> None:
+    """Note a message the bot posted into a ↪️ source chat."""
+    try:
+        key = f"{int(chat_id)}:{int(message_id)}"
+    except (TypeError, ValueError):
+        return
+    records = own_messages()
+    records[key] = int(time.time())
+    for old in sorted(records, key=lambda k: records[k])[:-OWN_MESSAGE_LIMIT]:
+        records.pop(old, None)
+    state["own_messages"] = records
+    save()
+
+def is_own_message(chat_id, message_id) -> bool:
+    try:
+        return f"{int(chat_id)}:{int(message_id)}" in own_messages()
+    except (TypeError, ValueError):
+        return False
+
+def forward_source_label(record: dict) -> str:
+    """``"📢 Rates channel"`` — or the chat id when Telegram gave no title."""
+    icon = FORWARD_SOURCE_ICONS.get(record.get("type"), "💬")
+    title = record.get("title") or ""
+    return f"{icon} {title or record.get('chat_id')}"
+
+def forward_source_summary() -> str:
+    """Short answer to "from where?" for a button label."""
+    sources = forward_sources()
+    if not sources:
+        return "the channel" if state.get("channel") else "none"
+    if len(sources) == 1:
+        record = next(iter(sources.values()))
+        title = record.get("title") or str(record.get("chat_id"))
+        return title if len(title) <= 22 else title[:21] + "…"
+    return f"{len(sources)} chats"
+
 def cycle_forward_target() -> str:
     """📤 Auto-forward button: group → channel → both → off."""
     order = ("group", "channel", "both", "off")
@@ -727,7 +879,11 @@ def empty_state():
             # anti-scam: {chat_id:user_id → {word, tries, msg_id, expires, …}}
             "captcha": {},
             # 📤 Undo for messages the admin had reposted to the group/channel
-            "forwards": {}}
+            "forwards": {},
+            # ↪️ chats selected as relay sources {chat_id: {chat_id, title, type}}
+            "forward_sources": {},
+            # ↪️ messages the bot itself posted into a source chat ("chat:msg" → ts)
+            "own_messages": {}}
 
 
 def load():
@@ -813,6 +969,12 @@ def load():
     data["captcha"] = clean
     if not isinstance(data.get("forwards"), dict):
         data["forwards"] = {}
+    # ↪️ relay sources: keep the valid records, drop anything malformed
+    data["forward_sources"] = normalize_forward_sources(data.get("forward_sources"))
+    own = data.get("own_messages")
+    data["own_messages"] = {k: v for k, v in own.items()
+                            if isinstance(k, str) and re.fullmatch(r"-?\d+:\d+", k)} \
+        if isinstance(own, dict) else {}
     return data
 
 def save():
@@ -1017,6 +1179,63 @@ def set_channel_button():
                             "&admin=post_messages+edit_messages+delete_messages")
     return B(label, callback_data="setchannel_help")
 
+def add_source_channel_button():
+    """Deep link that adds the bot to a channel and makes it a ↪️ relay source.
+
+    A bot only receives channel posts when it is an **admin** of the channel, so
+    the link asks Telegram for the posting right as well.
+    """
+    if BOT_USERNAME:
+        return B("📢 Add a channel", url=f"https://t.me/{BOT_USERNAME}?startchannel=forwardfrom"
+                                         "&admin=post_messages")
+    return B("📢 Add a channel", callback_data="fwd_src_help")
+
+def add_source_group_button():
+    """Deep link that adds the bot to a group and makes it a ↪️ relay source."""
+    if BOT_USERNAME:
+        return B("👥 Add a group", url=f"https://t.me/{BOT_USERNAME}?startgroup=forwardfrom")
+    return B("👥 Add a group", callback_data="fwd_src_help")
+
+def forward_sources_text() -> str:
+    """The ↪️ Forward-from menu: what is relayed, and how to change it."""
+    records = forward_source_records()
+    group = group_label()
+    lines = "\n".join(
+        f"{index}. <code>{html_escape(forward_source_label(record))}</code>"
+        for index, record in enumerate(records, 1))
+    if not records:
+        lines = ("<i>Nothing selected — new posts in the configured "
+                 f"{html_escape(channel_label() or 'channel (not set)')}</i> are relayed,\n"
+                 "<i>which is what the bot did before this option existed.</i>")
+    return (
+        f"↪️ <b>Forward from</b>\n\n"
+        f"Into the group: <code>{html_escape(group or 'not set')}</code>\n"
+        f"Forwarding: <b>{'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}</b>\n\n"
+        f"{lines}\n\n"
+        f"Add the bot to any <b>channel</b> or <b>group</b> and tap a button below, or send "
+        f"<code>/forwardfrom</code> inside that chat (<code>/stopforward</code> removes it again).\n"
+        f"• In a <b>channel</b> the bot must be an <b>admin</b> — Telegram only sends channel "
+        f"posts to admins.\n"
+        f"• In a <b>group</b> the bot must be an <b>admin</b> too, or @BotFather → "
+        f"<i>/setprivacy</i> → <b>Disable</b>, otherwise it cannot read the messages.\n"
+        f"• Tap a chat below to stop forwarding from it "
+        f"({len(records)}/{MAX_FORWARD_SOURCES} selected).\n"
+        f"• The price post itself is never echoed back, and the destination group cannot be a "
+        f"source."
+    )
+
+def forward_sources_kb():
+    """One row per selected chat (tap = remove), then the ways to add one."""
+    rows = [[B(forward_source_label(record), callback_data=f"fwd_src_del:{record['chat_id']}")]
+            for record in forward_source_records()]
+    rows.append([add_source_channel_button(), add_source_group_button()])
+    if state.get("channel") and not source_selected(state["channel"]):
+        rows.append([B("📢 Use the price channel", callback_data="fwd_src_use_channel")])
+    rows.append([B(f"↪️ Forward to group: {'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}",
+                   callback_data="fwd_src_toggle")])
+    rows.append([B("⬅️ Back", callback_data="settings")])
+    return KB(rows)
+
 def database_button():
     """The link to the page where a database is connected (Vercel → Storage)."""
     return B("🔌 Connect database ↗", url=database_link())
@@ -1062,7 +1281,8 @@ def settings_kb():
         [set_channel_button(), B("🛡 Anti-scam", callback_data="antiscam")],
         [B(f"📤 Auto-forward: {forward_label()}", callback_data="toggle_forward_target")],
         [B(f"↪️ Channel → group: {'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}",
-           callback_data="toggle_channel_to_group")],
+           callback_data="toggle_channel_to_group"),
+         B(f"↪️ Forward from: {forward_source_summary()}", callback_data="forward_sources")],
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="panel")]
     ])
 
@@ -1529,7 +1749,8 @@ def panel_text():
         f"🔄 Btn order: <b>{order_label()}</b> · 🎯 Links: <b>{'EXACT AD' if link_mode() == 'ad' else 'PROFILE'}</b>\n"
         f"🚪 Del Join/Left msgs: <b>{joinleft}</b>\n"
         f"📤 Auto-forward: <b>{forward_label()}</b> · ↪️ Channel → group: "
-        f"<b>{'ON' if channel_to_group_enabled() else 'OFF'}</b> · 🛡 Verification: "
+        f"<b>{'ON' if channel_to_group_enabled() else 'OFF'}</b> "
+        f"(from <b>{html_escape(forward_source_summary())}</b>) · 🛡 Verification: "
         f"<b>{'ON' if captcha_enabled() else 'OFF'}</b>"
         f"{f' ({pending} waiting' + (f', {locked} for you' if locked else '') + ')' if pending or locked else ''}\n"
         f"📝 Header: <code>{header_short}</code>\n"
@@ -1586,8 +1807,11 @@ def settings_text():
         f"   to that chat, with a 🗑 Undo button. Tap it to cycle:\n"
         f"   GROUP → CHANNEL → GROUP + CHANNEL → OFF.\n\n"
         f"↪️ Channel → group: <b>{'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}</b>\n"
-        f"   New posts in the configured channel are forwarded into the configured group.\n"
-        f"   The bot must be an admin in the channel and able to send messages in the group.\n\n"
+        f"   Forwarding from: <b>{html_escape(forward_source_summary())}</b>\n"
+        f"   New posts in the selected channel(s)/group(s) are forwarded into the group.\n"
+        f"   With nothing selected, the configured channel is relayed.\n"
+        f"   The bot must be an admin in the source chat and able to send messages in the\n"
+        f"   group. Tap ↪️ Forward from to pick the chats.\n\n"
         f"🛡 Anti-scam verification: <b>{'ON ✅' if captcha_enabled() else 'OFF ❌'}</b>\n"
         f"   New members must type a random word before they can post links or media\n"
         f"   ({captcha_attempts()} attempts, {captcha_timeout()} min, then "
@@ -1722,16 +1946,25 @@ async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat = u.effective_chat
     if chat.type in ("group", "supergroup", "channel"):
         wanted = {"group": "setgroup", "supergroup": "setgroup", "channel": "setchannel"}[chat.type]
-        if c.args and c.args[0] == wanted:
-            if not trusted(u): return
-            kind = "channel" if chat.type == "channel" else "group"
-            _set_destination(kind, chat)
-            # a channel post has no message to reply to — sending is enough there
-            if u.effective_message:
-                await u.effective_message.reply_text(
-                    f"✅ <b>{chat.title}</b> will receive price updates.", parse_mode="HTML")
-            await notify_admins(c.bot, f"✅ {'Channel' if kind == 'channel' else 'Group'} set to "
-                                       f"<b>{html_escape(chat.title or '')}</b>")
+        action = c.args[0] if c.args else None
+        if action not in SETUP_ACTIONS:
+            return
+        if not trusted(u): return
+        # …?startgroup=forwardfrom / …?startchannel=forwardfrom — the deep links
+        # behind the ↪️ Forward-from menu: add the bot here *and* relay from here.
+        if action == "forwardfrom":
+            await register_forward_source(u, c, chat)
+            return
+        if action != wanted:
+            return
+        kind = "channel" if chat.type == "channel" else "group"
+        _set_destination(kind, chat)
+        # a channel post has no message to reply to — sending is enough there
+        if u.effective_message:
+            await u.effective_message.reply_text(
+                f"✅ <b>{chat.title}</b> will receive price updates.", parse_mode="HTML")
+        await notify_admins(c.bot, f"✅ {'Channel' if kind == 'channel' else 'Group'} set to "
+                                   f"<b>{html_escape(chat.title or '')}</b>")
         return
     if is_admin(u): await u.message.reply_html(panel_text(), reply_markup=panel())
     else: await u.message.reply_text("⛔ You are not authorized. Ask the bot admin to add your ID.")
@@ -1766,6 +1999,79 @@ async def setchannel(u: Update, c):
         pass
     await notify_admins(c.bot, f"✅ Channel set to <b>{html_escape(chat.title or '')}</b>")
 
+async def answer_in_source(u, c, text: str) -> None:
+    """Reply inside a ↪️ source chat — and never relay that reply to the group."""
+    chat, msg = u.effective_chat, message_of(u)
+    try:
+        sent = (await msg.reply_html(text) if getattr(msg, "reply_html", None)
+                else await c.bot.send_message(chat.id, text, parse_mode="HTML"))
+    except Exception as e:                     # no posting rights, chat gone, …
+        log.debug("Could not answer in chat %s: %s", chat.id, e)
+        return
+    remember_own_message(chat.id, getattr(sent, "message_id", None))
+
+async def register_forward_source(u, c, chat) -> bool:
+    """↪️ Select this channel/group as a chat the bot forwards *from*."""
+    if chat.type not in FORWARD_SOURCE_TYPES:
+        await answer_in_source(u, c, "⚠️ Only a channel or a group can be a forward source.")
+        return False
+    if not state.get("group"):
+        await answer_in_source(u, c, "⚠️ Set the destination group first — 👥 <b>Set group</b> "
+                                     "in the bot, or /setgroup inside that group.")
+        return False
+    if chat.id == state["group"]:
+        await answer_in_source(u, c, "⚠️ This is the group messages are forwarded <b>into</b> — "
+                                     "choose another channel or group.")
+        return False
+    if source_selected(chat.id):
+        await answer_in_source(u, c, f"ℹ️ Already forwarding from <b>{html_escape(chat.title or '')}</b>.")
+        return False
+    if not add_forward_source(chat.id, chat.title, chat.type):
+        await answer_in_source(u, c, f"⚠️ The limit of {MAX_FORWARD_SOURCES} forward sources is "
+                                     "reached — remove one in ⚙️ Settings → ↪️ Forward from.")
+        return False
+    turned_on = ""
+    if not channel_to_group_enabled():        # selecting a source means "use it"
+        state["settings"]["channel_to_group"] = True
+        save()
+        turned_on = "\n↪️ Forwarding was OFF — it is ON now."
+    where = html_escape(group_label() or str(state["group"]))
+    await answer_in_source(u, c, f"✅ New messages in <b>{html_escape(chat.title or str(chat.id))}</b> "
+                                 f"are forwarded to <b>{where}</b>.{turned_on}")
+    await notify_admins(c.bot, f"✅ ↪️ Forwarding from <b>{html_escape(chat.title or str(chat.id))}</b> "
+                               f"({chat.type}) into <b>{where}</b>.",
+                       reply_markup=forward_sources_kb())
+    return True
+
+async def forwardfrom(u: Update, c):
+    """/forwardfrom — forward this channel's/group's messages into the group."""
+    chat = u.effective_chat
+    if chat.type == "private":
+        if not is_admin(u): return
+        return await u.message.reply_html(
+            "↪️ <b>Forward from</b>\n\nSend /forwardfrom inside the channel or group whose "
+            "messages should reach your group (/stopforward removes it again), or use the "
+            "buttons below.", reply_markup=forward_sources_kb())
+    if not trusted(u): return
+    await register_forward_source(u, c, chat)
+
+async def stopforward(u: Update, c):
+    """/stopforward — this chat is no longer forwarded into the group."""
+    chat = u.effective_chat
+    if chat.type == "private":
+        if not is_admin(u): return
+        return await u.message.reply_html(
+            "↪️ Send /stopforward inside the channel or group that should no longer be "
+            "forwarded, or tap it in the list below.", reply_markup=forward_sources_kb())
+    if not trusted(u): return
+    if not remove_forward_source(chat.id):
+        return await answer_in_source(u, c, "ℹ️ This chat was not selected as a forward source.")
+    await answer_in_source(u, c, f"🗑 Stopped forwarding <b>{html_escape(chat.title or str(chat.id))}</b> "
+                                 "into the group.")
+    await notify_admins(c.bot, f"🗑 ↪️ No longer forwarding from "
+                               f"<b>{html_escape(chat.title or str(chat.id))}</b>.",
+                       reply_markup=forward_sources_kb())
+
 async def on_my_chat_member(u: Update, c):
     m = u.my_chat_member
     chat = m.chat
@@ -1774,20 +2080,31 @@ async def on_my_chat_member(u: Update, c):
     was, now = m.old_chat_member.status, m.new_chat_member.status
     joined = was in ("left", "kicked") and now in ("member", "administrator")
     if joined and m.from_user and m.from_user.id in ADMINS and _set_destination(kind, chat):
-        try: await c.bot.send_message(chat.id, f"✅ <b>{chat.title}</b> will receive price updates.", parse_mode="HTML")
+        try:
+            sent = await c.bot.send_message(chat.id, f"✅ <b>{chat.title}</b> will receive price updates.", parse_mode="HTML")
+            # the chat may be a ↪️ source as well — never relay the bot's own hello
+            remember_own_message(chat.id, getattr(sent, "message_id", None))
         except Exception: pass
         await notify_admins(c.bot, f"✅ {'Channel' if kind == 'channel' else 'Group'} set to "
                                    f"<b>{html_escape(chat.title or '')}</b>")
-    elif now in ("left", "kicked") and chat_of(kind) == chat.id:
-        state[CHAT_ID[kind]] = None
-        state[CHAT_TITLE[kind]] = ""
-        state[LAST_ID[kind]] = None
-        state[LAST_TIME[kind]] = None
-        state[SNAPSHOT[kind]] = {}
-        forget_captchas(chat.id)
-        save()
-        await notify_admins(c.bot, f"⚠️ Bot was removed from <b>{html_escape(chat.title or '')}</b> "
-                                   f"— {kind} unset.")
+    elif now in ("left", "kicked"):
+        was_source = source_selected(chat.id)
+        if was_source:
+            remove_forward_source(chat.id)     # the bot cannot read that chat any more
+        if chat_of(kind) == chat.id:
+            state[CHAT_ID[kind]] = None
+            state[CHAT_TITLE[kind]] = ""
+            state[LAST_ID[kind]] = None
+            state[LAST_TIME[kind]] = None
+            state[SNAPSHOT[kind]] = {}
+            forget_captchas(chat.id)
+            save()
+            await notify_admins(c.bot, f"⚠️ Bot was removed from <b>{html_escape(chat.title or '')}</b> "
+                                       f"— {kind} unset.")
+        elif was_source:
+            await notify_admins(c.bot, f"⚠️ Bot was removed from <b>{html_escape(chat.title or '')}</b> "
+                                       f"— no longer forwarded into the group.",
+                                reply_markup=forward_sources_kb())
 
 
 # ── 🛡 anti-scam verification ───────────────────────────────────────────────
@@ -2021,38 +2338,76 @@ async def forward_to_targets(u, c) -> bool:
     log.info("Forwarded message %s from admin %s to %s", msg.message_id, u.effective_user.id, names)
     return True
 
-async def on_channel_post(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Forward each new post in the configured source channel into the group."""
+def is_own_post(msg, chat, bot=None) -> bool:
+    """True for a message the bot itself posted — never echo it back.
+
+    The scheduled price report already went to the group, so relaying the copy
+    the bot posted into a destination chat would duplicate it.
+    """
+    message_id = getattr(msg, "message_id", None)
+    if message_id is None:
+        return False
+    for chat_key, id_key in (("group", "last_msg_id"), ("channel", "channel_last_msg_id")):
+        if chat.id == state.get(chat_key) and state.get(id_key) == message_id:
+            return True
+    if is_own_message(chat.id, message_id):
+        return True
+    sender, bot_id = getattr(msg, "from_user", None), getattr(bot, "id", None)
+    return bool(sender is not None and bot_id is not None and sender.id == bot_id)
+
+async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
+    """↪️ Forward one message from a selected channel/group into the group.
+
+    Returns True when the message reached the group.  The source chats are the
+    ones the admin picked (⚙️ Settings → ↪️ Forward from); with none picked the
+    configured channel is relayed, as before this option existed.
+    """
     msg, chat = message_of(u), u.effective_chat
-    if (not msg or not chat or chat.type != "channel"
-            or chat.id != state.get("channel")
-            or not state.get("group")
-            or not channel_to_group_enabled()):
+    if (not msg or not chat or chat.type not in FORWARD_SOURCE_TYPES
+            or not is_forward_source(chat.id)):
         return False
-    # Don't echo the bot's own latest scheduled price report back into the group;
-    # that report was already posted directly to the group by the normal job.
-    if msg.message_id == state.get("channel_last_msg_id"):
+    if is_own_post(msg, chat, getattr(c, "bot", None)):
         return False
+    group = state["group"]
     try:
-        forwarded = await c.bot.forward_message(
-            chat_id=state["group"], from_chat_id=chat.id, message_id=msg.message_id)
-        log.info("Forwarded channel post %s from %s to group %s",
-                 msg.message_id, chat.id, state["group"])
+        await c.bot.forward_message(chat_id=group, from_chat_id=chat.id, message_id=msg.message_id)
+        log.info("Forwarded %s message %s from %s to group %s",
+                 chat.type, msg.message_id, chat.id, group)
         return True
     except Exception as forward_error:
         # Copy is a useful fallback for content Telegram permits copying but not
         # forwarding. Protected channel content is rejected by both API methods.
         try:
-            await c.bot.copy_message(chat_id=state["group"], from_chat_id=chat.id,
+            await c.bot.copy_message(chat_id=group, from_chat_id=chat.id,
                                      message_id=msg.message_id)
-            log.info("Copied channel post %s from %s to group %s after forward failed",
-                     msg.message_id, chat.id, state["group"])
+            log.info("Copied %s message %s from %s to group %s after forward failed",
+                     chat.type, msg.message_id, chat.id, group)
             return True
         except Exception as copy_error:
-            log.warning("Could not forward channel post %s from %s to group %s: "
+            log.warning("Could not forward %s message %s from %s to group %s: "
                         "forward failed (%s); copy failed (%s)",
-                        msg.message_id, chat.id, state["group"], forward_error, copy_error)
+                        chat.type, msg.message_id, chat.id, group, forward_error, copy_error)
             return False
+
+async def on_channel_post(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
+    """↪️ Relay each new post of a selected channel into the group."""
+    return await relay_to_group(u, c)
+
+async def on_source_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
+    """↪️ Relay each new message of a selected group into the group."""
+    return await relay_to_group(u, c)
+
+class ForwardSourceFilter(filters.MessageFilter):
+    """Matches a message sent in one of the ↪️ selected relay chats.
+
+    The check has to live in the *filter*: PTB calls only the first handler that
+    matches an update, so a handler that grabbed every group message would take
+    the registered group's messages away from the 🛡 anti-scam handler.
+    """
+
+    def filter(self, message):
+        return is_forward_source(getattr(message, "chat_id", None))
+
 
 async def on_private_media(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Anything else an admin sends privately → 📤 repost it to group/channel."""
@@ -2853,6 +3208,37 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    elif d == "forward_sources":
+        if edit_get(u, "awaiting_custom"):
+            edit_pop(u, "awaiting_custom")
+        await q.answer()
+        return await q.edit_message_text(forward_sources_text(), parse_mode="HTML",
+                                         reply_markup=forward_sources_kb())
+
+    elif d == "fwd_src_help":
+        return await q.answer("Add the bot to that channel or group (as an admin), then send "
+                              "/forwardfrom inside it.", show_alert=True)
+
+    elif d == "fwd_src_toggle" or d == "fwd_src_use_channel" or d.startswith("fwd_src_del:"):
+        # ↪️ Forward-from menu: switch the relay, add the price channel, drop one
+        if d == "fwd_src_toggle":
+            await q.answer(f"↪️ Forward to group: {'ON' if toggle_channel_to_group() else 'OFF'}")
+        elif d == "fwd_src_use_channel":
+            added = add_forward_source(state.get("channel"), state.get("channel_title"), "channel")
+            await q.answer("📢 Forwarding from the price channel" if added else "Already selected")
+        else:
+            try:
+                source_id = int(d.split(":", 1)[1])
+            except (TypeError, ValueError):
+                return await q.answer("Bad request", show_alert=True)
+            dropped = remove_forward_source(source_id)
+            await q.answer("🗑 No longer forwarded from there" if dropped else "Already gone")
+        try:
+            return await q.edit_message_text(forward_sources_text(), parse_mode="HTML",
+                                             reply_markup=forward_sources_kb())
+        except Exception:                        # unchanged text — the answer said it already
+            pass
+
     elif d.startswith("fwd_undo:"):
         done = await undo_forward(u, c, d.split(":", 1)[1])
         await q.answer("🗑 Deleted" if done else "Already gone")
@@ -3441,10 +3827,21 @@ def register_handlers(app):
     app.add_handler(CommandHandler("start", start, filters=with_channel_posts))
     app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(CommandHandler("setchannel", setchannel, filters=with_channel_posts))
-    # Relay ordinary posts from the configured channel; setup commands above
+    # ↪️ pick the chats whose messages are relayed into the group
+    app.add_handler(CommandHandler(["forwardfrom", "setforward"], forwardfrom,
+                                   filters=with_channel_posts))
+    app.add_handler(CommandHandler(["stopforward", "unforward"], stopforward,
+                                   filters=with_channel_posts))
+    # Relay ordinary posts from the selected channels; setup commands above
     # stay in the channel and are never copied into the group.
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS & ~filters.COMMAND,
                                    on_channel_post))
+    # The same for a selected *group*: the filter matches only those chats, so
+    # the registered group keeps its 🛡 anti-scam handler (PTB calls only the
+    # first matching handler of a group).
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGES & ForwardSourceFilter()
+                                   & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+                                   on_source_message))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("preview", preview_cmd))
     app.add_handler(CommandHandler(["database", "db"], database_cmd))
@@ -3497,6 +3894,8 @@ def main():
     print(f"🚀 Bot running · {ASSET}/{FIAT} · every {INTERVAL}s · Ctrl+C to stop")
     print(f"   Admins: {', '.join(map(str, ADMINS))} · Group: {state['group'] or 'not set'} · Merchants: {len(state['merchants'])}")
     print(f"   Channel: {state['channel'] or 'not set'} · 📤 Auto-forward: {forward_label()}")
+    print(f"   ↪️ Forward to group: {'ON' if channel_to_group_enabled() else 'OFF'}"
+          f" · from: {forward_source_summary()}")
     print(f"   🛡 Anti-scam: {'ON' if captcha_enabled() else 'OFF'}"
           f" ({captcha_attempts()} attempts, {captcha_timeout()} min → {captcha_action()})")
     print(f"   State: {STORE.describe()}")

@@ -396,6 +396,8 @@ async def run_tick() -> dict:
         result["auto"] = bool(bot_module.state.get("auto"))
         result["group"] = bot_module.state.get("group")
         result["channel"] = bot_module.state.get("channel")
+        # ↪️ the chats whose messages are relayed into the group
+        result["forward_from"] = bot_module.forward_source_summary()
         result["merchants"] = len(bot_module.state.get("merchants") or {})
     result["state"] = state_status()
     return result
