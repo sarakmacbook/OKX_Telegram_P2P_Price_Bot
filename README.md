@@ -349,7 +349,7 @@ P2P profile by default**, where users can choose an ad themselves.
 | 🔗 **BUY / SELL link** | Optional custom URL — overrides the target for that side (`{AD_URL}`, `{AD_ID}`, `{PRICE}`, `{URL}`, `{NICK}`, … available) |
 | 🔗 **Ad link templates** | Edit the deep-link template of each exchange (Binance / Bybit / OKX / Bitget) |
 | 🖼 **Button icons** | Put a custom-emoji image (and a colour) in front of any button label — see below |
-| 🖼 **Post banner** | Post a photo with the prices in its caption — see below |
+| 🖼 **Post banner** | Post a photo **or a GIF** with the prices in its caption — see below |
 | ♻️ **Reset buttons to default** | Restore both Buy/Sell buttons and profile links, clear extras and overrides, and turn buttons ON; asks for confirmation if extras would be deleted |
 
 Defaults:
@@ -433,22 +433,29 @@ emoji do.
 > refuses the icons, the bot notices once, logs it, and keeps posting with plain buttons — a price
 > post is never lost because of a decoration.
 
-### 🖼 Post banner — a photo with the prices in its caption
+### 🖼 Post banner — a photo **or a GIF** with the prices in its caption
 
-**⚙️ Settings → 🖼 Post banner** puts a picture (your logo, a banner, a rate card) above the
-prices: the post is then sent as a **photo whose caption is the report**, with the buttons under
-it.
+**⚙️ Settings → 🖼 Post banner** puts a picture (your logo, a banner, a rate card — or an
+animated GIF) above the prices: the post is then sent as a **photo or animation whose caption is
+the report**, with the buttons under it.
 
-* **📤 Send a photo** — send it in the chat; the bot stores Telegram's `file_id` (no re-uploading
-  on every post).
-* **🔗 Use an image URL** — an `https://` JPG/PNG link instead.
+* **📤 Send a photo or GIF** — send it in the chat; the bot stores Telegram's `file_id` (no
+  re-uploading on every post). A GIF is posted with `sendAnimation`, so Telegram **plays it in
+  the post**; send it as a GIF or as a `.gif` file, both work.
+* **🔗 Use an image URL** — an `https://` JPG/PNG link instead (a link ending in `.gif` is posted
+  as an animation automatically).
+* **🎞 Use a GIF URL** — an `https://` GIF (or silent MP4) link, always posted as an animation.
 * **👁 Send a test** / **👁 Preview** — see exactly what the group will get.
 * **🗑 Remove banner** — back to a plain text post.
 
-Telegram caps a **photo caption at 1024 characters**, so a longer report is posted as a plain text
-message and the banner is skipped (logged, and the test tells you). A banner Telegram refuses
-(deleted file, dead URL) also falls back to the text post. Deleting the previous message
-(**🗑 Auto-delete prev**) and the `N`-hour auto-delete both cover the banner message too.
+Telegram caps a **caption at 1024 characters** (photo or animation alike), so a longer report is
+posted as a plain text message and the banner is skipped (logged, and the test tells you). A
+banner Telegram refuses (deleted file, dead URL) also falls back to the text post. Deleting the
+previous message (**🗑 Auto-delete prev**) and the `N`-hour auto-delete both cover the banner
+message too.
+
+> 🎞 Switching a photo banner for a GIF (or back) counts as a change, so the next price post goes
+> out again even if the prices have not moved.
 
 ### 👤 Buy/Sell buttons open the **merchant profile**
 
@@ -589,7 +596,7 @@ is reposted to your group / channel — text, photo, video, sticker, file, voice
 | `OFF` | Nothing is reposted — the bot only answers your menus again |
 
 Not forwarded: **commands** (`/start`, `/cancel`, …), answers the bot asked for
-(a banner photo, a button label, an edited header…) and **merchant URLs**, which are
+(a banner photo or GIF, a button label, an edited header…) and **merchant URLs**, which are
 still added as merchants.
 
 > 📋 An **album** (several photos sent as one message) is reposted photo by photo;

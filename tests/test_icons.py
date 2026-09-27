@@ -407,6 +407,7 @@ def test_the_banner_url_flow_validates_and_saves(bot):
 def test_the_banner_screen_shows_the_state_and_its_actions(bot):
     assert "none" in bot.banner_text()
     assert [b.callback_data for b in _buttons(bot.banner_kb())] == ["banner_send", "banner_url",
+                                                                    "banner_gif_url",
                                                                     "button_icons", "preview",
                                                                     "settings"]
 
@@ -414,6 +415,7 @@ def test_the_banner_screen_shows_the_state_and_its_actions(bot):
     callbacks = [b.callback_data for b in _buttons(bot.banner_kb())]
     assert "banner_test" in callbacks and "banner_clear" in callbacks
     assert "caption" in bot.banner_text() and "1024" in bot.banner_text()
+    assert "photo" in bot.banner_text()        # a still picture, not a GIF
 
 
 def test_removing_the_banner_clears_it(bot):
@@ -423,6 +425,126 @@ def test_removing_the_banner_clears_it(bot):
     asyncio.run(bot.on_button(update, SimpleNamespace()))
 
     assert bot.post_banner() == ""
+
+
+# ── GIF banners ───────────────────────────────────────────────────────────
+def _media_update(**attrs):
+    """A private admin message carrying the given media attribute."""
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=424242),
+                             effective_chat=SimpleNamespace(type="private", id=424242),
+                             message=_message())
+    update.message.message_id = 10                     # 📤 forwarding needs it
+    for key, value in attrs.items():
+        setattr(update.message, key, value)
+    return update
+
+
+def _repost_context():
+    """A context whose copy_message succeeds, so a 📤 repost can be asserted."""
+    return SimpleNamespace(bot=SimpleNamespace(
+        copy_message=AsyncMock(return_value=SimpleNamespace(message_id=5)),
+        forward_message=AsyncMock(return_value=SimpleNamespace(message_id=5))))
+
+
+def test_only_a_photo_or_an_animation_is_a_banner_kind(bot):
+    assert bot.clean_banner_kind("animation") == "animation"
+    assert bot.clean_banner_kind("PHOTO ") == "photo"
+    assert bot.clean_banner_kind("video") == "photo"          # unknown → the safe default
+    assert bot.clean_banner_kind(None) == "photo"
+    assert bot.banner_kind() == "photo"                       # a fresh install posts photos
+
+
+def test_a_gif_sent_as_an_animation_becomes_the_banner(bot):
+    update = _media_update(animation=SimpleNamespace(file_id="CgACAgIAAxkBAAIBnGif"))
+    bot.edit_set(update, "awaiting_custom", "banner_media")
+
+    asyncio.run(bot.on_animation(update, SimpleNamespace()))
+
+    assert bot.post_banner() == "CgACAgIAAxkBAAIBnGif"
+    assert bot.banner_kind() == "animation"
+    assert bot.edit_get(update, "awaiting_custom") is None
+    assert "Banner saved" in update.message.reply_html.await_args.args[0]
+    assert "GIF" in bot.banner_text()                  # the screen says what is saved
+
+
+def test_a_gif_sent_as_a_file_becomes_the_banner(bot):
+    update = _media_update(document=SimpleNamespace(file_id="BQACAgIAAxkBAAIBnGif",
+                                                    mime_type="image/gif", file_name="rates.gif"))
+    bot.edit_set(update, "awaiting_custom", "banner_media")
+
+    asyncio.run(bot.on_animation(update, SimpleNamespace()))
+
+    assert bot.post_banner() == "BQACAgIAAxkBAAIBnGif"
+    assert bot.banner_kind() == "animation"
+
+
+def test_a_photo_is_still_saved_as_a_photo_banner(bot):
+    update = _media_update(photo=[SimpleNamespace(file_id="AgACAgIAAxkBAAICbig")])
+    bot.edit_set(update, "awaiting_custom", "banner_media")
+
+    asyncio.run(bot.on_photo(update, SimpleNamespace()))
+
+    assert bot.post_banner() == "AgACAgIAAxkBAAICbig"
+    assert bot.banner_kind() == "photo"
+
+
+def test_a_gif_nobody_asked_for_is_reposted_instead(bot):
+    bot.state["group"] = -100123                       # 📤 forwarding is on by default
+    update = _media_update(animation=SimpleNamespace(file_id="CgACAgIAAxkBAAIBnGif"))
+    context = _repost_context()
+
+    asyncio.run(bot.on_animation(update, context))
+
+    assert bot.post_banner() == ""
+    context.bot.copy_message.assert_awaited_once()
+
+
+def test_a_gif_url_is_saved_as_an_animation(bot):
+    update = _media_update(text="https://cdn.example.com/rates")
+    bot.edit_set(update, "awaiting_custom", "banner_gif_url")
+
+    asyncio.run(bot.on_text(update, SimpleNamespace()))
+
+    assert bot.post_banner() == "https://cdn.example.com/rates"
+    assert bot.banner_kind() == "animation"
+    assert bot.edit_get(update, "awaiting_custom") is None
+
+
+def test_an_image_url_ending_in_gif_is_an_animation_too(bot):
+    update = _media_update(text="https://cdn.example.com/rates.gif?raw=1")
+    bot.edit_set(update, "awaiting_custom", "banner_url")
+
+    asyncio.run(bot.on_text(update, SimpleNamespace()))
+
+    assert bot.banner_kind() == "animation"
+
+
+def test_an_ordinary_image_url_stays_a_photo(bot):
+    update = _media_update(text="https://cdn.example.com/logo.png")
+    bot.edit_set(update, "awaiting_custom", "banner_url")
+
+    asyncio.run(bot.on_text(update, SimpleNamespace()))
+
+    assert bot.banner_kind() == "photo"
+
+
+def test_removing_a_gif_banner_clears_the_kind_too(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation")
+    update, _ = _admin_update("banner_clear")
+
+    asyncio.run(bot.on_button(update, SimpleNamespace()))
+
+    assert bot.post_banner() == "" and bot.banner_kind() == "photo"
+
+
+def test_a_gif_banner_and_a_garbage_kind_are_sanitised_on_load(bot, monkeypatch):
+    monkeypatch.setattr(bot.STORE, "load", lambda: {
+        "settings": {"post_photo": "CgACAgIAAxkBAAIBnGif", "post_photo_kind": "animation"}})
+    assert bot.load()["settings"]["post_photo_kind"] == "animation"
+
+    monkeypatch.setattr(bot.STORE, "load", lambda: {
+        "settings": {"post_photo": "CgACAgIAAxkBAAIBnGif", "post_photo_kind": "video"}})
+    assert bot.load()["settings"]["post_photo_kind"] == "photo"
 
 
 # ── sending: banner photo vs. caption limit ────────────────────────────────
@@ -437,6 +559,13 @@ class _FakeBot:
             raise RuntimeError("Bad Request: photo not found")
         self.calls.append(("photo", chat_id, kwargs))
         return SimpleNamespace(message_id=7, photo=[object()], caption=kwargs.get("caption"))
+
+    async def send_animation(self, chat_id, **kwargs):
+        if self.fail_photo:
+            raise RuntimeError("Bad Request: animation not found")
+        self.calls.append(("animation", chat_id, kwargs))
+        return SimpleNamespace(message_id=7, photo=None, animation=object(),
+                               caption=kwargs.get("caption"))
 
     async def send_message(self, chat_id, text, **kwargs):
         self.calls.append(("text", chat_id, {"text": text, **kwargs}))
@@ -473,6 +602,50 @@ def test_a_banner_telegram_refuses_falls_back_to_text(bot):
     asyncio.run(bot.send_report(fake, -100123, "short report", "KB"))
 
     assert [call[0] for call in fake.calls] == ["text"]
+
+
+def test_a_gif_banner_is_posted_as_an_animation(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation")
+    fake = _FakeBot()
+
+    asyncio.run(bot.send_report(fake, -100123, "📊 P2P USDT/USD\n🔴 0.999", "KB"))
+
+    kind, chat_id, kwargs = fake.calls[0]
+    assert (kind, chat_id) == ("animation", -100123)
+    assert kwargs["animation"] == "CgACAgIAAxkBAAIBnGif"
+    assert kwargs["caption"].startswith("📊 P2P")
+    assert kwargs["parse_mode"] == "HTML" and kwargs["reply_markup"] == "KB"
+
+
+def test_a_gif_banner_telegram_refuses_falls_back_to_text(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation")
+    fake = _FakeBot(fail_photo=True)
+
+    asyncio.run(bot.send_report(fake, -100123, "short report", "KB"))
+
+    assert [call[0] for call in fake.calls] == ["text"]
+
+
+def test_a_gif_report_longer_than_a_caption_drops_the_gif(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation")
+    fake = _FakeBot()
+    long_report = "x" * (bot.CAPTION_LIMIT + 1)
+
+    asyncio.run(bot.send_report(fake, -100123, long_report, "KB"))
+
+    assert fake.calls[0][0] == "text"
+
+
+def test_the_banner_test_recognises_a_gif(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation")
+    fake = _FakeBot()
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=424242),
+                             effective_chat=SimpleNamespace(type="private", id=424242))
+
+    asyncio.run(bot.banner_test(update, SimpleNamespace(bot=fake)))
+
+    assert [call[0] for call in fake.calls] == ["animation", "text"]
+    assert "your banner" in fake.calls[-1][2]["text"]
 
 
 def test_without_a_banner_nothing_changes(bot):
@@ -538,6 +711,23 @@ def test_the_banner_is_in_the_change_snapshot(bot, merchant, prices, monkeypatch
     assert asyncio.run(bot.post(fake)) is False               # unchanged
     bot.state["settings"]["post_photo"] = "AgACAgIAAxkBAAICbig"
     assert asyncio.run(bot.post(fake)) is True
+
+
+def test_swapping_a_photo_banner_for_a_gif_reposts(bot, merchant, prices, monkeypatch):
+    """The prices did not move, but the post looks different — so it goes out again."""
+    bot.state["merchants"][merchant.key] = merchant.__dict__
+    bot.state["group"] = -100123
+    monkeypatch.setattr(bot, "get_prices", AsyncMock(return_value=prices))
+    fake = _FakeBot()
+    fake.delete_message = AsyncMock()
+
+    bot.set_banner("AgACAgIAAxkBAAICbig", "photo")
+    assert asyncio.run(bot.post(fake)) is True
+    assert asyncio.run(bot.post(fake)) is False               # unchanged
+
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation")
+    assert asyncio.run(bot.post(fake)) is True
+    assert fake.calls[-1][0] == "animation"
 
 
 def test_the_preview_button_shows_the_banner_too(bot, merchant, prices, monkeypatch):
