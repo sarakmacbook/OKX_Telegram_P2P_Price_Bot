@@ -211,3 +211,96 @@ def test_the_startchannel_deep_link_registers_the_channel(router):
         "entities": [{"type": "bot_command", "offset": 0, "length": 6}]}})
 
     assert router.bot.state["channel"] == CHANNEL
+
+
+# ── ↪️ forwarding from a chat the admin picked ──────────────────────────────
+NEWS, SIGNALS = -100555, -100777
+
+
+def _chat_message(chat_id, chat_type, text=None, message_id=11, user_id=NEWCOMER,
+                  command=False, **media):
+    """An ordinary message in any group/channel — the ↪️ relay input."""
+    payload = {"message_id": message_id, "date": 0, "text": text,
+               "chat": {"id": chat_id, "type": chat_type, "title": "Source"},
+               "from": {"id": user_id, "is_bot": False, "first_name": "Sam"}, **media}
+    if command:
+        payload["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
+    key = "channel_post" if chat_type == "channel" else "message"
+    if chat_type == "channel":
+        payload.pop("from")               # a channel post has no sender
+    return {"update_id": 6, key: payload}
+
+
+def test_a_message_in_a_selected_group_is_relayed_into_the_group(router):
+    router.bot.add_forward_source(SIGNALS, "Signals", "supergroup")
+
+    calls = router.send(_chat_message(SIGNALS, "supergroup", "buy now"))
+
+    calls["forward_message"].assert_awaited_once_with(
+        chat_id=GROUP, from_chat_id=SIGNALS, message_id=11)
+
+
+def test_a_photo_in_a_selected_group_is_relayed_and_not_read_as_a_banner(router):
+    router.bot.add_forward_source(SIGNALS, "Signals", "supergroup")
+
+    calls = router.send(_chat_message(SIGNALS, "supergroup", message_id=12, photo=[
+        {"file_id": "AgACAgIAAxkBAAICbig", "file_unique_id": "u3", "width": 1, "height": 1}]))
+
+    calls["forward_message"].assert_awaited_once()
+    assert router.bot.post_banner() == ""
+
+
+def test_only_the_selected_chats_are_relayed(router):
+    router.bot.add_forward_source(SIGNALS, "Signals", "supergroup")
+
+    calls = router.send(_chat_message(NEWS, "supergroup", "unselected chat"))
+
+    calls["forward_message"].assert_not_awaited()
+    calls["copy_message"].assert_not_awaited()
+
+
+def test_commands_in_a_selected_group_stay_there(router):
+    router.bot.add_forward_source(SIGNALS, "Signals", "supergroup")
+
+    calls = router.send(_chat_message(SIGNALS, "supergroup", "/forwardfrom", command=True))
+
+    assert router.bot.source_selected(SIGNALS) is True      # it registered the chat…
+    calls["forward_message"].assert_not_awaited()           # …and was not relayed
+
+
+def test_the_registered_group_keeps_its_anti_scam_handler(router):
+    """Selecting the destination group must not steal its messages."""
+    router.bot.add_forward_source(GROUP, "Rates", "supergroup")
+    router.send(_join())
+    record = router.bot.pending_captcha(GROUP, NEWCOMER)
+
+    calls = router.send(_group(record["word"]))
+
+    assert router.bot.pending_captcha(GROUP, NEWCOMER) is None   # the 🛡 handler answered
+    calls["forward_message"].assert_not_awaited()
+
+
+def test_the_bot_does_not_relay_its_own_confirmation(router):
+    """The ✅ answer inside a source chat is not echoed into the group."""
+    calls = router.send(_chat_message(NEWS, "channel", "/forwardfrom", command=True))
+
+    assert router.bot.source_selected(NEWS) is True
+    # the stubbed Telegram call answered "message_id=42" — that is the ✅ the bot
+    # posted into the channel it now relays from
+    assert router.bot.is_own_message(NEWS, 42) is True
+    calls = router.send(_chat_message(NEWS, "channel", "✅ New messages …", message_id=42))
+
+    calls["forward_message"].assert_not_awaited()
+
+    calls = router.send(_chat_message(NEWS, "channel", "a real post", message_id=43))
+    calls["forward_message"].assert_awaited_once_with(
+        chat_id=GROUP, from_chat_id=NEWS, message_id=43)
+
+
+def test_a_message_in_a_selected_channel_is_relayed(router):
+    router.bot.add_forward_source(NEWS, "News", "channel")
+
+    calls = router.send(_chat_message(NEWS, "channel", "channel announcement", message_id=13))
+
+    calls["forward_message"].assert_awaited_once_with(
+        chat_id=GROUP, from_chat_id=NEWS, message_id=13)

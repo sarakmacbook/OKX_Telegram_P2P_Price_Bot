@@ -81,6 +81,9 @@ async def _status(request: Request) -> Response:
         "environment": env("VERCEL_ENV") or None,
         "group": bot_module.state.get("group"),
         "group_title": bot_module.state.get("group_title") or None,
+        # ↪️ which chats are relayed into the group, and whether that is on
+        "forward_from": bot_module.forward_source_summary(),
+        "forwarding": bot_module.channel_to_group_enabled(),
         "merchants": len(bot_module.state.get("merchants") or {}),
         "auto_posting": bool(bot_module.state.get("auto")),
         "state": state_status(),
@@ -193,6 +196,8 @@ def _status_page(data: dict) -> str:
         ("Database detected", (data.get("database") or {}).get("where")
                               or "none found — connect a KV/Redis store"),
         ("Group", data.get("group_title") or data.get("group") or "not set"),
+        ("↪️ Forward to group", f"{data.get('forward_from')} — "
+                                f"{'ON' if data.get('forwarding') else 'OFF'}"),
         ("Merchants", data.get("merchants")),
         ("Auto posting", data.get("auto_posting")),
     ]

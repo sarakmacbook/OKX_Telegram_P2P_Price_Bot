@@ -273,7 +273,8 @@ docker compose up -d --build
 4. Tap **🟢 Auto: ON** — prices are posted whenever they change.
 5. Optional: **📢 Set channel** to post into a channel too. New posts from that
    channel are also auto-forwarded into the configured group by default; toggle
-   this with **⚙️ Settings → ↪️ Channel → group**. Check **🛡 Anti-scam** so
+   this with **⚙️ Settings → ↪️ Channel → group**, and pick *which* channels or
+   groups to forward from in **⚙️ Settings → ↪️ Forward from**. Check **🛡 Anti-scam** so
    newcomers have to type a random word before they can post.
 
 ### Panel buttons
@@ -286,7 +287,7 @@ docker compose up -d --build
 | 👥 **Set group** | One click: choose the group that receives updates |
 | 📢 **Set channel** | One click: add the bot to a channel and post the prices there too |
 | 🛡 **Anti-scam** | Mute newcomers until they type a random word — see [🛡 Anti-scam verification](#-anti-scam-verification) |
-| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup**, **📤 private-message forwarding**, **↪️ channel-to-group forwarding**, **🖼 button icons & post banner** |
+| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup**, **📤 private-message forwarding**, **↪️ forwarding into the group + which chats to forward from**, **🖼 button icons & post banner** |
 | 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
 | 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer |
 | 👁 **Preview** | See exactly how the group post will look |
@@ -532,14 +533,35 @@ you want a public rate channel and a discussion group.
 | Removing | Remove the bot from a chat and it is unset automatically. |
 | Permissions | In a channel the bot must be an **admin** with the right to post and delete messages. |
 
-### ↪️ Forward channel posts into the group
+### ↪️ Forward posts into the group — you pick from where
 
-When both a group and channel are configured, new posts in that channel are
-forwarded into the group by default. This is separate from the private-chat
-**📤 Auto-forward** option above. Toggle it in **⚙️ Settings → ↪️ Channel → group**.
-The bot must remain an **administrator in the source channel** so Telegram sends
-it channel-post updates, and it must be able to send messages in the group.
-Bot-generated price reports are not echoed back into the group.
+New messages in the chats **you select** are forwarded into your group. This is
+separate from the private-chat **📤 Auto-forward** option below.
+
+| | |
+|---|---|
+| Switch | **⚙️ Settings → ↪️ Channel → group** (ON by default) |
+| Pick the chats | **⚙️ Settings → ↪️ Forward from** — lists every selected chat, tap one to remove it (up to 10) |
+| Default | Nothing selected → the **configured price channel** is relayed, which is what the bot did before this option existed |
+| Add a channel | **📢 Add a channel** in that menu (a deep link that adds the bot as an admin), or send `/forwardfrom` inside the channel |
+| Add a group | **👥 Add a group** in that menu, or send `/forwardfrom` inside the group |
+| Stop | `/stopforward` inside that chat, or tap it in the menu |
+| One tap | **📢 Use the price channel** adds the channel the prices go to |
+
+Requirements — the bot has to be able to **read** the source chat and **write** to
+the group:
+
+- In a **channel** the bot must be an **administrator**: Telegram only sends
+  channel posts to admins.
+- In a **group** the bot must be an **admin** as well, *or* privacy mode must be
+  off (@BotFather → `/setprivacy` → **Disable**) — otherwise it never sees the
+  messages it should relay.
+- The **destination group itself** cannot be a source (its messages stay with the
+  🛡 anti-scam handler), and the relay can be turned off without losing the list.
+
+Never relayed: **commands** (`/forwardfrom`, `/setchannel`, …), the bot's **own
+price reports** and its **“✅ forwarding from here”** confirmations — so nothing
+is echoed back into the group.
 
 ---
 
@@ -706,8 +728,8 @@ python -m pytest tests -q
 ```
 
 The suite covers the ad-link templates, the Buy/Sell button targets, clickable prices, the
-group/channel destinations, 📤 auto-forward, the 🛡 anti-scam check and the state backends —
-no Telegram calls are made.
+group/channel destinations, 📤 auto-forward, the ↪️ forward-source selection, the 🛡 anti-scam
+check and the state backends — no Telegram calls are made.
 
 ---
 
