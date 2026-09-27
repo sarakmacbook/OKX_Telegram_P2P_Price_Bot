@@ -298,6 +298,8 @@ DEFAULT_SETTINGS = {
     "post_photo": "",              # banner for the group post: file_id or https URL
     # ── reposting what the admin sends in the private chat ──
     "forward_target": "group",     # "off" | "group" | "channel" | "both"
+    # ── reposting new posts from the configured channel into the group ──
+    "channel_to_group": True,
     # ── anti-scam verification for new members ──
     "captcha_enabled": True,       # mute new members until they type a random word
     "captcha_message": "",         # empty = DEFAULT_CAPTCHA_MESSAGE
@@ -553,6 +555,16 @@ def forward_target() -> str:
     target = get_settings().get("forward_target")
     return target if target in FORWARD_TARGETS else DEFAULT_SETTINGS["forward_target"]
 
+def channel_to_group_enabled() -> bool:
+    value = get_settings().get("channel_to_group")
+    return value if isinstance(value, bool) else DEFAULT_SETTINGS["channel_to_group"]
+
+def toggle_channel_to_group() -> bool:
+    enabled = not channel_to_group_enabled()
+    state["settings"]["channel_to_group"] = enabled
+    save()
+    return enabled
+
 def cycle_forward_target() -> str:
     """📤 Auto-forward button: group → channel → both → off."""
     order = ("group", "channel", "both", "off")
@@ -753,6 +765,8 @@ def load():
     # ── destinations, auto-forward and the anti-scam check ──
     if data["settings"].get("forward_target") not in FORWARD_TARGETS:
         data["settings"]["forward_target"] = DEFAULT_SETTINGS["forward_target"]
+    if not isinstance(data["settings"].get("channel_to_group"), bool):
+        data["settings"]["channel_to_group"] = DEFAULT_SETTINGS["channel_to_group"]
     data["settings"]["captcha_message"] = clean_captcha_message(data["settings"].get("captcha_message"))
     data["settings"]["captcha_attempts"] = _clean_choice(
         data["settings"].get("captcha_attempts"),
@@ -1047,6 +1061,8 @@ def settings_kb():
          B("🖼 Post banner", callback_data="banner_menu")],
         [set_channel_button(), B("🛡 Anti-scam", callback_data="antiscam")],
         [B(f"📤 Auto-forward: {forward_label()}", callback_data="toggle_forward_target")],
+        [B(f"↪️ Channel → group: {'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}",
+           callback_data="toggle_channel_to_group")],
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="panel")]
     ])
 
@@ -1512,7 +1528,8 @@ def panel_text():
         f"💧 Liquidity: <b>{liq}</b> · 🔘 Buttons: <b>{btns}</b> · 🗑 AutoDel: <b>{autodel}</b>\n"
         f"🔄 Btn order: <b>{order_label()}</b> · 🎯 Links: <b>{'EXACT AD' if link_mode() == 'ad' else 'PROFILE'}</b>\n"
         f"🚪 Del Join/Left msgs: <b>{joinleft}</b>\n"
-        f"📤 Auto-forward: <b>{forward_label()}</b> · 🛡 Verification: "
+        f"📤 Auto-forward: <b>{forward_label()}</b> · ↪️ Channel → group: "
+        f"<b>{'ON' if channel_to_group_enabled() else 'OFF'}</b> · 🛡 Verification: "
         f"<b>{'ON' if captcha_enabled() else 'OFF'}</b>"
         f"{f' ({pending} waiting' + (f', {locked} for you' if locked else '') + ')' if pending or locked else ''}\n"
         f"📝 Header: <code>{header_short}</code>\n"
@@ -1568,6 +1585,9 @@ def settings_text():
         f"   Anything you send here (text, photo, video, sticker, file…) is reposted\n"
         f"   to that chat, with a 🗑 Undo button. Tap it to cycle:\n"
         f"   GROUP → CHANNEL → GROUP + CHANNEL → OFF.\n\n"
+        f"↪️ Channel → group: <b>{'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}</b>\n"
+        f"   New posts in the configured channel are forwarded into the configured group.\n"
+        f"   The bot must be an admin in the channel and able to send messages in the group.\n\n"
         f"🛡 Anti-scam verification: <b>{'ON ✅' if captcha_enabled() else 'OFF ❌'}</b>\n"
         f"   New members must type a random word before they can post links or media\n"
         f"   ({captcha_attempts()} attempts, {captcha_timeout()} min, then "
@@ -2000,6 +2020,39 @@ async def forward_to_targets(u, c) -> bool:
                          reply_markup=KB([[B("🗑 Undo", callback_data=f"fwd_undo:{token}")]]))
     log.info("Forwarded message %s from admin %s to %s", msg.message_id, u.effective_user.id, names)
     return True
+
+async def on_channel_post(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Forward each new post in the configured source channel into the group."""
+    msg, chat = message_of(u), u.effective_chat
+    if (not msg or not chat or chat.type != "channel"
+            or chat.id != state.get("channel")
+            or not state.get("group")
+            or not channel_to_group_enabled()):
+        return False
+    # Don't echo the bot's own latest scheduled price report back into the group;
+    # that report was already posted directly to the group by the normal job.
+    if msg.message_id == state.get("channel_last_msg_id"):
+        return False
+    try:
+        forwarded = await c.bot.forward_message(
+            chat_id=state["group"], from_chat_id=chat.id, message_id=msg.message_id)
+        log.info("Forwarded channel post %s from %s to group %s",
+                 msg.message_id, chat.id, state["group"])
+        return True
+    except Exception as forward_error:
+        # Copy is a useful fallback for content Telegram permits copying but not
+        # forwarding. Protected channel content is rejected by both API methods.
+        try:
+            await c.bot.copy_message(chat_id=state["group"], from_chat_id=chat.id,
+                                     message_id=msg.message_id)
+            log.info("Copied channel post %s from %s to group %s after forward failed",
+                     msg.message_id, chat.id, state["group"])
+            return True
+        except Exception as copy_error:
+            log.warning("Could not forward channel post %s from %s to group %s: "
+                        "forward failed (%s); copy failed (%s)",
+                        msg.message_id, chat.id, state["group"], forward_error, copy_error)
+            return False
 
 async def on_private_media(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Anything else an admin sends privately → 📤 repost it to group/channel."""
@@ -2792,6 +2845,14 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    elif d == "toggle_channel_to_group":
+        enabled = toggle_channel_to_group()
+        await q.answer(f"↪️ Channel → group: {'ON' if enabled else 'OFF'}")
+        try:
+            return await q.edit_message_text(settings_text(), parse_mode="HTML", reply_markup=settings_kb())
+        except Exception:
+            pass
+
     elif d.startswith("fwd_undo:"):
         done = await undo_forward(u, c, d.split(":", 1)[1])
         await q.answer("🗑 Deleted" if done else "Already gone")
@@ -3380,6 +3441,10 @@ def register_handlers(app):
     app.add_handler(CommandHandler("start", start, filters=with_channel_posts))
     app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(CommandHandler("setchannel", setchannel, filters=with_channel_posts))
+    # Relay ordinary posts from the configured channel; setup commands above
+    # stay in the channel and are never copied into the group.
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS & ~filters.COMMAND,
+                                   on_channel_post))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("preview", preview_cmd))
     app.add_handler(CommandHandler(["database", "db"], database_cmd))

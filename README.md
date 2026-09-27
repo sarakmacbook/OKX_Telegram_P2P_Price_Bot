@@ -271,8 +271,10 @@ docker compose up -d --build
    - `https://www.okx.com/p2p/ads-merchant?publicUserId=…`
    - `https://www.bitget.com/p2p/merchant/…`
 4. Tap **🟢 Auto: ON** — prices are posted whenever they change.
-5. Optional: **📢 Set channel** to post into a channel too, and check **🛡 Anti-scam**
-   so newcomers have to type a random word before they can post.
+5. Optional: **📢 Set channel** to post into a channel too. New posts from that
+   channel are also auto-forwarded into the configured group by default; toggle
+   this with **⚙️ Settings → ↪️ Channel → group**. Check **🛡 Anti-scam** so
+   newcomers have to type a random word before they can post.
 
 ### Panel buttons
 
@@ -284,7 +286,7 @@ docker compose up -d --build
 | 👥 **Set group** | One click: choose the group that receives updates |
 | 📢 **Set channel** | One click: add the bot to a channel and post the prices there too |
 | 🛡 **Anti-scam** | Mute newcomers until they type a random word — see [🛡 Anti-scam verification](#-anti-scam-verification) |
-| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup**, **📤 auto-forward**, **🖼 button icons & post banner** |
+| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup**, **📤 private-message forwarding**, **↪️ channel-to-group forwarding**, **🖼 button icons & post banner** |
 | 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
 | 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer |
 | 👁 **Preview** | See exactly how the group post will look |
@@ -529,6 +531,15 @@ you want a public rate channel and a discussion group.
 | Adding later | Setting a channel does **not** repost to the group; only the new chat gets a post. |
 | Removing | Remove the bot from a chat and it is unset automatically. |
 | Permissions | In a channel the bot must be an **admin** with the right to post and delete messages. |
+
+### ↪️ Forward channel posts into the group
+
+When both a group and channel are configured, new posts in that channel are
+forwarded into the group by default. This is separate from the private-chat
+**📤 Auto-forward** option above. Toggle it in **⚙️ Settings → ↪️ Channel → group**.
+The bot must remain an **administrator in the source channel** so Telegram sends
+it channel-post updates, and it must be able to send messages in the group.
+Bot-generated price reports are not echoed back into the group.
 
 ---
 
