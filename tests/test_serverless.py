@@ -698,6 +698,38 @@ def test_page_escapes_link_urls(serverless):
     assert "&quot;&gt;" in text
 
 
+def test_status_page_says_where_the_database_was_detected(serverless, webhook, monkeypatch):
+    """The status page answers "do I have a database?" with where it found one."""
+    monkeypatch.setenv("KV_REST_API_URL", "https://kv.example")
+    monkeypatch.setenv("KV_REST_API_TOKEN", "token")
+    serverless.reset_database_detection()
+
+    text = webhook._status_page({"state": {"backend": "redis", "persistent": True,
+                                           "detail": "redis (kv.example, key p2p)"},
+                                 "database": serverless.detect_database()})
+    serverless.reset_database_detection()
+
+    assert "Database detected" in text
+    assert "Vercel KV / Upstash" in text
+
+
+def test_status_json_carries_the_database_detection_too(serverless, webhook, monkeypatch):
+    """Scripts reading the diagnostics see the same detection the page shows."""
+    monkeypatch.setenv("KV_REST_API_URL", "https://kv.example")
+    monkeypatch.setenv("KV_REST_API_TOKEN", "token")
+    serverless.reset_database_detection()
+    monkeypatch.setattr(webhook, "ensure_webhook",
+                        Recorder(result={"url": "", "pending_updates": 0}))
+
+    status, data = asgi_json(webhook.app, method="GET", params={"register": "0"})
+    serverless.reset_database_detection()
+
+    assert status == 200
+    assert data["database"]["found"] is True
+    assert data["database"]["source"] == "environment"
+    assert "kv.example" not in json.dumps(data), "the URL itself is never published"
+
+
 def test_status_json_carries_the_database_link_too(serverless, webhook, monkeypatch):
     """Scripts polling the status endpoint get the link, not only browsers."""
     monkeypatch.setattr(webhook, "ensure_webhook",

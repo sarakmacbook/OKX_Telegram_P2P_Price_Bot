@@ -91,6 +91,43 @@ set but which no longer answers (see §9). In both states there is nothing to
 protect and everything to repair, so the page that reports the problem is the
 page that fixes it.
 
+### The database step is skipped when a database is already there
+
+The setup page does not guess from the environment alone: it **detects** the
+database before it asks for one, and skips the step — and the "How to insert the
+database" guide — the moment it finds one. It looks in two places, in this
+order:
+
+| # | Where it looks | What it answers |
+|---|---|---|
+| 1 | **This deployment's environment** — a complete `KV_REST_API_URL` + `KV_REST_API_TOKEN` pair (or the Upstash/Redis aliases) | *"already connected — the bot is using it"* — nothing to enter, nothing to redeploy |
+| 2 | **Vercel itself** — `GET /v1/storage/stores` for this project, then the project's environment-variable *names* (values are never fetched) | *"connected to this project, but the credentials have not reached this deployment yet"* |
+
+Case 2 is the one that used to send owners off to create a second database: the
+store **is** connected, only the environment variables are missing because they
+only land on the **next** deployment. The page says exactly that — press
+**Connect to this project** again in *Vercel → Storage*, then **Redeploy** — and
+it names the store it found, so you can see the step was skipped for a reason.
+
+The Vercel look-up is read-only, cached for five minutes, and **best effort**:
+
+* it needs `VERCEL_PROJECT_ID` (Vercel exposes it when *System Environment
+  Variables* are enabled) **and** a credential — `VERCEL_TOKEN` (or
+  `P2P_VERCEL_TOKEN`), which you add yourself;
+* with neither, no call is made at all and the page simply says it could not
+  check, instead of pretending nothing is connected;
+* a refused token, an offline host or an API error is reported in the checklist
+  and in `GET /api/setup` JSON (`status.database.error`) — never raised.
+
+Nothing secret is ever part of the answer: the detection returns the store
+**name**, the provider and where it was found. The checklist and the diagnostics
+JSON show `status.database` (`found`, `wired`, `source`, `where`, `skipped`), and
+the status page has a **Database detected** row.
+
+> 🔁 A database that is *detected but no longer answers* is not skipped — that is
+> the outage the checklist reports as **Not responding**, and the page keeps the
+> form and the guide open so it can be repaired (see §9).
+
 ## 2. Deploy
 
 ### Option 1 — the dashboard
@@ -217,6 +254,8 @@ in its answer) — anyone who knows the URL could then trigger a post, so set it
 | `P2P_STATE_KEY` | – | key the state lives under (default `p2p-price-bot:state`) |
 | `P2P_DATABASE_LINK` | – | destination of the **🔌 Connect database** link the bot (`/database`, the panel, ⚙️ Settings) and the setup/status pages show when no KV store is connected. Default `https://vercel.com/dashboard/stores`; set it to your team's storage page, an Upstash console or your own Redis docs |
 | `SETUP_SECRET` | – (recommended) | locks the `/api/setup` form: every submission must carry it (form field, `?secret=`, or `Authorization: Bearer`). Without it the form is open while the deployment is unconfigured and closes once it is ready |
+| `VERCEL_TOKEN` (or `P2P_VERCEL_TOKEN`) | – | lets the setup page ask Vercel which database is already connected to the project, so the step can be skipped (needs `VERCEL_PROJECT_ID`, which Vercel exposes when *System Environment Variables* are enabled) |
+| `P2P_VERCEL_PROJECT_ID`, `P2P_VERCEL_TEAM_ID` | – | override the project/team the page asks about (defaults: `VERCEL_PROJECT_ID` / `VERCEL_PROJECT_NAME` and `VERCEL_TEAM_ID`) |
 | `P2P_CONFIG_KEY` | – | key the settings saved by the form / `setup_cli.py` live under (default `p2p-price-bot:config`) |
 | `P2P_RUNTIME_CONFIG_FILE` | – | file those settings live in when there is no Redis (default `runtime_config.json` next to the data file) |
 | `PUBLIC_URL` | – | public URL used to register the webhook; auto-detected from `VERCEL_PROJECT_PRODUCTION_URL`/`VERCEL_URL`, set it for a custom domain or if the page says it cannot tell |
