@@ -173,12 +173,14 @@ def test_every_menu_renders(bot, merchant, prices):
     bot.state["group_title"] = "My P2P group"
     for text in (bot.panel_text(), bot.settings_text(), bot.buttons_menu_text(),
                  bot.adlink_menu_text(), bot.custom_menu_text(), bot.database_text(),
-                 bot.button_icons_text(), bot.banner_text(), bot.icon_editor_text("🟢")):
+                 bot.button_icons_text(), bot.banner_text(), bot.icon_editor_text("🟢"),
+                 bot.antiscam_text(), bot.cleanup_text()):
         assert isinstance(text, str) and text.strip()
     for kb in (bot.panel(), bot.settings_kb(), bot.buttons_menu_kb(),
                bot.adlink_menu_kb(), bot.custom_menu_kb(), bot.list_kb(),
                bot.database_kb(), bot.button_icons_kb(), bot.banner_kb(),
-               bot.icon_editor_kb("🟢"), bot.report_keyboard(prices)):
+               bot.icon_editor_kb("🟢"), bot.report_keyboard(prices),
+               bot.antiscam_kb(), bot.cleanup_kb()):
         assert isinstance(kb, InlineKeyboardMarkup) and kb.inline_keyboard
     # the ad-link screen lists one editor per supported exchange
     callbacks = [b.callback_data for row in bot.adlink_menu_kb().inline_keyboard for b in row]

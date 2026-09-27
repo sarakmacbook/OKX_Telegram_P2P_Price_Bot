@@ -282,7 +282,7 @@ want that choice to survive every cold start.
 | `/api/setup` | `GET` | the first-start page: readiness checklist + a form for what is missing (rendered whether or not the bot can start, so it is also where you change a setting later) |
 | `/api/setup` | `POST` | stores the submitted settings (JSON or form-encoded) and applies them at once; 403 when the deployment is healthy and no authorization is sent, 400 with a readable reason when a value is wrong or Telegram rejects the token |
 | `/api/setup` | `POST` `action=send-link` | the 🔧 **Reconfigure** button: sends the admins a one-time link in Telegram that reopens the form (see §6) |
-| `/api/tick` | `GET` | one cron round: keep the webhook registered → post prices if they changed → delete stale group messages |
+| `/api/tick` | `GET` | one cron round: keep the webhook registered → post prices if they changed → delete stale group messages, expired 🛡 anti-scam checks and 🧹 group-cleanup warnings |
 | anything else | – | `404` (JSON) — the deployment is one catch-all function, so the router answers what the platform's 404 used to |
 
 ## 8. How it works under the hood

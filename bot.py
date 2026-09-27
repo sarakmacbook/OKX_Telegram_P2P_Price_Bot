@@ -283,6 +283,86 @@ MEMBER_PERMISSIONS = ChatPermissions(
     can_add_web_page_previews=True, can_invite_users=True,
 )
 
+# ── 🧹 group cleanup: remove join notices and every useless message ─────────
+# The group is a price board, not a chat room: "X joined the group" notices and
+# member spam push the price post off the screen.  Each rule below is its own
+# switch, so the admin chooses exactly how strict the group is — from "only the
+# join/left notices" (what the bot always did) to 🔇 strict, where an ordinary
+# member cannot leave anything standing at all.
+#
+# Three kinds of sender are *never* touched, whatever is switched on:
+#   • the bot itself (the price post, the 🛡 challenge, ↪️ relayed messages),
+#   • the bot's admins and the group's own administrators,
+#   • a member who is answering the 🛡 anti-scam check — that flow owns them.
+CLEANUP_RULES = (
+    ("delete_join_left", "🚪 Join/left notices",
+     "\"X joined the group\" and \"X left the group\" service messages"),
+    ("cleanup_service", "🧾 Other service notices",
+     "changed title/photo, pinned messages, invite links, video chats, topics"),
+    ("cleanup_links", "🔗 Links & @usernames",
+     "any message holding a URL, a t.me link or an @username"),
+    ("cleanup_media", "🖼 Media & stickers",
+     "stickers, GIFs, photos, videos, voice notes, audio and files"),
+    ("cleanup_forwards", "↩️ Forwarded messages",
+     "messages forwarded from another chat, channel or bot"),
+    ("cleanup_commands", "⌨️ Commands",
+     "\"/something\" typed by an ordinary member"),
+    ("cleanup_strict", "🔇 Strict: members post nothing",
+     "every message from an ordinary member is removed"),
+)
+CLEANUP_RULE_KEYS = tuple(key for key, _label, _about in CLEANUP_RULES)
+CLEANUP_RULE_LABELS = {key: label for key, label, _about in CLEANUP_RULES}
+CLEANUP_RULE_ABOUT = {key: about for key, _label, about in CLEANUP_RULES}
+# What the log, the admin DM and the group warning say about a removal.
+CLEANUP_REASONS = {
+    "delete_join_left": "it is a join/left notice",
+    "cleanup_service": "it is a Telegram service notice",
+    "cleanup_links": "it holds a link or an @username",
+    "cleanup_media": "it is media or a sticker",
+    "cleanup_forwards": "it was forwarded",
+    "cleanup_commands": "it is a command",
+    "cleanup_strict": "members cannot post in this group",
+}
+# The order the rules are tested (and reported) in — 🔇 strict says it best.
+CLEANUP_ORDER = ("cleanup_strict", "cleanup_service", "cleanup_links", "cleanup_media",
+                 "cleanup_forwards", "cleanup_commands")
+CLEANUP_NOTIFY = ("off", "group", "admin")
+CLEANUP_NOTIFY_TITLES = {"off": "silent 🤫",
+                         "group": "a short warning in the group 💬",
+                         "admin": "a private message to the admins 📩"}
+CLEANUP_NOTIFY_SHORT = {"off": "Silent", "group": "Warn", "admin": "Tell admins"}
+CLEANUP_NOTICE_SECONDS = 20        # how long a group warning stays visible
+CLEANUP_NOTICE_LIMIT = 10          # …and how many are remembered for the sweep
+CLEANUP_ADMIN_TTL = 600            # the group's admin list is read at most every 10 min
+CLEANUP_SKIP_LIMIT = 200           # message ids another handler already dealt with
+CLEANUP_MASTER_KEY = "cleanup_enabled"
+
+# Service messages other than join/leave: Telegram sets exactly one of these on
+# the message it posts into the chat, which makes them easy to recognise.
+SERVICE_MESSAGE_ATTRS = (
+    "new_chat_title", "new_chat_photo", "delete_chat_photo", "group_chat_created",
+    "supergroup_chat_created", "channel_chat_created", "pinned_message",
+    "message_auto_delete_timer_changed", "migrate_to_chat_id", "migrate_from_chat_id",
+    "video_chat_scheduled", "video_chat_started", "video_chat_ended",
+    "video_chat_participants_invited", "proximity_alert_triggered",
+    "forum_topic_created", "forum_topic_edited", "forum_topic_closed",
+    "forum_topic_reopened", "general_forum_topic_hidden", "general_forum_topic_unhidden",
+    "write_access_allowed", "chat_shared", "users_shared", "bot_allowed",
+    "chat_background_set", "boost_added", "giveaway_created", "giveaway",
+    "giveaway_winners", "giveaway_completed", "invoice", "successful_payment",
+    "refunded_payment",
+)
+# Anything of these makes a member's message "media" for the 🖼 rule.
+MEDIA_MESSAGE_ATTRS = (
+    "photo", "video", "animation", "document", "audio", "voice", "video_note",
+    "sticker", "contact", "location", "venue", "poll", "dice", "game",
+    "paid_media",
+)
+# Entity types that mean the message carries a link or points at another user.
+LINK_ENTITY_TYPES = ("url", "text_link", "mention")
+LINK_PATTERN = re.compile(
+    r"(?:https?://|www\.|t\.me/|(?:^|[\s(<\[])[@][A-Za-z][A-Za-z0-9_]{3,})", re.IGNORECASE)
+
 DEFAULT_SETTINGS = {
     "show_liquidity": False,
     "show_buttons": True,
@@ -292,6 +372,17 @@ DEFAULT_SETTINGS = {
     "auto_delete": True,  # delete previous group message on new post
     "delete_after_hours": 24,  # auto delete after 24h
     "delete_join_left": True,  # delete Telegram "X joined/left the group" service messages
+    # ── 🧹 group cleanup: which useless messages the bot removes ──
+    # The master switch is ON so the join/left rule above keeps behaving exactly
+    # as it always did; every other rule starts OFF and is opt-in.
+    "cleanup_enabled": True,
+    "cleanup_service": False,    # other service notices (title/photo, pins, invites…)
+    "cleanup_links": False,      # messages with a URL, t.me link or @username
+    "cleanup_media": False,      # stickers, GIFs, photos, video, voice, files
+    "cleanup_forwards": False,   # forwarded messages
+    "cleanup_commands": False,   # "/command" typed by an ordinary member
+    "cleanup_strict": False,     # nothing from ordinary members stays at all
+    "cleanup_notify": "off",     # "off" | "group" (a warning) | "admin" (a DM)
     # ── Buy / Sell buttons (editable from the private bot chat) ──
     "buttons_order": "buy_sell",   # "buy_sell" = Buy left / Sell right, "sell_buy" = the opposite
     "btn_buy_enabled": True,      # remove/restore either built-in button independently
@@ -886,6 +977,59 @@ async def send_report(bot, chat_id, text, kb, rebuild=None):
         return await deliver(rebuild())
 
 
+# ── 🧹 group cleanup: state helpers ─────────────────────────────────────────
+# Pure functions, because ``load()`` sanitises whatever the store returned
+# before anything else reads it.
+def _clean_int(value, default: int = 0) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number >= 0 else default
+
+
+def normalize_cleanup_stats(value) -> dict:
+    """The 🧹 counter block: ``{removed, reason, name, at}``."""
+    stats = value if isinstance(value, dict) else {}
+    return {"removed": _clean_int(stats.get("removed")),
+            "reason": str(stats.get("reason") or "")[:80],
+            "name": str(stats.get("name") or "")[:80],
+            "at": _clean_int(stats.get("at"))}
+
+
+def normalize_cleanup_notices(value) -> dict:
+    """``"chat:message" → the second that group warning may go away``.
+
+    An entry that lost its number is dropped: a warning nobody can date would
+    otherwise stay in the group forever.
+    """
+    notices = value if isinstance(value, dict) else {}
+    clean = {}
+    for key, expires in notices.items():
+        if not (isinstance(key, str) and re.fullmatch(r"-?\d+:\d+", key)):
+            continue
+        try:
+            clean[key] = int(expires)
+        except (TypeError, ValueError):
+            continue
+    # oldest first, and never more than the limit: a notice is disposable
+    return dict(sorted(clean.items(), key=lambda item: item[1])[:CLEANUP_NOTICE_LIMIT])
+
+
+def cleanup_stats() -> dict:
+    stats = state.get("cleanup")
+    if not isinstance(stats, dict):
+        stats = state["cleanup"] = normalize_cleanup_stats(None)
+    return stats
+
+
+def cleanup_notices() -> dict:
+    notices = state.get("cleanup_notices")
+    if not isinstance(notices, dict):
+        notices = state["cleanup_notices"] = {}
+    return notices
+
+
 def empty_state():
     return {"group": None, "group_title": "", "channel": None, "channel_title": "",
             "auto": False, "merchants": {}, "last": {}, "channel_last": {}, "edits": {},
@@ -894,6 +1038,9 @@ def empty_state():
             "channel_last_msg_id": None, "channel_last_msg_time": None,
             # anti-scam: {chat_id:user_id → {word, tries, msg_id, expires, …}}
             "captcha": {},
+            # 🧹 group cleanup: what it removed, and the warnings still on screen
+            "cleanup": {"removed": 0, "reason": "", "name": "", "at": 0},
+            "cleanup_notices": {},
             # 📤 Undo for messages the admin had reposted to the group/channel
             "forwards": {},
             # ↪️ chats selected as relay sources {chat_id: {chat_id, title, type}}
@@ -950,6 +1097,14 @@ def load():
         data["settings"]["captcha_action"] = DEFAULT_SETTINGS["captcha_action"]
     if not isinstance(data["settings"].get("captcha_enabled"), bool):
         data["settings"]["captcha_enabled"] = DEFAULT_SETTINGS["captcha_enabled"]
+    # ── 🧹 group cleanup: booleans and one choice, anything else back to default ──
+    if not isinstance(data["settings"].get(CLEANUP_MASTER_KEY), bool):
+        data["settings"][CLEANUP_MASTER_KEY] = DEFAULT_SETTINGS[CLEANUP_MASTER_KEY]
+    for key in CLEANUP_RULE_KEYS:
+        if not isinstance(data["settings"].get(key), bool):
+            data["settings"][key] = DEFAULT_SETTINGS[key]
+    if data["settings"].get("cleanup_notify") not in CLEANUP_NOTIFY:
+        data["settings"]["cleanup_notify"] = DEFAULT_SETTINGS["cleanup_notify"]
     if "last" not in data:
         data["last"] = {}
     if "channel_last" not in data or not isinstance(data.get("channel_last"), dict):
@@ -983,6 +1138,9 @@ def load():
                 and re.fullmatch(r"-?\d+:\d+", key) and record.get("word")):
             clean[key] = record
     data["captcha"] = clean
+    # 🧹 group cleanup: a small counter block + the warnings still on screen
+    data["cleanup"] = normalize_cleanup_stats(data.get("cleanup"))
+    data["cleanup_notices"] = normalize_cleanup_notices(data.get("cleanup_notices"))
     if not isinstance(data.get("forwards"), dict):
         data["forwards"] = {}
     # ↪️ relay sources: keep the valid records, drop anything malformed
@@ -1289,7 +1447,9 @@ def settings_kb():
         [B("🔗 Ad link templates", callback_data="adlink_menu")],
         [B(f"🗑 Auto-delete prev: {'ON ✅' if s.get('auto_delete') else 'OFF ❌'}", callback_data="toggle_autodelete"),
          B(f"⏰ Delete after {s.get('delete_after_hours',24)}h", callback_data="toggle_delete_hours")],
-        [B(f"🚪 Del Join/Left msgs: {'ON ✅' if s.get('delete_join_left', True) else 'OFF ❌'}", callback_data="toggle_joinleft")],
+        [B(f"🧹 Group cleanup: {'ON ✅' if cleanup_enabled() else 'OFF ❌'}", callback_data="cleanup_menu"),
+         B(f"🚪 Del Join/Left msgs: {'ON ✅' if s.get('delete_join_left', True) else 'OFF ❌'}",
+           callback_data="toggle_joinleft")],
         [B("📝 Edit Header", callback_data="edit_header"), B("📝 Edit Body", callback_data="edit_body")],
         [B("📝 Edit Footer", callback_data="edit_footer"), B("🗑 Clear Custom Msg", callback_data="clear_custom")],
         [B(f"🗄 Database: {'connected ✅' if db_is_persistent() else 'connect ⚠️'}", callback_data="database")],
@@ -1525,7 +1685,7 @@ def button_labels() -> list[str]:
     labels = [buy_label_tpl(), sell_label_tpl()]
     labels += [button["label"] for button in extra_buttons()]
     for builder in (panel, settings_kb, buttons_menu_kb, extra_buttons_kb, adlink_menu_kb,
-                    custom_menu_kb, database_kb, list_kb, antiscam_kb):
+                    custom_menu_kb, database_kb, list_kb, antiscam_kb, cleanup_kb):
         try:
             keyboard = builder()
         except Exception as e:                        # pragma: no cover - defensive
@@ -1746,6 +1906,7 @@ def panel_text():
     btns = "ON" if s.get("show_buttons") else "OFF"
     autodel = "ON" if s.get("auto_delete") else "OFF"
     joinleft = "ON" if s.get("delete_join_left", True) else "OFF"
+    cleanup = f"ON — {cleanup_summary()}" if cleanup_enabled() else "OFF"
     header = s.get("custom_header") or "(default)"
     body = s.get("custom_body") or "(default)"
     footer = s.get("custom_footer") or "(none)"
@@ -1764,7 +1925,7 @@ def panel_text():
         f"{'' if db_is_persistent() else ' — tap 🔌 Connect database'}\n"
         f"💧 Liquidity: <b>{liq}</b> · 🔘 Buttons: <b>{btns}</b> · 🗑 AutoDel: <b>{autodel}</b>\n"
         f"🔄 Btn order: <b>{order_label()}</b> · 🎯 Links: <b>{'EXACT AD' if link_mode() == 'ad' else 'PROFILE'}</b>\n"
-        f"🚪 Del Join/Left msgs: <b>{joinleft}</b>\n"
+        f"🧹 Group cleanup: <b>{html_escape(cleanup)}</b> · 🚪 Join/Left: <b>{joinleft}</b>\n"
         f"📤 Auto-forward: <b>{forward_label()}</b> · ↪️ Channel → group: "
         f"<b>{'ON' if channel_to_group_enabled() else 'OFF'}</b> "
         f"(from <b>{html_escape(forward_source_summary())}</b>) · 🛡 Verification: "
@@ -1812,9 +1973,19 @@ def settings_text():
         f"   When ON, deletes previous price message on refresh/update.\n\n"
         f"⏰ Auto-delete after: <b>{del_hours}h</b>\n"
         f"   Message will be deleted after {del_hours} hours (0 = never).\n\n"
+        f"🧹 Group cleanup: <b>{'ON ✅' if cleanup_enabled() else 'OFF ❌'}</b> — "
+        f"<b>{html_escape(cleanup_summary())}</b>\n"
+        f"   Removes the useless messages in the group, so the price post stays the\n"
+        f"   last thing anybody reads. Tap 🧹 Group cleanup to pick the rules.\n\n"
         f"🚪 Delete Join/Left messages: <b>{joinleft}</b>\n"
         f"   When ON, the bot deletes Telegram's \"user joined the group\" and\n"
         f"   \"user left the group\" service messages in your group.\n"
+        f"   The other rules — 🧾 service notices, 🔗 links, 🖼 media, ↩️ forwards,\n"
+        f"   ⌨️ commands and 🔇 strict \"members post nothing\" — are switched on in\n"
+        f"   🧹 Group cleanup, which is also the master switch for this one.\n"
+        f"   Never removed: the bot's own posts, your messages, the other bot admins'\n"
+        f"   and the group administrators', or a new member answering the 🛡 check.\n"
+        f"   After a removal: <b>{CLEANUP_NOTIFY_TITLES[cleanup_notify_mode()]}</b>\n"
         f"   ⚠️ Bot must be a group admin with 'Delete messages' permission.\n\n"
         f"📢 Channel: <b>{html_escape(channel_label() or 'not set')}</b>\n"
         f"   The price post also goes to a channel when one is set — the group and\n"
@@ -2477,12 +2648,21 @@ async def on_join_left(u: Update, c: ContextTypes.DEFAULT_TYPE):
     # only in the registered group (if one is set)
     if state.get("group") and chat.id != state["group"]:
         return
-    if get_settings().get("delete_join_left", DEFAULT_SETTINGS["delete_join_left"]):
+    # 🚪 the first rule of the 🧹 group cleanup — it stays here, next to the
+    # anti-scam check that a join also starts, and never runs twice.
+    if cleanup_rule("delete_join_left"):
         try:
             await msg.delete()
             kind = "joined" if msg.new_chat_members else "left"
             member = msg.new_chat_members[0] if msg.new_chat_members else msg.left_chat_member
-            log.info("Deleted '%s the group' service message for %s in %s",
+            remember_cleanup_skip(chat.id, msg.message_id)
+            stats = cleanup_stats()
+            stats["removed"] = _clean_int(stats.get("removed")) + 1
+            stats["reason"] = CLEANUP_REASONS["delete_join_left"]
+            stats["name"] = getattr(member, "full_name", "") or str(getattr(member, "id", ""))
+            stats["at"] = int(time.time())
+            save()
+            log.info("🧹 Deleted '%s the group' service message for %s in %s",
                      kind, getattr(member, "full_name", "?"), chat.id)
         except Exception as e:
             log.warning("Could not delete join/left msg in %s: %s "
@@ -2511,10 +2691,388 @@ async def on_group_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     record = pending_captcha(chat.id, user.id)
     if not record or record.get("locked"):
         return
+    # the 🛡 check owns this message (it deletes it either way) — 🧹 keeps off it
+    remember_cleanup_skip(chat.id, msg.message_id)
     if captcha_word_matches((msg.text or msg.caption or ""), record["word"]):
         await captcha_pass(c.bot, chat, user, record, msg)
     else:
         await captcha_fail_attempt(c.bot, chat, user, record, msg)
+
+# ── 🧹 group cleanup: remove join notices and every useless message ─────────
+# The group is a price board, not a chat room, so the bot keeps it clean: the
+# rules the admin switched on decide what disappears.  It runs in PTB handler
+# group 1, *next to* the handlers of group 0 (🛡 anti-scam answers, ↪️ relay,
+# 🖼 banner input) instead of in front of them — PTB calls only one handler per
+# group per update, so a group-0 handler that took the message would otherwise
+# hide it from the cleanup.
+def cleanup_enabled() -> bool:
+    """The master switch — OFF means the bot removes nothing at all."""
+    return bool(get_settings().get(CLEANUP_MASTER_KEY, DEFAULT_SETTINGS[CLEANUP_MASTER_KEY]))
+
+
+def cleanup_rule(key: str) -> bool:
+    """A rule is active when it is switched on *and* the master switch is on."""
+    return cleanup_enabled() and bool(get_settings().get(key, DEFAULT_SETTINGS.get(key)))
+
+
+def cleanup_active_rules() -> list[tuple[str, str]]:
+    """``[(key, label), …]`` of the rules that are switched on right now."""
+    return [(key, CLEANUP_RULE_LABELS[key]) for key in CLEANUP_RULE_KEYS if cleanup_rule(key)]
+
+
+def cleanup_notify_mode() -> str:
+    mode = get_settings().get("cleanup_notify")
+    return mode if mode in CLEANUP_NOTIFY else DEFAULT_SETTINGS["cleanup_notify"]
+
+
+def cycle_cleanup_notify() -> str:
+    """Silent → warn in the group → tell the admins → silent …"""
+    mode = CLEANUP_NOTIFY[(CLEANUP_NOTIFY.index(cleanup_notify_mode()) + 1) % len(CLEANUP_NOTIFY)]
+    state["settings"]["cleanup_notify"] = mode
+    save()
+    return mode
+
+
+def cleanup_summary() -> str:
+    """Short answer to "what does it remove?" for a button or the panel."""
+    if not cleanup_enabled():
+        return "OFF"
+    active = cleanup_active_rules()
+    if not active:
+        return "no rule selected"
+    if any(key == "cleanup_strict" for key, _label in active):
+        return "STRICT — members post nothing"
+    names = [label.split(" ", 1)[-1] for _key, label in active]
+    return ", ".join(names[:3]) + (f" +{len(names) - 3} more" if len(names) > 3 else "")
+
+
+def cleanup_covers(chat) -> bool:
+    """Only the registered group is cleaned.
+
+    The bot can sit in other groups — a ↪️ relay source, a friend's chat — and
+    removing people's messages there is never what the admin meant.  With no
+    group registered there is no price board to keep clean, so 🧹 waits.  (The
+    🚪 join/left rule stays as it always was: it also works before a group is
+    picked, because a join notice is noise anywhere.)
+    """
+    if not chat or getattr(chat, "type", None) not in ("group", "supergroup"):
+        return False
+    return bool(state.get("group")) and chat.id == state["group"]
+
+
+# ── what a message is ───────────────────────────────────────────────────────
+def message_entities(msg) -> list:
+    return list(getattr(msg, "entities", None) or []) + \
+        list(getattr(msg, "caption_entities", None) or [])
+
+
+def entity_type(entity):
+    """Entity types arrive as objects from PTB and as dicts from raw payloads."""
+    return entity.get("type") if isinstance(entity, dict) else getattr(entity, "type", None)
+
+
+def message_body(msg) -> str:
+    """Text and caption together — a rule never depends on which one it is in."""
+    return " ".join(part for part in (getattr(msg, "text", None), getattr(msg, "caption", None))
+                    if isinstance(part, str) and part)
+
+
+def is_join_left_message(msg) -> bool:
+    return bool(getattr(msg, "new_chat_members", None) or getattr(msg, "left_chat_member", None))
+
+
+def is_service_message(msg) -> bool:
+    """Telegram's own notices: changed title/photo, pins, invites, video chats…"""
+    return any(getattr(msg, attr, None) for attr in SERVICE_MESSAGE_ATTRS)
+
+
+def is_media_message(msg) -> bool:
+    return any(getattr(msg, attr, None) for attr in MEDIA_MESSAGE_ATTRS)
+
+
+def is_forwarded_message(msg) -> bool:
+    """Forwarded from anywhere — PTB 21 renamed the fields, so check both."""
+    return bool(getattr(msg, "forward_origin", None) or getattr(msg, "forward_date", None)
+                or getattr(msg, "forward_from", None) or getattr(msg, "forward_from_chat", None)
+                or getattr(msg, "is_automatic_forward", False))
+
+
+def is_link_message(msg) -> bool:
+    """A URL, a t.me link or an @username — by entity and by text, either wins."""
+    if any(entity_type(e) in LINK_ENTITY_TYPES for e in message_entities(msg)):
+        return True
+    return bool(LINK_PATTERN.search(message_body(msg)))
+
+
+def is_command_message(msg) -> bool:
+    if any(entity_type(e) == "bot_command" for e in message_entities(msg)):
+        return True
+    return (getattr(msg, "text", None) or "").strip().startswith("/")
+
+
+# rule key → the test that says "this message breaks it"
+CLEANUP_TESTS = {
+    "cleanup_strict": lambda msg: True,
+    "cleanup_service": is_service_message,
+    "cleanup_links": is_link_message,
+    "cleanup_media": is_media_message,
+    "cleanup_forwards": is_forwarded_message,
+    "cleanup_commands": is_command_message,
+}
+
+
+def cleanup_violations(msg) -> list[tuple[str, str]]:
+    """Every active rule this message breaks, as ``[(key, reason), …]``.
+
+    🔇 strict is tested first: its reason explains the removal best when more
+    than one rule matches.
+    """
+    return [(key, CLEANUP_REASONS[key]) for key in CLEANUP_ORDER
+            if cleanup_rule(key) and CLEANUP_TESTS[key](msg)]
+
+
+# ── who is never touched ────────────────────────────────────────────────────
+_ADMIN_CACHE: dict = {}       # chat_id → (read_at, {admin user ids})
+_CLEANUP_SKIP: dict = {}      # "chat:message" → ts: another handler deleted it
+
+
+def remember_cleanup_skip(chat_id, message_id) -> None:
+    """Note a message somebody else already dealt with — 🧹 must not retry it."""
+    try:
+        key = f"{int(chat_id)}:{int(message_id)}"
+    except (TypeError, ValueError):
+        return
+    _CLEANUP_SKIP[key] = int(time.time())
+    for old in sorted(_CLEANUP_SKIP, key=_CLEANUP_SKIP.get)[:-CLEANUP_SKIP_LIMIT]:
+        _CLEANUP_SKIP.pop(old, None)
+
+
+def cleanup_skipped(chat_id, message_id) -> bool:
+    try:
+        return f"{int(chat_id)}:{int(message_id)}" in _CLEANUP_SKIP
+    except (TypeError, ValueError):
+        return False
+
+
+def member_name(user) -> str:
+    name = (getattr(user, "full_name", None) or getattr(user, "first_name", None)
+            or getattr(user, "username", None) or str(getattr(user, "id", "?")))
+    return str(name)[:60]
+
+
+async def chat_admin_ids(bot, chat_id) -> set[int]:
+    """The group's own administrators — the bot never removes their messages.
+
+    The list is read at most every ``CLEANUP_ADMIN_TTL`` seconds per chat: one
+    API call per message would be slow and could hit Telegram's limits.
+    """
+    now = int(time.time())
+    cached = _ADMIN_CACHE.get(chat_id)
+    if cached and now - cached[0] < CLEANUP_ADMIN_TTL:
+        return cached[1]
+    ids: set[int] = set()
+    try:
+        for member in await bot.get_chat_administrators(chat_id):
+            user = getattr(member, "user", None)
+            if user is not None:
+                ids.add(user.id)
+        _ADMIN_CACHE[chat_id] = (now, ids)
+    except Exception as e:
+        # Without the list only the bot's own admins are trusted.  Remember that
+        # for a minute instead of asking again for every single message.
+        log.debug("Could not read the administrators of %s: %s", chat_id, e)
+        _ADMIN_CACHE[chat_id] = (now - CLEANUP_ADMIN_TTL + 60, ids)
+    return ids
+
+
+async def cleanup_exempt(bot, msg, chat, user):
+    """Why this message stays — ``None`` when 🧹 may remove it."""
+    if user is None:
+        # Nobody sent it: a channel post, or a notice Telegram wrote itself.
+        # Only the 🧾 rule has anything to say about those — there is no member
+        # to protect and nothing to blame.
+        return None if is_service_message(msg) else "it has no sender"
+    if getattr(msg, "author_signature", None) or user.id == getattr(chat, "id", None):
+        return "it was posted as the group"           # an anonymous admin
+    if cleanup_skipped(chat.id, getattr(msg, "message_id", None)):
+        return "another handler already dealt with it"
+    if is_own_post(msg, chat, bot):
+        return "the bot posted it"
+    if user.id in ADMINS:
+        return "a bot admin sent it"
+    if pending_captcha(chat.id, user.id):
+        return "the member is answering the 🛡 anti-scam check"
+    if user.id in await chat_admin_ids(bot, chat.id):
+        return "a group administrator sent it"
+    return None
+
+
+# ── removing one message ────────────────────────────────────────────────────
+async def cleanup_remove(bot, chat, msg, user, violations) -> bool:
+    """Delete one useless message and, if the admin wants that, say why."""
+    key, reason = violations[0]
+    try:
+        await bot.delete_message(chat_id=chat.id, message_id=msg.message_id)
+    except Exception as e:
+        log.warning("🧹 Could not delete message %s in %s (%s) — make the bot a group "
+                    "admin with 'Delete messages'", getattr(msg, "message_id", "?"), chat.id, e)
+        return False
+    remember_cleanup_skip(chat.id, msg.message_id)   # nothing may try it twice
+    who = member_name(user) if user is not None else "Telegram"
+    stats = cleanup_stats()
+    stats["removed"] = _clean_int(stats.get("removed")) + 1
+    stats["reason"], stats["name"], stats["at"] = reason, who, int(time.time())
+    save()
+    log.info("🧹 Removed a message in %s from %s (%s)", chat.id, who, reason)
+    await cleanup_report(bot, chat, user, reason)
+    return True
+
+
+async def cleanup_report(bot, chat, user, reason) -> None:
+    """Tell somebody about the removal: nobody, the group, or the admins."""
+    mode = cleanup_notify_mode()
+    if mode == "off":
+        return
+    name = html_escape(member_name(user)) if user is not None else "Telegram"
+    where = html_escape(getattr(chat, "title", "") or str(chat.id))
+    if mode == "admin":
+        await notify_admins(bot, f"🧹 <b>Message removed in {where}</b>\n"
+                                 f"From: {name}\nWhy: {html_escape(reason)}")
+        return
+    if user is None:
+        return          # a service notice has nobody to warn in the group
+    try:
+        sent = await bot.send_message(
+            chat.id, f"🧹 {name}, your message was removed — {html_escape(reason)}.",
+            parse_mode="HTML")
+    except Exception as e:
+        log.debug("🧹 Could not warn in %s: %s", chat.id, e)
+        return
+    notices = cleanup_notices()
+    notices[f"{chat.id}:{sent.message_id}"] = int(time.time()) + CLEANUP_NOTICE_SECONDS
+    state["cleanup_notices"] = normalize_cleanup_notices(notices)
+    save()
+    # The warning deletes itself; a serverless container that freezes before
+    # then leaves it to sweep_cleanup_notices() on the next tick.
+    try:
+        asyncio.get_running_loop().create_task(
+            forget_cleanup_notice(bot, chat.id, sent.message_id, CLEANUP_NOTICE_SECONDS))
+    except RuntimeError:                               # pragma: no cover - no loop
+        pass
+
+
+async def forget_cleanup_notice(bot, chat_id, message_id, delay: int = 0) -> bool:
+    """Delete one 🧹 warning in the group once it is old enough."""
+    if delay:
+        await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        log.debug("🧹 Could not delete the warning %s in %s: %s", message_id, chat_id, e)
+    if cleanup_notices().pop(f"{chat_id}:{message_id}", None) is not None:
+        save()
+    return True
+
+
+async def sweep_cleanup_notices(bot) -> int:
+    """Delete the 🧹 warnings whose time is up — how many went away."""
+    now, notices, gone = int(time.time()), cleanup_notices(), 0
+    for key, expires in list(notices.items()):
+        if _clean_int(expires, now + 1) > now:
+            continue
+        try:
+            chat_id, message_id = (int(part) for part in key.split(":", 1))
+        except ValueError:                             # pragma: no cover - load() cleans
+            notices.pop(key, None); gone += 1; continue
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            log.debug("🧹 Could not delete the warning %s: %s", key, e)
+        notices.pop(key, None)
+        gone += 1
+    if gone:
+        save()
+    return gone
+
+
+async def on_group_cleanup(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """🧹 Remove the useless messages in the group (PTB handler group 1)."""
+    msg, chat, user = message_of(u), u.effective_chat, u.effective_user
+    if not msg or not cleanup_enabled() or not cleanup_covers(chat):
+        return
+    if is_join_left_message(msg):
+        return                       # on_join_left owns the join/left notices
+    violations = cleanup_violations(msg)
+    if not violations:
+        return
+    exempt = await cleanup_exempt(c.bot, msg, chat, user)
+    if exempt:
+        log.debug("🧹 Kept message %s in %s: %s", getattr(msg, "message_id", "?"), chat.id, exempt)
+        return
+    await cleanup_remove(c.bot, chat, msg, user, violations)
+
+
+async def cleanup_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/cleanup (alias /clean) — the 🧹 screen, in the private chat only."""
+    if not is_admin(u) or u.effective_chat.type != "private":
+        return
+    await u.effective_message.reply_html(cleanup_text(), reply_markup=cleanup_kb())
+
+
+# ── 🧹 the admin screen ─────────────────────────────────────────────────────
+def cleanup_text() -> str:
+    stats = cleanup_stats()
+    rules = "\n".join(f"{'✅' if cleanup_rule(key) else '➖'} <b>{label}</b>\n   {about}"
+                      for key, label, about in CLEANUP_RULES)
+    removed = _clean_int(stats.get("removed"))
+    last = ""
+    if stats.get("at") and stats.get("reason"):
+        last = (f" — last: {html_escape(stats.get('name') or 'a member')} "
+                f"({html_escape(stats['reason'])})")
+    where = html_escape(state.get("group_title") or "the group")
+    missing = ("" if state.get("group") else
+               "\n\n⚠️ <b>No group is set yet</b> — tap 👥 Set group in the panel first: "
+               "🧹 only ever cleans the group that receives the prices.")
+    return (
+        f"🧹 <b>Group cleanup</b>\n\n"
+        f"Removes the join notices and the useless messages in <b>{where}</b>, so the "
+        f"price post stays the last thing anybody reads.\n\n"
+        f"Cleanup: <b>{'ON ✅' if cleanup_enabled() else 'OFF ❌'}</b>\n"
+        f"Removing: <b>{html_escape(cleanup_summary())}</b>\n"
+        f"After a removal: <b>{CLEANUP_NOTIFY_TITLES[cleanup_notify_mode()]}</b>\n"
+        f"Removed so far: <b>{removed}</b>{last}\n\n"
+        f"<b>Rules</b>\n{rules}\n\n"
+        f"<b>Never removed</b>\n"
+        f"• the bot's own posts — prices, the 🛡 challenge, ↪️ relayed messages\n"
+        f"• you, the other bot admins and the group's own administrators\n"
+        f"• a new member who is answering the 🛡 anti-scam check\n\n"
+        f"ℹ️ The bot must be a group admin with <b>Delete messages</b>; without that "
+        f"right nothing can be removed.{missing}"
+    )
+
+
+def cleanup_rule_button(key: str):
+    on = "ON ✅" if cleanup_rule(key) else "OFF ❌"
+    return B(f"{CLEANUP_RULE_LABELS[key]}: {on}", callback_data=f"cleanup_rule:{key}")
+
+
+def cleanup_kb():
+    keys = list(CLEANUP_RULE_KEYS)
+    rows = [[B(f"🧹 Cleanup: {'ON ✅' if cleanup_enabled() else 'OFF ❌'}",
+               callback_data="cleanup_toggle")]]
+    rows += [[cleanup_rule_button(a), cleanup_rule_button(b)]
+             for a, b in zip(keys[::2], keys[1::2])]
+    if len(keys) % 2:
+        rows.append([cleanup_rule_button(keys[-1])])
+    if cleanup_notices():
+        rows.append([B("🧹 Clear the warnings now", callback_data="cleanup_notices")])
+    rows += [
+        [B(f"📣 After a removal: {CLEANUP_NOTIFY_SHORT[cleanup_notify_mode()]}",
+           callback_data="cleanup_notify")],
+        [B("⬅️ Back to settings", callback_data="settings")],
+    ]
+    return KB(rows)
+
 
 # ── custom message helpers ──
 def apply_template(text: str) -> str:
@@ -3142,6 +3700,10 @@ async def cleanup_job(c: ContextTypes.DEFAULT_TYPE):
         await sweep_captcha(c.bot)
     except Exception as e:
         log.warning("anti-scam sweep failed: %s", e)
+    try:
+        await sweep_cleanup_notices(c.bot)
+    except Exception as e:
+        log.warning("group cleanup sweep failed: %s", e)
 
 # ── buttons ──
 def list_kb():
@@ -3734,6 +4296,40 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+    # ── 🧹 group cleanup ──
+    elif d == "cleanup_menu":
+        if edit_get(u, "awaiting_custom"):
+            edit_pop(u, "awaiting_custom")
+        await q.answer()
+        return await q.edit_message_text(cleanup_text(), parse_mode="HTML", reply_markup=cleanup_kb())
+
+    elif d == "cleanup_toggle":
+        state["settings"][CLEANUP_MASTER_KEY] = not cleanup_enabled()
+        save()
+        await q.answer(f"🧹 Group cleanup {'ON' if cleanup_enabled() else 'OFF'}")
+        return await q.edit_message_text(cleanup_text(), parse_mode="HTML", reply_markup=cleanup_kb())
+
+    elif d.startswith("cleanup_rule:"):
+        key = d.split(":", 1)[1]
+        if key not in CLEANUP_RULE_KEYS:
+            return await q.answer("Unknown rule", show_alert=True)
+        state["settings"][key] = not state["settings"].get(key, DEFAULT_SETTINGS[key])
+        save()
+        await q.answer(f"{CLEANUP_RULE_LABELS[key]}: "
+                       f"{'ON' if state['settings'][key] else 'OFF'}")
+        return await q.edit_message_text(cleanup_text(), parse_mode="HTML", reply_markup=cleanup_kb())
+
+    elif d == "cleanup_notify":
+        mode = cycle_cleanup_notify()
+        await q.answer(f"After a removal: {CLEANUP_NOTIFY_SHORT[mode]}")
+        return await q.edit_message_text(cleanup_text(), parse_mode="HTML", reply_markup=cleanup_kb())
+
+    elif d == "cleanup_notices":
+        # the group warnings that are still on screen go away at once
+        gone = await sweep_cleanup_notices(c.bot)
+        await q.answer(f"🧹 {gone} warning(s) removed" if gone else "No warning on screen")
+        return await q.edit_message_text(cleanup_text(), parse_mode="HTML", reply_markup=cleanup_kb())
+
     elif d == "clear_custom":
         state["settings"]["custom_header"] = ""
         state["settings"]["custom_body"] = ""
@@ -3884,6 +4480,8 @@ def register_handlers(app):
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("preview", preview_cmd))
     app.add_handler(CommandHandler(["database", "db"], database_cmd))
+    # 🧹 group cleanup: the screen in the private chat
+    app.add_handler(CommandHandler(["cleanup", "clean"], cleanup_cmd))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS
@@ -3891,6 +4489,11 @@ def register_handlers(app):
     # the group: answers to the 🛡 anti-scam challenge
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT
                                    & ~filters.COMMAND, on_group_text))
+    # 🧹 group cleanup lives in handler group 1: PTB runs at most one handler per
+    # group, so registering it next to the ones above lets it see *every* group
+    # message — including the ones the 🛡 check, the ↪️ relay or the 🖼 editors
+    # already took in group 0 — without stealing any of them.
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_cleanup), group=1)
     # banner photos and premium-emoji stickers (the two image inputs)
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.Sticker.ALL, on_sticker))
@@ -3935,6 +4538,7 @@ def main():
     print(f"   Channel: {state['channel'] or 'not set'} · 📤 Auto-forward: {forward_label()}")
     print(f"   ↪️ Forward to group: {'ON' if channel_to_group_enabled() else 'OFF'}"
           f" · from: {forward_source_summary()}")
+    print(f"   🧹 Group cleanup: {'ON' if cleanup_enabled() else 'OFF'} · {cleanup_summary()}")
     print(f"   🛡 Anti-scam: {'ON' if captcha_enabled() else 'OFF'}"
           f" ({captcha_attempts()} attempts, {captcha_timeout()} min → {captcha_action()})")
     print(f"   State: {STORE.describe()}")

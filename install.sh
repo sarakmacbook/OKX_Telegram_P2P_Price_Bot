@@ -675,7 +675,7 @@ fi
 # see DEFAULT_SETTINGS in bot.py so the two never drift apart)
 if [[ ! -f "$INSTALL_DIR/data.json" ]]; then
   cat > "$INSTALL_DIR/data.json" <<'EOF'
-{"group": null, "auto": false, "merchants": {}, "last": {}, "settings": {"show_liquidity": false, "show_buttons": true, "custom_header": "", "custom_body": "", "custom_footer": "", "auto_delete": true, "delete_after_hours": 24, "delete_join_left": true, "buttons_order": "buy_sell", "btn_buy_label": "", "btn_sell_label": "", "btn_buy_url": "", "btn_sell_url": "", "btn_link_mode": "ad", "ad_link_templates": {}, "price_links": true}, "last_msg_id": null, "last_msg_time": null}
+{"group": null, "auto": false, "merchants": {}, "last": {}, "settings": {"show_liquidity": false, "show_buttons": true, "custom_header": "", "custom_body": "", "custom_footer": "", "auto_delete": true, "delete_after_hours": 24, "delete_join_left": true, "cleanup_enabled": true, "cleanup_service": false, "cleanup_links": false, "cleanup_media": false, "cleanup_forwards": false, "cleanup_commands": false, "cleanup_strict": false, "cleanup_notify": "off", "buttons_order": "buy_sell", "btn_buy_label": "", "btn_sell_label": "", "btn_buy_url": "", "btn_sell_url": "", "btn_link_mode": "ad", "ad_link_templates": {}, "price_links": true}, "last_msg_id": null, "last_msg_time": null}
 EOF
 fi
 chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -807,7 +807,10 @@ echo -e "   ${CYAN}👁 Preview${NC} · ${CYAN}🔄 Refresh${NC}"
 echo ""
 echo -e "  ${BOLD}Extras:${NC}"
 echo -e "   · ${CYAN}📝 Custom Msg${NC} customizes the whole post — header, body (per merchant), footer"
-echo -e "   · ${CYAN}🚪 Del Join/Left msgs${NC} (in ⚙️ Settings) removes \"X joined/left the group\" notices"
+echo -e "   · ${CYAN}🧹 Group cleanup${NC} (in ⚙️ Settings, or /cleanup) removes \"X joined/left the group\""
+echo -e "     notices and the useless messages: service notices, 🔗 links, 🖼 media,"
+echo -e "     ↩️ forwards, ⌨️ commands — or 🔇 strict, where members post nothing at all"
+echo -e "     — the bot's own posts, the admins' and a member's 🛡 answer are never removed"
 echo -e "     — the bot must be a group admin with the ${DIM}Delete messages${NC} permission"
 echo -e "   · ⚙️ Settings also has auto-delete timers, liquidity and Buy/Sell buttons"
 echo ""

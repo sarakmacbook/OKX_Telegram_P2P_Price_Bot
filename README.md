@@ -287,7 +287,7 @@ docker compose up -d --build
 | 👥 **Set group** | One click: choose the group that receives updates |
 | 📢 **Set channel** | One click: add the bot to a channel and post the prices there too |
 | 🛡 **Anti-scam** | Mute newcomers until they type a random word — see [🛡 Anti-scam verification](#-anti-scam-verification) |
-| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **join/left cleanup**, **📤 private-message forwarding**, **↪️ forwarding into the group + which chats to forward from**, **🖼 button icons & post banner** |
+| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **🧹 group cleanup** (join notices + the useless messages), **📤 private-message forwarding**, **↪️ forwarding into the group + which chats to forward from**, **🖼 button icons & post banner** |
 | 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
 | 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer |
 | 👁 **Preview** | See exactly how the group post will look |
@@ -506,12 +506,45 @@ hint, so the link still lands on the correct side and pair — and you can paste
 template in **🔗 Ad link templates** at any time (no code change, no redeploy). Bybit's own share
 links expire after 30 minutes, which is why its default template points at the market page.
 
-### 🚪 Auto-delete “joined / left the group” messages
+### 🧹 Group cleanup — remove the join notices and every useless message
 
-The bot deletes Telegram’s **“X joined the group”** and **“X left the group”** service messages in your group — including when people join after being **accepted via a join request** — so your price feed stays clean.
+Your group is a price board, so the bot keeps it clean: it removes the messages
+nobody needs and the price post stays the last thing anybody reads. Open the bot →
+⚙️ **Settings → 🧹 Group cleanup** (or send `/cleanup`, alias `/clean`) — one switch
+per rule, plus a master switch that turns the whole thing off:
 
-- Toggle in ⚙️ **Settings → 🚪 Del Join/Left msgs** (ON by default).
-- ⚠️ The bot must be a **group admin** with the **Delete messages** permission, otherwise it can't remove those messages.
+| Rule | What disappears | Default |
+|---|---|---|
+| 🚪 **Join/left notices** | Telegram’s **“X joined the group”** / **“X left the group”** service messages — including people accepted **via a join request** | **ON** ✅ |
+| 🧾 **Other service notices** | changed title/photo, pinned messages, invite links, video chats, forum topics, “group upgraded”… | OFF |
+| 🔗 **Links & @usernames** | any member message holding a URL, a `t.me` link or an `@username` | OFF |
+| 🖼 **Media & stickers** | stickers, GIFs, photos, videos, voice notes, audio, files, polls, locations | OFF |
+| ↩️ **Forwarded messages** | anything forwarded from another chat, channel or bot | OFF |
+| ⌨️ **Commands** | `/something` typed by an ordinary member | OFF |
+| 🔇 **Strict: members post nothing** | **every** message from an ordinary member — the group reads like a channel | OFF |
+
+**Never removed**, whatever you switch on:
+
+- the bot’s own posts — the price report, the 🛡 anti-scam challenge, ↪️ relayed
+  channel posts and anything you 📤 forwarded from the private chat;
+- your messages, the other bot admins’, and the **group administrators’** (their
+  list is read once and remembered for 10 minutes, so it costs no extra call per
+  message);
+- a new member who is answering the 🛡 **anti-scam check** — that flow owns their
+  messages until it is done with them, so a verification answer is never eaten by
+  🔇 strict mode.
+
+**After a removal** the bot can stay **silent 🤫** (default), post a **short warning
+in the group 💬** that deletes itself after 20 seconds, or **tell the admins 📩** in
+private. The 🧹 screen also counts what it removed and shows the last reason.
+
+- ⚠️ The bot must be a **group admin** with the **Delete messages** permission,
+  otherwise it cannot remove anything (it says so in the log).
+- Cleanup runs in your **registered group** only, and it looks at every message
+  *next to* the other handlers — a photo the 🖼 banner editor also sees, or an
+  answer the 🛡 check already took, is handled by both without fighting over it.
+- Telegram only lets a bot delete messages younger than **48 hours**, so this
+  cleans what arrives from now on; it cannot purge old history.
 
 ---
 
