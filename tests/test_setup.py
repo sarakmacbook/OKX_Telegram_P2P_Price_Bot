@@ -923,3 +923,32 @@ def test_pressing_the_button_twice_does_not_spam_the_admins(telegram):
 
     assert status == 200 and len(telegram.messages) == 1, "no second message was sent"
     assert "already have a link" in text
+
+
+@pytest.mark.parametrize("ready,serverless,fail", [
+    (True, True, False), (True, True, True),
+    (False, True, False), (True, False, False),
+])
+def test_setup_activates_delivery_without_another_visit(monkeypatch, ready, serverless, fail):
+    from unittest.mock import AsyncMock
+    from api import setup
+
+    result = {"ok": True, "saved": ["BOT_TOKEN"], "warnings": [],
+              "status": {"ready": ready, "serverless": serverless, "missing": ""}}
+    register = AsyncMock(return_value={"url": "https://example.com/api/webhook"})
+    if fail:
+        register.side_effect = RuntimeError("unavailable")
+    monkeypatch.setattr(setup, "setup_write_allowed", lambda request: (True, ""))
+    monkeypatch.setattr(setup, "save_setup_values", lambda values: result)
+    monkeypatch.setattr(setup, "consume_setup_link", lambda secret: None)
+    monkeypatch.setattr(setup, "ensure_webhook", register)
+    status, _, payload = post_json({"BOT_TOKEN": "123:TEST"})
+    data = json.loads(payload)
+    assert status == 200 and data["ok"]  # a delivery failure must not lose settings
+    assert register.await_count == int(ready and serverless)
+    if fail:
+        assert "could not be activated" in data["warnings"][0]
+        assert "webhook" not in data
+    elif ready and serverless:
+        assert data["webhook"]["url"].endswith("/api/webhook")
+        assert "Telegram connected" in setup._headline(data)

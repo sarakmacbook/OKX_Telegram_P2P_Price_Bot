@@ -277,7 +277,7 @@ async def _application_locked(loop: asyncio.AbstractEventLoop):
     # bot's own user, so /start links work without a second API call.
     await app.initialize()
     try:
-        bot_module.BOT_USERNAME = app.bot.bot.username
+        bot_module.BOT_USERNAME = app.bot.username
     except Exception as exc:                      # pragma: no cover - defensive
         log.warning("could not read the bot's own user: %s", exc)
     _apps[id(loop)] = app
@@ -347,7 +347,7 @@ async def set_webhook(app=None) -> dict:
         url=target,
         secret_token=secret,
         allowed_updates=list(bot_module.Update.ALL_TYPES),
-        drop_pending_updates=truthy(env("WEBHOOK_DROP_PENDING", default="1")),
+        drop_pending_updates=truthy(env("WEBHOOK_DROP_PENDING", default="0")),
     )
     bot_module.state[MARKER_KEY] = {"url": target, "secret_fp": _fingerprint(secret)}
     bot_module.save()
