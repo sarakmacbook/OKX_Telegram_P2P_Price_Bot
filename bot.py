@@ -8,7 +8,8 @@ from dataclasses import asdict
 from urllib.parse import urlsplit
 from pathlib import Path
 import httpx
-from telegram import (Update, ChatPermissions, InlineKeyboardButton as _TelegramButton,
+from telegram import (Update, ChatPermissions, BotCommand, BotCommandScopeAllPrivateChats,
+                      BotCommandScopeChat, InlineKeyboardButton as _TelegramButton,
                       InlineKeyboardMarkup as KB)
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, ChatMemberHandler, ContextTypes, filters)
@@ -3964,11 +3965,49 @@ async def error_handler(update, context):
     log.warning("Update %s caused error %s", update, context.error)
 
 # ── run ──
+PRIVATE_COMMANDS = [
+    BotCommand("start", "Open the bot control panel"),
+]
+ADMIN_PRIVATE_COMMANDS = [
+    BotCommand("start", "Open the bot control panel"),
+    BotCommand("setgroup", "Set the group for price updates"),
+    BotCommand("setchannel", "Set a channel for price updates"),
+    BotCommand("forwardfrom", "Set up forwarding from this chat"),
+    BotCommand("stopforward", "Stop forwarding from this chat"),
+    BotCommand("preview", "Preview the price report"),
+    BotCommand("database", "Check the database connection"),
+    BotCommand("cancel", "Cancel the current action"),
+]
+
+
+async def configure_bot_commands(bot, *, include_setup: bool = False):
+    """Publish Telegram's private-chat command menu for users and admins.
+
+    The default private menu only exposes /start. Each configured admin gets a
+    more useful, private menu with the commands the bot actually handles.
+    Failures are non-fatal: an unavailable Bot API must not stop the bot.
+    """
+    try:
+        await bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    except Exception as exc:
+        log.warning("Could not publish the private /start command: %s", exc)
+
+    commands = list(ADMIN_PRIVATE_COMMANDS)
+    if include_setup:
+        commands.append(BotCommand("setup", "Get a one-time reconfiguration link"))
+    for admin_id in ADMINS:
+        try:
+            await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as exc:
+            log.warning("Could not publish private commands for admin %s: %s", admin_id, exc)
+
+
 async def post_init(application):
     global BOT_USERNAME
     me = await application.bot.get_me()
     BOT_USERNAME = me.username
     log.info("Logged in as @%s", BOT_USERNAME)
+    await configure_bot_commands(application.bot)
 
 def register_handlers(app):
     # A command handler only listens to *messages* by default, and a channel
