@@ -362,6 +362,7 @@ def test_group_to_channel_opt_in_and_no_echo(router):
     assert calls["send_message"].await_args.kwargs["chat_id"] == CHANNEL
     assert calls["send_message"].await_args.kwargs["text"] == "👥 <b>Rates</b>\n\ngroup news"
     assert router.bot.is_own_message(CHANNEL, 42)
+    calls["send_message"].reset_mock()
     calls = router.send(_chat_message(CHANNEL, "channel", "echo", message_id=42))
     calls["send_message"].assert_not_awaited()
 
