@@ -183,6 +183,25 @@ def test_an_unrelated_channel_message_changes_nothing(router):
     assert router.bot.state["channel"] is None
 
 
+def test_a_post_in_the_configured_channel_is_forwarded_into_the_group(router):
+    router.bot.state["channel"] = CHANNEL
+
+    calls = router.send(_channel_post("channel announcement"))
+
+    calls["forward_message"].assert_awaited_once_with(
+        chat_id=GROUP, from_chat_id=CHANNEL, message_id=14)
+
+
+def test_channel_setup_commands_are_not_forwarded_to_the_group(router):
+    router.bot.state["channel"] = CHANNEL
+
+    calls = router.send(_channel_post("/setchannel", command=True))
+
+    assert router.bot.state["channel"] == CHANNEL
+    calls["forward_message"].assert_not_awaited()
+    calls["copy_message"].assert_not_awaited()
+
+
 def test_the_startchannel_deep_link_registers_the_channel(router):
     """``t.me/bot?startchannel=setchannel`` arrives as a /start channel post."""
     router.send({"update_id": 5, "channel_post": {

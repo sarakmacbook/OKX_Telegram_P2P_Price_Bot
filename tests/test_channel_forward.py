@@ -329,3 +329,72 @@ def test_an_unknown_forward_target_falls_back(manager, target):
     manager.state["settings"]["forward_target"] = target
     manager.refresh_state()
     assert manager.forward_target() == "group"
+
+
+def _channel_update(message_id=34, chat_id=CHANNEL):
+    message = SimpleNamespace(message_id=message_id)
+    chat = SimpleNamespace(id=chat_id, type="channel")
+    return SimpleNamespace(effective_message=message, message=None, effective_chat=chat)
+
+
+def test_channel_posts_are_forwarded_to_the_configured_group_by_default(manager):
+    manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
+    fake = _bot()
+
+    assert manager.channel_to_group_enabled() is True
+    assert asyncio.run(manager.on_channel_post(_channel_update(), SimpleNamespace(bot=fake))) is True
+
+    fake.forward_message.assert_awaited_once_with(
+        chat_id=GROUP, from_chat_id=CHANNEL, message_id=34)
+    fake.copy_message.assert_not_awaited()
+
+
+def test_channel_posts_only_forward_from_the_configured_channel(manager):
+    manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
+    fake = _bot()
+
+    assert asyncio.run(manager.on_channel_post(
+        _channel_update(chat_id=CHANNEL - 1), SimpleNamespace(bot=fake))) is False
+    fake.forward_message.assert_not_awaited()
+
+
+def test_channel_to_group_forwarding_can_be_disabled(manager):
+    manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
+    manager.state["settings"]["channel_to_group"] = False
+    fake = _bot()
+
+    assert asyncio.run(manager.on_channel_post(_channel_update(), SimpleNamespace(bot=fake))) is False
+    fake.forward_message.assert_not_awaited()
+
+
+def test_the_channel_price_report_is_not_echoed_back_to_the_group(manager):
+    manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
+    manager.state["channel_last_msg_id"] = 34
+    fake = _bot()
+
+    assert asyncio.run(manager.on_channel_post(_channel_update(), SimpleNamespace(bot=fake))) is False
+    fake.forward_message.assert_not_awaited()
+
+
+def test_channel_forward_falls_back_to_copy(manager):
+    manager.state["group"], manager.state["channel"] = GROUP, CHANNEL
+    fake = _bot()
+    fake.forward_message = AsyncMock(side_effect=RuntimeError("forward unavailable"))
+
+    assert asyncio.run(manager.on_channel_post(_channel_update(), SimpleNamespace(bot=fake))) is True
+    fake.copy_message.assert_awaited_once_with(
+        chat_id=GROUP, from_chat_id=CHANNEL, message_id=34)
+
+
+def test_channel_forward_toggle_is_available_in_settings(manager):
+    buttons = [button for row in manager.settings_kb().inline_keyboard for button in row]
+    toggle = next(button for button in buttons if button.callback_data == "toggle_channel_to_group")
+    assert "Channel → group" in toggle.text
+
+
+def test_channel_forward_toggle_persists(manager):
+    assert manager.channel_to_group_enabled() is True
+    _callback(manager, "toggle_channel_to_group")
+    assert manager.channel_to_group_enabled() is False
+    _callback(manager, "toggle_channel_to_group")
+    assert manager.channel_to_group_enabled() is True
