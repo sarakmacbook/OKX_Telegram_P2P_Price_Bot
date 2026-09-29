@@ -241,6 +241,31 @@ def test_a_gif_sent_as_a_file_is_posted_without_a_size_it_does_not_have(router):
     assert "width" not in sent.kwargs and "height" not in sent.kwargs
 
 
+def test_a_gif_sent_as_a_file_is_known_as_one_so_the_banner_is_not_lost(router):
+    """📎 the rescue is keyed on which real Telegram field the id came from."""
+    asked = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN))
+
+    router.bot.edit_set(asked, "awaiting_custom", "banner_media")
+    router.send(_private(document={"file_id": "BQACAgIAAxkBAAIBnGif", "file_unique_id": "u4",
+                                  "mime_type": "image/gif", "file_name": "rates.gif"}))
+    assert router.bot.banner_raw() is True                # a document id, maybe unplayable
+
+    router.bot.edit_set(asked, "awaiting_custom", "banner_media")
+    router.send(_private(animation={"file_id": "CgACAgIAAxkBAAIBnGif", "file_unique_id": "u5",
+                                    "width": 480, "height": 480, "duration": 2}))
+    assert router.bot.banner_raw() is False               # a real animation id plays
+
+
+def test_a_photo_banner_is_never_marked_as_a_file(router):
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+
+    router.send(_private(photo=[{"file_id": "AgACAgIAAxkBAAICbig", "file_unique_id": "u2",
+                                 "width": 1600, "height": 900}]))
+
+    assert router.bot.banner_raw() is False
+
+
 def test_turning_full_hd_off_stops_passing_the_size(router):
     router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
                         "awaiting_custom", "banner_media")

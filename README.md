@@ -450,6 +450,11 @@ the report**, with the buttons under it.
   `sendAnimation`, so Telegram renders the animation **at its own size** instead of picking a
   smaller preview. A photo banner needs no such fields — the bot always keeps the **largest** copy
   Telegram made of your upload. Turn 📐 off if you would rather Telegram choose the display size.
+* **📎 A GIF sent as a file never loses the banner** — sending a GIF *without compression* keeps
+  every byte of it, but the id Telegram gives that upload is a **document** id, and
+  `sendAnimation` does not always play one. When it refuses, the bot posts the **file itself**
+  with the prices in its caption: a banner that the client opens on a tap still beats a price
+  post with no banner at all. 👁 Send a test tells you which of the two the group received.
 * **👁 Send a test** / **👁 Preview** — see exactly what the group will get, including the size the
   GIF went out at.
 * **🗑 Remove banner** — back to a plain text post.
@@ -460,11 +465,11 @@ the report**, with the buttons under it.
 > and a very large picture is downscaled into its photo copies) is out of the bot's hands — so
 > upload the banner at the size you want your group to see, and tap 👁 Send a test to confirm.
 
-Telegram caps a **caption at 1024 characters** (photo or animation alike), so a longer report is
-posted as a plain text message and the banner is skipped (logged, and the test tells you). A
-banner Telegram refuses (deleted file, dead URL) also falls back to the text post. Deleting the
-previous message (**🗑 Auto-delete prev**) and the `N`-hour auto-delete both cover the banner
-message too.
+Telegram caps a **caption at 1024 characters** (photo, animation or file alike), so a longer
+report is posted as a plain text message and the banner is skipped (logged, and the test tells
+you). A banner Telegram refuses for good — a deleted file, a dead URL, an upload that has gone
+from its storage — also falls back to the text post. Deleting the previous message
+(**🗑 Auto-delete prev**) and the `N`-hour auto-delete both cover the banner message too.
 
 > 🎞 Switching a photo banner for a GIF (or back), or turning **📐 full HD** on or off, counts as a
 > change, so the next price post goes out again even if the prices have not moved.
