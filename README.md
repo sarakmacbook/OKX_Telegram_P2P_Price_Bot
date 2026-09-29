@@ -349,7 +349,7 @@ P2P profile by default**, where users can choose an ad themselves.
 | 🔗 **BUY / SELL link** | Optional custom URL — overrides the target for that side (`{AD_URL}`, `{AD_ID}`, `{PRICE}`, `{URL}`, `{NICK}`, … available) |
 | 🔗 **Ad link templates** | Edit the deep-link template of each exchange (Binance / Bybit / OKX / Bitget) |
 | 🖼 **Button icons** | Put a custom-emoji image (and a colour) in front of any button label — see below |
-| 🖼 **Post banner** | Post a photo **or a GIF** with the prices in its caption — see below |
+| 🖼 **Post banner** | Post a photo **or a GIF** — with the prices in its caption and the media at its own full-HD size — see below |
 | ♻️ **Reset buttons to default** | Restore both Buy/Sell buttons and profile links, clear extras and overrides, and turn buttons ON; asks for confirmation if extras would be deleted |
 
 Defaults:
@@ -433,7 +433,7 @@ emoji do.
 > refuses the icons, the bot notices once, logs it, and keeps posting with plain buttons — a price
 > post is never lost because of a decoration.
 
-### 🖼 Post banner — a photo **or a GIF** with the prices in its caption
+### 🖼 Post banner — a photo **or a GIF** in full HD, with the prices in its caption
 
 **⚙️ Settings → 🖼 Post banner** puts a picture (your logo, a banner, a rate card — or an
 animated GIF) above the prices: the post is then sent as a **photo or animation whose caption is
@@ -445,8 +445,20 @@ the report**, with the buttons under it.
 * **🔗 Use an image URL** — an `https://` JPG/PNG link instead (a link ending in `.gif` is posted
   as an animation automatically).
 * **🎞 Use a GIF URL** — an `https://` GIF (or silent MP4) link, always posted as an animation.
-* **👁 Send a test** / **👁 Preview** — see exactly what the group will get.
+* **📐 Post in full HD** — ON by default, and it is what makes an uploaded GIF stay sharp: the
+  bot remembers the `width`, `height` and `duration` of the file you sent and passes them to
+  `sendAnimation`, so Telegram renders the animation **at its own size** instead of picking a
+  smaller preview. A photo banner needs no such fields — the bot always keeps the **largest** copy
+  Telegram made of your upload. Turn 📐 off if you would rather Telegram choose the display size.
+* **👁 Send a test** / **👁 Preview** — see exactly what the group will get, including the size the
+  GIF went out at.
 * **🗑 Remove banner** — back to a plain text post.
+
+> 📐 **What full HD does and does not do.** The bot never re-encodes, resamples or crops your
+> media: it posts the file Telegram already has, at the size that file measures. What Telegram did
+> to the upload *before* the bot could see it (a GIF sent as media is converted to a silent MP4,
+> and a very large picture is downscaled into its photo copies) is out of the bot's hands — so
+> upload the banner at the size you want your group to see, and tap 👁 Send a test to confirm.
 
 Telegram caps a **caption at 1024 characters** (photo or animation alike), so a longer report is
 posted as a plain text message and the banner is skipped (logged, and the test tells you). A
@@ -454,8 +466,8 @@ banner Telegram refuses (deleted file, dead URL) also falls back to the text pos
 previous message (**🗑 Auto-delete prev**) and the `N`-hour auto-delete both cover the banner
 message too.
 
-> 🎞 Switching a photo banner for a GIF (or back) counts as a change, so the next price post goes
-> out again even if the prices have not moved.
+> 🎞 Switching a photo banner for a GIF (or back), or turning **📐 full HD** on or off, counts as a
+> change, so the next price post goes out again even if the prices have not moved.
 
 ### 👤 Buy/Sell buttons open the **merchant profile**
 
