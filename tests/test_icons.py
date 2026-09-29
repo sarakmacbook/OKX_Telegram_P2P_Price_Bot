@@ -6,8 +6,9 @@ the icon by the emoji a label starts with, so one setting per emoji covers every
 button that uses it: the group price post, the admin panel and the menus.
 
 These tests pin that mapping, both ways of setting an icon (forwarding the emoji
-or pasting its id), the screens, the banner photo (and its caption-limit
-fallback), and that malformed saved state can never break a keyboard.
+or pasting its id), the screens, the banner photo and GIF (their caption-limit
+fallback and the size they are posted at — 📐 full HD), and that malformed
+saved state can never break a keyboard.
 """
 
 import asyncio
@@ -407,7 +408,7 @@ def test_the_banner_url_flow_validates_and_saves(bot):
 def test_the_banner_screen_shows_the_state_and_its_actions(bot):
     assert "none" in bot.banner_text()
     assert [b.callback_data for b in _buttons(bot.banner_kb())] == ["banner_send", "banner_url",
-                                                                    "banner_gif_url",
+                                                                    "banner_gif_url", "banner_hd",
                                                                     "button_icons", "preview",
                                                                     "settings"]
 
@@ -547,7 +548,202 @@ def test_a_gif_banner_and_a_garbage_kind_are_sanitised_on_load(bot, monkeypatch)
     assert bot.load()["settings"]["post_photo_kind"] == "photo"
 
 
-# ── sending: banner photo vs. caption limit ────────────────────────────────
+# ── 📐 full HD: the banner goes out at the size it was uploaded at ─────────
+def test_a_fresh_install_posts_the_banner_in_full_hd(bot):
+    """HD is the default — nobody should have to find the switch to look sharp."""
+    assert bot.banner_hd() is True
+    assert bot.DEFAULT_SETTINGS["post_photo_hd"] is True
+    assert bot.banner_send_kwargs() == {}                 # no banner, so nothing to pass
+
+
+# a size is only trusted when both sides are real numbers; the play length is a
+# decoration, so anything odd about it is dropped and the size itself survives
+@pytest.mark.parametrize("value,kept", [
+    ({"width": 1080, "height": 640, "duration": 3},
+     {"width": 1080, "height": 640, "duration": 3}),
+    ({"width": 1080.0, "height": 640}, {"width": 1080, "height": 640, "duration": 0}),
+    ({"width": "800", "height": "600", "duration": ""},
+     {"width": 800, "height": 600, "duration": 0}),
+    ({"width": 1080, "height": 640, "duration": True},
+     {"width": 1080, "height": 640, "duration": 0}),        # only a decoration → dropped
+    ({"width": 1080, "height": 640, "duration": 900},
+     {"width": 1080, "height": 640, "duration": 0}),   # a wild play length never costs the size
+    ({"width": 1080}, {}),                                # a half-known size is not a size
+    ({"width": 1080, "height": 0}, {}),                    # would render an invisible banner
+    ({"width": 99999, "height": 640}, {}),                 # past what Telegram accepts
+    ({"width": -5, "height": 640}, {}),
+    ({}, {}), ("", {}), (None, {}), ([], {}),
+])
+def test_only_a_believable_size_is_kept(bot, value, kept):
+    assert bot.clean_banner_size(value) == kept
+
+
+def test_an_uploaded_gif_is_remembered_at_its_own_size(bot):
+    update = _media_update(animation=SimpleNamespace(file_id="CgACAgIAAxkBAAIBnGif",
+                                                      width=1080, height=640, duration=4))
+    bot.edit_set(update, "awaiting_custom", "banner_media")
+
+    asyncio.run(bot.on_animation(update, SimpleNamespace()))
+
+    assert bot.banner_size() == {"width": 1080, "height": 640, "duration": 4}
+    assert "1080×640" in bot.banner_text()                # the screen says what is stored
+    assert "Full HD: ON ✅" in bot.banner_text()
+
+
+def test_an_uploaded_gif_is_posted_at_the_size_it_was_sent_at(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation",
+                   {"width": 1080, "height": 640, "duration": 4})
+    fake = _FakeBot()
+
+    asyncio.run(bot.send_report(fake, -100123, "📊 P2P USDT/USD", "KB"))
+
+    kind, _, kwargs = fake.calls[0]
+    assert kind == "animation"
+    assert (kwargs["width"], kwargs["height"], kwargs["duration"]) == (1080, 640, 4)
+
+
+def test_turning_full_hd_off_holds_the_size_back(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation",
+                   {"width": 1080, "height": 640, "duration": 4})
+    bot.state["settings"]["post_photo_hd"] = False
+    fake = _FakeBot()
+
+    asyncio.run(bot.send_report(fake, -100123, "📊 P2P USDT/USD", "KB"))
+
+    assert "width" not in fake.calls[0][2] and "height" not in fake.calls[0][2]
+    assert "Full HD: OFF ❌" in bot.banner_text()
+
+
+def test_a_photo_banner_needs_no_size_field_but_keeps_its_largest_copy(bot):
+    """``sendPhoto`` has no dimensions — the HD photo copy is stored and posted as is."""
+    photos = [SimpleNamespace(file_id="small", width=100, height=100),
+              SimpleNamespace(file_id="AgACAgIAAxkBAAICbig", width=1600, height=900),
+              SimpleNamespace(file_id="medium", width=400, height=400)]
+    update = _media_update(photo=photos)
+    bot.edit_set(update, "awaiting_custom", "banner_media")
+
+    asyncio.run(bot.on_photo(update, SimpleNamespace()))
+
+    assert bot.post_banner() == "AgACAgIAAxkBAAICbig"     # the largest, not simply the last
+    assert bot.banner_size() == {"width": 1600, "height": 900, "duration": 0}
+
+    fake = _FakeBot()
+    asyncio.run(bot.send_report(fake, -100123, "📊 P2P USDT/USD", "KB"))
+
+    kind, _, kwargs = fake.calls[0]
+    assert kind == "photo"
+    assert "width" not in kwargs and "duration" not in kwargs
+
+
+def test_a_gif_sent_as_a_file_claims_no_size_it_does_not_have(bot):
+    """A GIF that arrives as a document carries no dimensions — nothing is invented."""
+    update = _media_update(document=SimpleNamespace(file_id="BQACAgIAAxkBAAIBnGif",
+                                                     mime_type="image/gif",
+                                                     file_name="rates.gif"))
+    bot.edit_set(update, "awaiting_custom", "banner_media")
+
+    asyncio.run(bot.on_animation(update, SimpleNamespace()))
+
+    assert bot.banner_kind() == "animation"
+    assert bot.banner_size() == {}
+    assert bot.banner_send_kwargs() == {}                  # Telegram reads the file itself
+    assert "nothing to downscale" in bot.banner_text()
+
+
+def test_a_new_banner_never_inherits_the_size_of_the_old_one(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation",
+                   {"width": 1080, "height": 640, "duration": 4})
+    update = _media_update(text="https://cdn.example.com/rates.gif")
+    bot.edit_set(update, "awaiting_custom", "banner_gif_url")
+
+    asyncio.run(bot.on_text(update, SimpleNamespace()))
+
+    assert bot.post_banner() == "https://cdn.example.com/rates.gif"
+    assert bot.banner_size() == {}
+    assert bot.banner_send_kwargs() == {}
+
+
+def test_the_hd_switch_flips_saves_and_relabels_itself(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation",
+                   {"width": 720, "height": 720, "duration": 2})
+    update, query = _admin_update("banner_hd")
+
+    assert bot.banner_hd_label() == "ON ✅"
+    asyncio.run(bot.on_button(update, SimpleNamespace()))
+
+    assert bot.banner_hd() is False
+    assert query.answer.await_args.args[0].startswith("📐 Full HD OFF")
+    assert bot.banner_kb().inline_keyboard[2][0].text == "📐 Post in full HD: OFF ❌"
+    assert bot.STORE.load()["settings"]["post_photo_hd"] is False      # survives a restart
+
+
+def test_turning_full_hd_off_reposts_unchanged_prices(bot, merchant, prices, monkeypatch):
+    """The post looks different, so it goes out again — same rule as a new banner."""
+    bot.state["merchants"][merchant.key] = merchant.__dict__
+    bot.state["group"] = -100123
+    monkeypatch.setattr(bot, "get_prices", AsyncMock(return_value=prices))
+    fake = _FakeBot()
+    fake.delete_message = AsyncMock()
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation",
+                   {"width": 1080, "height": 640, "duration": 4})
+
+    assert asyncio.run(bot.post(fake)) is True
+    assert asyncio.run(bot.post(fake)) is False                        # unchanged
+    assert fake.calls[-1][2]["width"] == 1080
+
+    assert bot.toggle_banner_hd() is False
+    assert asyncio.run(bot.post(fake)) is True
+    assert "width" not in fake.calls[-1][2]
+
+
+def test_the_test_post_says_what_size_the_gif_went_out_at(bot):
+    bot.set_banner("CgACAgIAAxkBAAIBnGif", "animation",
+                   {"width": 1080, "height": 640, "duration": 4})
+    fake = _FakeBot()
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=424242),
+                             effective_chat=SimpleNamespace(type="private", id=424242))
+
+    asyncio.run(bot.banner_test(update, SimpleNamespace(bot=fake)))
+
+    assert "1080×640" in fake.calls[-1][2]["text"]
+
+
+def test_a_saved_size_and_hd_flag_are_sanitised_on_load(bot, monkeypatch):
+    monkeypatch.setattr(bot.STORE, "load", lambda: {
+        "settings": {"post_photo": "CgACAgIAAxkBAAIBnGif",
+                     "post_photo_size": {"width": 1080, "height": "tall", "duration": 4}}})
+    assert bot.load()["settings"]["post_photo_size"] == {}      # not a size → not trusted
+
+    monkeypatch.setattr(bot.STORE, "load", lambda: {
+        "settings": {"post_photo": "CgACAgIAAxkBAAIBnGif", "post_photo_kind": "animation",
+                     "post_photo_size": {"width": 1080, "height": 640, "duration": 4},
+                     "post_photo_hd": "yes"}})
+    loaded = bot.load()
+
+    assert loaded["settings"]["post_photo_size"] == {"width": 1080, "height": 640, "duration": 4}
+    assert loaded["settings"]["post_photo_hd"] is True         # a non-bool → the default
+
+
+def test_a_size_never_survives_the_banner_it_belongs_to(bot, monkeypatch):
+    monkeypatch.setattr(bot.STORE, "load", lambda: {
+        "settings": {"post_photo": "", "post_photo_size": {"width": 1080, "height": 640}}})
+
+    assert bot.load()["settings"]["post_photo_size"] == {}
+
+
+def test_the_fields_are_real_telegram_fields(bot):
+    """A made-up field would cost every banner post — only what Telegram knows is sent."""
+    import inspect
+
+    from telegram import Bot
+    animation = inspect.signature(Bot.send_animation).parameters
+    document = inspect.signature(Bot.send_document).parameters
+
+    assert {"width", "height", "duration"} <= set(animation)
+    assert {"document", "caption", "parse_mode", "reply_markup"} <= set(document)
+
+
+
 class _FakeBot:
     """Records what would be sent to the group."""
 
@@ -565,6 +761,13 @@ class _FakeBot:
             raise RuntimeError("Bad Request: animation not found")
         self.calls.append(("animation", chat_id, kwargs))
         return SimpleNamespace(message_id=7, photo=None, animation=object(),
+                               caption=kwargs.get("caption"))
+
+    async def send_document(self, chat_id, **kwargs):
+        # the file is the *rescue* for an animation Telegram refuses to play, so it
+        # works here unless a test says the upload itself is gone
+        self.calls.append(("document", chat_id, kwargs))
+        return SimpleNamespace(message_id=7, photo=None, animation=None, document=object(),
                                caption=kwargs.get("caption"))
 
     async def send_message(self, chat_id, text, **kwargs):
@@ -624,6 +827,161 @@ def test_a_gif_banner_telegram_refuses_falls_back_to_text(bot):
     asyncio.run(bot.send_report(fake, -100123, "short report", "KB"))
 
     assert [call[0] for call in fake.calls] == ["text"]
+
+
+# ── 📎 a GIF that came in as a file is never traded for a text post ────────
+def test_a_file_gif_the_player_refuses_is_posted_as_the_file(bot):
+    """A document id is not always playable — the file itself still carries the banner."""
+    bot.set_banner("BQACAgIAAxkBAAIBnGif", "animation", {}, raw=True)
+    fake = _FakeBot(fail_photo=True)
+
+    asyncio.run(bot.send_report(fake, -100123, "📊 P2P USDT/USD\n🔴 0.999", "KB"))
+
+    kind, chat_id, kwargs = fake.calls[0]
+    assert (kind, chat_id) == ("document", -100123)
+    assert kwargs["document"] == "BQACAgIAAxkBAAIBnGif"
+    assert kwargs["caption"].startswith("📊 P2P")
+    assert kwargs["parse_mode"] == "HTML" and kwargs["reply_markup"] == "KB"
+    assert "width" not in kwargs                       # a file has no size to pass
+
+
+@pytest.mark.parametrize("banner,raw", [
+    ("https://cdn.example.com/rates.gif", False),      # Telegram downloads the link
+    ("CgACAgIAAxkBAAIBnGif", False),                   # a GIF sent as a GIF
+])
+def test_only_a_file_id_is_rescued_as_a_file(bot, banner, raw):
+    """The rescue is for the one id type that needs it — anything else is really gone."""
+    bot.set_banner(banner, "animation", {}, raw=raw)
+    fake = _FakeBot(fail_photo=True)
+
+    asyncio.run(bot.send_report(fake, -100123, "short report", "KB"))
+
+    assert [call[0] for call in fake.calls] == ["text"]
+
+
+def test_a_gone_upload_loses_the_banner_the_way_it_always_did(bot):
+    """File refused too (deleted upload): the post still goes out, as text."""
+
+    class _FileGoneToo(_FakeBot):
+        async def send_document(self, chat_id, **kwargs):
+            self.calls.append(("document", chat_id, kwargs))     # tried…
+            raise RuntimeError("Bad Request: file not found")    # …the upload is really gone
+
+    bot.set_banner("BQACAgIAAxkBAAIBnGif", "animation", {}, raw=True)
+    fake = _FileGoneToo(fail_photo=True)
+
+    asyncio.run(bot.send_report(fake, -100123, "short report", "KB"))
+
+    assert [call[0] for call in fake.calls] == ["document", "text"]
+
+
+def test_an_icon_refusal_is_not_mistaken_for_a_refused_banner(bot, merchant, prices, monkeypatch):
+    """The buttons are the problem there — rebuilding them beats sending a file."""
+    monkeypatch.setattr(bot, "_rejected_icons", None)
+    bot.state["merchants"][merchant.key] = merchant.__dict__
+    bot.state["settings"]["button_icons"] = {"🟢": {"icon": "5368324170671202286"}}
+    bot.set_banner("BQACAgIAAxkBAAIBnGif", "animation", {}, raw=True)
+
+    class _PickyAboutIcons(_FakeBot):
+        """Refuses an animation whose buttons carry an icon, then accepts it."""
+
+        @staticmethod
+        def _has_icons(kwargs):
+            rows = getattr(kwargs.get("reply_markup"), "inline_keyboard", None) or []
+            return any(b.to_dict().get("icon_custom_emoji_id") for row in rows for b in row)
+
+        async def send_animation(self, chat_id, **kwargs):
+            if self._has_icons(kwargs):
+                raise RuntimeError("Bad Request: BUTTON_ICON_CUSTOM_EMOJI_ID_INVALID")
+            return await super().send_animation(chat_id, **kwargs)
+
+    fake = _PickyAboutIcons()
+
+    asyncio.run(bot.send_report(fake, -100123, "report", bot.report_keyboard(prices),
+                                rebuild=lambda: bot.report_keyboard(prices)))
+
+    assert [call[0] for call in fake.calls] == ["animation"]     # played after the rebuild
+    assert bot.icons_available() is False                        # remembered, as everywhere else
+
+
+def test_a_gif_sent_as_media_is_not_marked_as_a_file(bot):
+    update = _media_update(animation=SimpleNamespace(file_id="CgACAgIAAxkBAAIBnGif",
+                                                      width=1080, height=640, duration=4))
+    bot.edit_set(update, "awaiting_custom", "banner_media")
+
+    asyncio.run(bot.on_animation(update, SimpleNamespace()))
+
+    assert bot.banner_raw() is False
+
+
+def test_a_gif_sent_as_a_file_is_marked_so_the_post_can_be_rescued(bot):
+    update = _media_update(document=SimpleNamespace(file_id="BQACAgIAAxkBAAIBnGif",
+                                                     mime_type="image/gif",
+                                                     file_name="rates.gif"))
+    bot.edit_set(update, "awaiting_custom", "banner_media")
+
+    asyncio.run(bot.on_animation(update, SimpleNamespace()))
+
+    assert bot.banner_raw() is True
+    assert "Posted from your file" in bot.banner_text()     # the screen says how it is delivered
+
+
+def test_a_playable_gif_has_nothing_to_explain(bot):
+    update = _media_update(animation=SimpleNamespace(file_id="CgACAgIAAxkBAAIBnGif",
+                                                      width=1080, height=640, duration=4))
+    bot.edit_set(update, "awaiting_custom", "banner_media")
+
+    asyncio.run(bot.on_animation(update, SimpleNamespace()))
+
+    assert "Posted from your file" not in bot.banner_text()
+
+
+def test_the_rescue_flag_belongs_to_the_banner_it_was_set_for(bot):
+    assert bot.banner_raw() is False
+    bot.set_banner("BQACAgIAAxkBAAIBnGif", "animation", {}, raw=True)
+    assert bot.banner_raw() is True
+    bot.set_banner("AgACAgIAAxkBAAICbig", "photo")               # a photo has its own method
+    assert bot.banner_raw() is False
+    bot.set_banner("BQACAgIAAxkBAAIBnGif", "animation", {}, raw=True)
+    bot.set_banner("", "photo")                                  # removed with the banner
+    assert bot.banner_raw() is False
+
+
+@pytest.mark.parametrize("banner,kind,raw,kept", [
+    ("BQACAgIAAxkBAAIBnGif", "animation", True, True),
+    ("BQACAgIAAxkBAAIBnGif", "animation", "yes", True),
+    ("BQACAgIAAxkBAAIBnGif", "animation", False, False),
+    ("https://cdn.example.com/rates.gif", "animation", True, False),   # not an upload
+    ("AgACAgIAAxkBAAICbig", "photo", True, False),                     # not a GIF
+    ("", "animation", True, False),                                    # no banner at all
+])
+def test_the_rescue_flag_is_only_kept_where_it_means_something(bot, banner, kind, raw, kept):
+    assert bot.clean_banner_raw(raw, banner, kind) is kept
+
+
+def test_the_rescue_flag_is_sanitised_with_the_banner(bot, monkeypatch):
+    monkeypatch.setattr(bot.STORE, "load", lambda: {
+        "settings": {"post_photo": "BQACAgIAAxkBAAIBnGif", "post_photo_kind": "animation",
+                     "post_photo_raw": True}})
+    assert bot.load()["settings"]["post_photo_raw"] is True
+
+    monkeypatch.setattr(bot.STORE, "load", lambda: {
+        "settings": {"post_photo": "https://cdn.example.com/rates.gif",
+                     "post_photo_kind": "animation", "post_photo_raw": True}})
+    assert bot.load()["settings"]["post_photo_raw"] is False
+
+
+def test_the_test_post_says_a_refused_gif_went_out_as_a_file(bot):
+    bot.set_banner("BQACAgIAAxkBAAIBnGif", "animation", {}, raw=True)
+    fake = _FakeBot(fail_photo=True)
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=424242),
+                             effective_chat=SimpleNamespace(type="private", id=424242))
+
+    asyncio.run(bot.banner_test(update, SimpleNamespace(bot=fake)))
+
+    assert [call[0] for call in fake.calls] == ["document", "text"]
+    note = fake.calls[-1][2]["text"]
+    assert "your banner" in note and "📎" in note
 
 
 def test_a_gif_report_longer_than_a_caption_drops_the_gif(bot):
