@@ -20,7 +20,7 @@ def test_private_command_menu_shows_start_to_everyone_and_admin_tools_to_admins(
     assert admin_call.kwargs["scope"].chat_id == 424242
     assert {command.command for command in admin_call.args[0]} == {
         "start", "setgroup", "setchannel", "forwardfrom", "stopforward",
-        "preview", "database", "cancel",
+        "preview", "cleanup", "database", "cancel",
     }
 
 

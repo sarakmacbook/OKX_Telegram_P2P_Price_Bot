@@ -20,7 +20,8 @@ GROUP, CHANNEL, ADMIN, NEWCOMER = -100123, -100987, 424242, 555
 
 BOT_METHODS = ("send_message", "send_photo", "send_animation", "copy_message",
                "forward_message", "delete_message", "restrict_chat_member", "ban_chat_member",
-               "unban_chat_member", "edit_message_text", "answer_callback_query")
+               "unban_chat_member", "edit_message_text", "answer_callback_query",
+               "get_chat_administrators")
 
 
 class Runner:
@@ -67,12 +68,16 @@ def router(bot, monkeypatch, tmp_path):
     bot.state["group_title"] = "Rates"
     bot.save()
 
+    bot._ADMIN_CACHE.clear()      # 🧹 remembers the group's admins between updates
+    bot._CLEANUP_SKIP.clear()
+
     runner = Runner(bot)
     # a Bot instance is frozen once built, so the calls are stubbed on the class
     for name in BOT_METHODS:
         mock = AsyncMock(return_value=SimpleNamespace(message_id=42), name=name)
         monkeypatch.setattr(ExtBot, name, mock)
         runner.calls[name] = mock
+    runner.calls["get_chat_administrators"].return_value = []
     return runner
 
 
@@ -484,3 +489,99 @@ def test_group_to_channel_media(router):
     calls = router.send(_chat_message(GROUP, "supergroup", message_id=50, photo=[
         {"file_id": "AgACAgIAAxkBAAICbig", "file_unique_id": "u3", "width": 1, "height": 1}]))
     assert calls["copy_message"].await_args.kwargs["chat_id"] == CHANNEL
+
+# ── 🧹 group cleanup runs *next to* the handlers above ─────────────────────
+BOT_ID = 123456          # the user id the stubbed getMe gives the bot
+
+
+def _cleanup(router, **rules):
+    """Switch the 🧹 rules on; the administrator list stays empty by default."""
+    router.bot.state["settings"].update(rules)
+    router.bot.save()
+
+
+def test_the_cleanup_handler_sees_what_the_anti_scam_handler_took(router):
+    """PTB runs one handler per group, so 🧹 lives in a group of its own.
+
+    The wrong answer belongs to the 🛡 check, which deletes it — 🧹 must see the
+    same message (it is in handler group 1) and keep its hands off it.
+    """
+    _cleanup(router, cleanup_strict=True)
+    calls = router.send(_join())
+    record = router.bot.pending_captcha(GROUP, NEWCOMER)
+    assert record and record["word"]                       # the 🛡 challenge is open
+    assert calls["delete_message"].await_count == 1        # the "joined the group" notice
+
+    calls = router.send(_group("let me in"))
+
+    # one more, for the wrong answer — 🧹 saw the same message and kept off it
+    assert calls["delete_message"].await_count == 2
+    assert calls["delete_message"].await_args.kwargs["message_id"] == 11
+    assert router.bot.pending_captcha(GROUP, NEWCOMER)["tries"] == 1
+    assert router.bot.cleanup_stats()["removed"] == 1      # the join notice only
+
+
+def test_a_photo_in_the_group_is_removed_even_though_the_banner_handler_saw_it(router):
+    """🖼 on_photo takes every photo in group 0 — 🧹 still gets its turn."""
+    _cleanup(router, cleanup_media=True)
+
+    calls = router.send(_chat_message(GROUP, "supergroup", message_id=21, photo=[
+        {"file_id": "AgACAgIAAxkBAAICbig", "file_unique_id": "u9", "width": 1, "height": 1}]))
+
+    calls["delete_message"].assert_awaited_once_with(chat_id=GROUP, message_id=21)
+    assert router.bot.post_banner() == ""                  # and it was not read as a banner
+
+
+def test_a_link_is_removed_once_its_rule_is_on(router):
+    _cleanup(router, cleanup_links=True)
+
+    calls = router.send(_group("free money https://scam.example", message_id=22))
+
+    calls["delete_message"].assert_awaited_once_with(chat_id=GROUP, message_id=22)
+    assert router.bot.cleanup_stats()["removed"] == 1
+
+
+def test_an_ordinary_message_stays_when_no_rule_matches(router):
+    _cleanup(router, cleanup_links=True)
+
+    calls = router.send(_group("hello everyone", message_id=23))
+
+    calls["delete_message"].assert_not_awaited()
+
+
+def test_strict_mode_spares_the_bot_the_admins_and_the_group_administrators(router):
+    _cleanup(router, cleanup_strict=True)
+    router.calls["get_chat_administrators"].return_value = [
+        SimpleNamespace(user=SimpleNamespace(id=777, is_bot=False))]
+
+    calls = router.send(_group("the price post", user_id=BOT_ID, message_id=24))
+    calls["delete_message"].assert_not_awaited()           # the bot itself
+
+    calls = router.send(_group("announcement", user_id=ADMIN, message_id=25))
+    calls["delete_message"].assert_not_awaited()           # a bot admin
+
+    calls = router.send(_group("rules of the group", user_id=777, message_id=26))
+    calls["delete_message"].assert_not_awaited()           # a group administrator
+
+    calls = router.send(_group("buy now!", user_id=NEWCOMER, message_id=27))
+    calls["delete_message"].assert_awaited_once_with(chat_id=GROUP, message_id=27)
+
+
+def test_the_group_warning_goes_to_the_group_and_the_admins_get_their_copy(router):
+    _cleanup(router, cleanup_links=True, cleanup_notify="group")
+
+    calls = router.send(_group("free money https://scam.example", message_id=28))
+
+    calls["delete_message"].assert_awaited_once_with(chat_id=GROUP, message_id=28)
+    warning = calls["send_message"].await_args
+    assert warning.args[0] == GROUP and "removed" in warning.args[1]
+    assert router.bot.cleanup_notices()                    # it deletes itself later
+
+
+def test_the_cleanup_command_opens_its_screen_in_the_private_chat(router):
+    calls = router.send(_private("/cleanup", entities=[
+        {"type": "bot_command", "offset": 0, "length": 8}]))
+
+    text = calls["send_message"].await_args.kwargs["text"]
+    assert "🧹" in text and "Group cleanup" in text
+    assert calls["copy_message"].await_count == 0           # it was not reposted

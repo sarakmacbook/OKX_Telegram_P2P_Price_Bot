@@ -396,6 +396,9 @@ async def run_tick() -> dict:
         result["deleted_stale_message"] = bool(await bot_module.cleanup_task(app.bot))
         # serverless has no JobQueue: expired anti-scam checks are swept here
         result["captcha_expired"] = int(await bot_module.sweep_captcha(app.bot))
+        # 🧹 …and so are the group-cleanup warnings still standing in the group
+        result["cleanup"] = bot_module.cleanup_summary()
+        result["cleanup_warnings_removed"] = int(await bot_module.sweep_cleanup_notices(app.bot))
         result["auto"] = bool(bot_module.state.get("auto"))
         result["group"] = bot_module.state.get("group")
         result["channel"] = bot_module.state.get("channel")
