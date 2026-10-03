@@ -8,7 +8,8 @@ from dataclasses import asdict
 from urllib.parse import urlsplit
 from pathlib import Path
 import httpx
-from telegram import (Update, ChatPermissions, InlineKeyboardButton as _TelegramButton,
+from telegram import (Update, ChatPermissions, BotCommand, BotCommandScopeAllPrivateChats,
+                      BotCommandScopeChat, InlineKeyboardButton as _TelegramButton,
                       InlineKeyboardMarkup as KB)
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, ChatMemberHandler, ContextTypes, filters)
@@ -399,11 +400,16 @@ DEFAULT_SETTINGS = {
     # ── look of the buttons and the post ──
     "button_icons": {},            # {"🟢": {"icon": "<custom emoji id>", "style": "success"}}
     "post_photo": "",              # banner for the group post: file_id or https URL
+    "post_photo_kind": "photo",    # how to send it: "photo" (send_photo) | "animation" (GIF)
+    "post_photo_size": {},         # what the uploaded file measures: {width, height, duration}
+    "post_photo_hd": True,         # deliver the banner at its own size (📐 Full HD)
+    "post_photo_raw": False,       # the GIF came in as a file → its id is a document id
     # ── reposting what the admin sends in the private chat ──
     "forward_target": "group",     # "off" | "group" | "channel" | "both"
     # ── ↪️ reposting new messages from the selected chats into the group ──
     # which chats: state["forward_sources"] (empty = the configured channel)
     "channel_to_group": True,
+    "group_to_channel": False,     # opt in: ordinary group posts to price channel
     # ── anti-scam verification for new members ──
     "captcha_enabled": True,       # mute new members until they type a random word
     "captcha_message": "",         # empty = DEFAULT_CAPTCHA_MESSAGE
@@ -602,6 +608,22 @@ def B(text, *, icon=None, style=None, **kwargs):
 
 
 # ── the post banner ─────────────────────────────────────────────────────────
+#: how a banner is delivered — a still picture goes out with ``send_photo``, a
+#: GIF (or any other silent animation) with ``send_animation``, which Telegram
+#: plays inline in the post.  ``post_photo`` holds *what* to send,
+#: ``post_photo_kind`` *how* — an animation file id only works with the method
+#: it came from — and ``post_photo_size`` *how big*, so the post shows the file
+#: at the size it was uploaded at instead of a preview (📐 Full HD).
+BANNER_KINDS = ("photo", "animation")
+BANNER_KIND_LABELS = {"photo": "photo", "animation": "GIF"}
+#: the ``awaiting_custom`` keys the banner screens use (``banner_photo`` is the
+#: old name of ``banner_media``, still honoured for a prompt left open across
+#: an upgrade)
+BANNER_AWAITING = ("banner_media", "banner_photo", "banner_url", "banner_gif_url")
+#: a URL ending in one of these is delivered as an animation
+ANIMATION_URL_SUFFIXES = (".gif", ".mp4")
+
+
 def valid_photo_url(value: str) -> bool:
     """An http(s) image URL Telegram can download for ``send_photo``."""
     if not isinstance(value, str) or not value or len(value) > 2048:
@@ -624,6 +646,153 @@ def clean_banner(value) -> str:
     if text.startswith(("http://", "https://")):
         return text if valid_photo_url(text) else ""
     return text if re.fullmatch(r"[A-Za-z0-9_\-=]{10,200}", text) else ""
+
+
+def clean_banner_kind(value) -> str:
+    """``"animation"`` for a GIF, ``"photo"`` for anything else (the default)."""
+    kind = str(value or "").strip().lower()
+    return kind if kind in BANNER_KINDS else "photo"
+
+
+def banner_kind() -> str:
+    """How the current banner has to be sent: ``"photo"`` or ``"animation"``."""
+    return clean_banner_kind(get_settings().get("post_photo_kind"))
+
+
+def banner_kind_label(kind: str = "") -> str:
+    """``"GIF"`` or ``"photo"`` — what the admin is shown for the current banner."""
+    return BANNER_KIND_LABELS.get(clean_banner_kind(kind or banner_kind()), "photo")
+
+
+def banner_kind_from_url(url) -> str:
+    """A link that ends in ``.gif`` / ``.mp4`` is an animation, the rest a photo."""
+    try:
+        path = urlsplit(str(url or "")).path.lower()
+    except ValueError:
+        return "photo"
+    return "animation" if path.endswith(ANIMATION_URL_SUFFIXES) else "photo"
+
+
+#: An HD banner is delivered with the measurements of the file the admin sent:
+#: ``sendAnimation`` then plays the GIF at its own size, instead of the small
+#: preview Telegram picks for an animation that carries no size info.  A still
+#: photo needs nothing (``sendPhoto`` always uses the largest copy of the
+#: upload) and a URL — like a GIF that arrived as a plain file — has no
+#: measured size here, so no size is claimed for it: a wrong one, shown as a
+#: stretched or letterboxed banner, is worse than none.
+BANNER_SIZE_LIMITS = {"width": (1, 10000), "height": (1, 10000)}
+#: how long a silent GIF/MP4 may claim to play for — a decoration, so an absurd
+#: value is dropped instead of throwing the whole size away
+BANNER_DURATION_LIMIT = 600
+
+
+def _size_number(raw, low: int, high: int):
+    """One field of a banner size: an int inside its bounds, ``0`` when absent.
+
+    ``None`` means *unusable* — the caller then drops the whole size.
+    """
+    if raw is None or raw == "":
+        return 0 if low == 0 else None
+    if isinstance(raw, bool):
+        return None
+    try:
+        number = int(round(float(raw)))
+    except (TypeError, ValueError):
+        return None
+    return number if low <= number <= high else None
+
+
+def clean_banner_size(value) -> dict:
+    """A believable ``{width, height, duration}`` — or nothing at all."""
+    if not isinstance(value, dict):
+        return {}
+    size = {}
+    for key, (low, high) in BANNER_SIZE_LIMITS.items():
+        number = _size_number(value.get(key), low, high)
+        if number is None:
+            return {}                      # half a size is worse than none
+        size[key] = number
+    duration = _size_number(value.get("duration"), 0, BANNER_DURATION_LIMIT)
+    size["duration"] = duration or 0                       # only the play length, so never fatal
+    return size
+
+
+def banner_size() -> dict:
+    """What the current banner measures (``{}`` when nothing is known about it)."""
+    return clean_banner_size(get_settings().get("post_photo_size"))
+
+
+def banner_hd() -> bool:
+    """Post the banner at its own size — on, unless the admin turned it off."""
+    return bool(get_settings().get("post_photo_hd", True))
+
+
+def banner_hd_label() -> str:
+    """``"ON ✅"`` / ``"OFF ❌"`` — how the 📐 switch reads on the banner screen."""
+    return "ON ✅" if banner_hd() else "OFF ❌"
+
+
+def toggle_banner_hd() -> bool:
+    """📐 Full HD on/off for every future post; returns the new state."""
+    state["settings"]["post_photo_hd"] = not banner_hd()
+    save()
+    return banner_hd()
+
+
+def banner_size_label(size: dict = None) -> str:
+    """``"1080×640"`` for the banner screen, ``""`` when the size is unknown."""
+    size = banner_size() if size is None else clean_banner_size(size)
+    return f"{size['width']}×{size['height']}" if size else ""
+
+
+def clean_banner_raw(value, banner: str, kind: str) -> bool:
+    """Whether a banner id may have to go out as a file — and whether it may at all.
+
+    Only a GIF the admin sent *as a file* has a document id, the one id type
+    ``sendAnimation`` sometimes refuses.  A URL is downloaded by Telegram itself
+    (sending it as a document would only fetch the same link again) and a photo
+    has its own method, so the flag is dropped for both.
+    """
+    if not value or not banner or clean_banner_kind(kind) != "animation":
+        return False
+    return not banner.startswith(("http://", "https://"))
+
+
+def banner_raw() -> bool:
+    """Whether the stored GIF id came from a file the admin sent (uncompressed).
+
+    ``sendAnimation`` does not always accept a document id — the post then sends
+    the file itself rather than losing the banner.
+    """
+    return bool(get_settings().get("post_photo_raw"))
+
+
+def banner_send_kwargs(kind: str = "") -> dict:
+    """The ``sendAnimation`` fields that keep the banner in full HD.
+
+    Empty when the banner is a photo (the API has no size field there), when 📐
+    Full HD is off, or when nothing is known about the file's size.
+    """
+    if clean_banner_kind(kind or banner_kind()) != "animation" or not banner_hd():
+        return {}
+    size = banner_size()
+    if not size:
+        return {}
+    kwargs = {"width": size["width"], "height": size["height"]}
+    if size["duration"]:
+        kwargs["duration"] = size["duration"]
+    return kwargs
+
+
+def set_banner(value, kind: str = "photo", size=None, raw: bool = False) -> None:
+    """Store a banner, *how* it is delivered and *what it measures* (state only)."""
+    banner = clean_banner(value)
+    kind = clean_banner_kind(kind) if banner else "photo"
+    state["settings"]["post_photo"] = banner
+    state["settings"]["post_photo_kind"] = kind
+    state["settings"]["post_photo_size"] = clean_banner_size(size) if banner else {}
+    # only a GIF that came in as a file has a document id to worry about
+    state["settings"]["post_photo_raw"] = clean_banner_raw(raw, banner, kind)
 
 
 def post_banner() -> str:
@@ -666,6 +835,16 @@ def channel_to_group_enabled() -> bool:
 def toggle_channel_to_group() -> bool:
     enabled = not channel_to_group_enabled()
     state["settings"]["channel_to_group"] = enabled
+    save()
+    return enabled
+
+def group_to_channel_enabled() -> bool:
+    value = get_settings().get("group_to_channel")
+    return value if isinstance(value, bool) else DEFAULT_SETTINGS["group_to_channel"]
+
+def toggle_group_to_channel() -> bool:
+    enabled = not group_to_channel_enabled()
+    state["settings"]["group_to_channel"] = enabled
     save()
     return enabled
 
@@ -941,30 +1120,55 @@ def custom_emoji_id(message) -> str:
 
 
 async def send_report(bot, chat_id, text, kb, rebuild=None):
-    """Send a price post — as a banner photo with the report as its caption.
+    """Send a price post — as a banner with the report as its caption.
 
-    Telegram caps a caption at :data:`CAPTION_LIMIT` characters, so a longer
-    report is posted as a normal text message and the banner is skipped (logged,
-    never silently mangled).  A banner that Telegram refuses (deleted file,
-    unreachable URL) also falls back to the text post.
+    The banner is a photo (``send_photo``) or a GIF (``send_animation``); the
+    report becomes its caption either way.  A GIF is sent with its own
+    dimensions (📐 Full HD, on by default), so Telegram plays it at full size
+    instead of a downscaled preview.  Telegram caps a caption at
+    :data:`CAPTION_LIMIT` characters, so a longer report is posted as a normal
+    text message and the banner is skipped (logged, never silently mangled).
+    A GIF the admin uploaded *as a file* carries a document id, which
+    ``sendAnimation`` does not always play: then the file itself is sent with
+    the same caption (``send_document``), so the banner survives at its full
+    size instead of collapsing to text.  Any other banner Telegram refuses
+    (deleted file, unreachable URL) falls back to the text post.
 
     ``rebuild`` is a callable that builds the keyboard again; it is used when
     Telegram rejects the button icons, so the post goes out with plain buttons
     instead of not going out at all.
     """
-    photo = post_banner()
-    if photo and len(text) > CAPTION_LIMIT:
+    banner, kind = post_banner(), banner_kind()
+    if banner and len(text) > CAPTION_LIMIT:
         log.info("Report is %s characters — above the %s-character caption limit; "
                  "posting it without the banner", len(text), CAPTION_LIMIT)
-        photo = ""
+        banner = ""
 
     async def deliver(keyboard):
-        if photo:
+        if banner:
+            hd = banner_send_kwargs(kind)
             try:
-                return await bot.send_photo(chat_id, photo=photo, caption=text,
+                if kind == "animation":
+                    return await bot.send_animation(chat_id, animation=banner, caption=text,
+                                                    parse_mode="HTML", reply_markup=keyboard, **hd)
+                return await bot.send_photo(chat_id, photo=banner, caption=text,
                                             parse_mode="HTML", reply_markup=keyboard)
             except Exception as e:
-                log.warning("Could not send the banner (%s) — falling back to a text post", e)
+                if _looks_like_icon_refusal(e):
+                    raise                                     # the buttons, not the banner
+                reason = f"could not send the {kind} banner ({e})"
+                if kind == "animation" and banner_raw():
+                    # the GIF came in as a file, so its id is a document id and
+                    # sendAnimation does not always play one: the file itself then
+                    # carries the banner, at its own size, instead of a text post
+                    log.info("Telegram would not play the GIF banner (%s) — trying the file "
+                             "itself", e)
+                    try:
+                        return await bot.send_document(chat_id, document=banner, caption=text,
+                                                       parse_mode="HTML", reply_markup=keyboard)
+                    except Exception as file_error:
+                        reason = f"neither the GIF nor the file behind it went out ({file_error})"
+                log.warning("%s — falling back to a text post", reason)
         return await bot.send_message(chat_id, text, parse_mode="HTML",
                                       disable_web_page_preview=True, reply_markup=keyboard)
 
@@ -1079,6 +1283,17 @@ def load():
     # icons and the post banner are read while building every keyboard
     data["settings"]["button_icons"] = normalize_button_icons(data["settings"].get("button_icons"))
     data["settings"]["post_photo"] = clean_banner(data["settings"].get("post_photo"))
+    # a banner saved before GIF support existed is always a photo
+    data["settings"]["post_photo_kind"] = clean_banner_kind(data["settings"].get("post_photo_kind"))
+    # the size the banner was uploaded at, and whether it should be kept (📐 HD)
+    size = clean_banner_size(data["settings"].get("post_photo_size"))
+    data["settings"]["post_photo_size"] = size if data["settings"]["post_photo"] else {}
+    if not isinstance(data["settings"].get("post_photo_hd"), bool):
+        data["settings"]["post_photo_hd"] = DEFAULT_SETTINGS["post_photo_hd"]
+    # a document id only ever belongs to a GIF that arrived as a file
+    data["settings"]["post_photo_raw"] = clean_banner_raw(
+        data["settings"].get("post_photo_raw"), data["settings"]["post_photo"],
+        data["settings"]["post_photo_kind"])
     if data["settings"].get("btn_link_mode") not in ("ad", "profile"):
         data["settings"]["btn_link_mode"] = DEFAULT_SETTINGS["btn_link_mode"]
     # ── destinations, auto-forward and the anti-scam check ──
@@ -1086,6 +1301,8 @@ def load():
         data["settings"]["forward_target"] = DEFAULT_SETTINGS["forward_target"]
     if not isinstance(data["settings"].get("channel_to_group"), bool):
         data["settings"]["channel_to_group"] = DEFAULT_SETTINGS["channel_to_group"]
+    if not isinstance(data["settings"].get("group_to_channel"), bool):
+        data["settings"]["group_to_channel"] = DEFAULT_SETTINGS["group_to_channel"]
     data["settings"]["captcha_message"] = clean_captcha_message(data["settings"].get("captcha_message"))
     data["settings"]["captcha_attempts"] = _clean_choice(
         data["settings"].get("captcha_attempts"),
@@ -1457,6 +1674,8 @@ def settings_kb():
          B("🖼 Post banner", callback_data="banner_menu")],
         [set_channel_button(), B("🛡 Anti-scam", callback_data="antiscam")],
         [B(f"📤 Auto-forward: {forward_label()}", callback_data="toggle_forward_target")],
+        [B(f"↪️ Group → channel: {'ON ✅' if group_to_channel_enabled() else 'OFF ❌'}",
+           callback_data="toggle_group_to_channel")],
         [B(f"↪️ Channel → group: {'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}",
            callback_data="toggle_channel_to_group"),
          B(f"↪️ Forward from: {forward_source_summary()}", callback_data="forward_sources")],
@@ -1670,6 +1889,7 @@ def antiscam_kb():
 # them here would recurse.
 ICON_SCREEN_LABELS = ("🖼 Button icons", "🖼 Post banner", "👁 Send a test",
                       "📤 Send a photo", "🔗 Use an image URL", "🗑 Remove banner",
+                      "📐 Post in full HD: ON ✅",
                       "🖼 Set / replace icon", "🎨 Colour: green 🟢", "🗑 Remove icon",
                       "🛡 Anti-scam", "📢 Set channel", "📢 Change channel",
                       "📝 Edit challenge message", "♻️ Reset message",
@@ -1800,29 +2020,58 @@ def icon_prompt(key: str):
             "Send /cancel to stop without changing anything.")
 
 
+def banner_hd_note(size: dict = None, kind: str = "") -> str:
+    """The one line that explains what 📐 Full HD does to *this* banner."""
+    size = banner_size() if size is None else clean_banner_size(size)
+    if clean_banner_kind(kind or banner_kind()) == "photo":
+        return "a photo is always the largest copy of your upload — 📐 is about a GIF"
+    if banner_hd():
+        return (f"the post passes the GIF's own {banner_size_label(size)} to Telegram, so it "
+                "plays at full size instead of a preview" if size else
+                "the GIF is posted as the file it is and Telegram reads its size — nothing to "
+                "downscale")
+    return ("the GIF's own size is held back, so Telegram may render a smaller preview of it"
+            if size else "no size is passed, so Telegram may pick a smaller preview itself")
+
+
+def banner_raw_note() -> str:
+    """The 📎 line of the banner screen — only a GIF that came in as a file needs it."""
+    if not banner_raw():
+        return ""
+    return ("📎 <b>Posted from your file</b> — Telegram does not always play a GIF that was sent "
+            "as a file. If it refuses one, the post sends the file itself with the prices in its "
+            "caption: a banner is never traded for a plain text message.\n\n")
+
+
 def banner_text():
-    photo = post_banner()
-    if photo.startswith(("http://", "https://")):
-        shown = photo if len(photo) <= 80 else photo[:79] + "…"
-        current = f"an image URL (<code>{html_escape(shown)}</code>)"
-    elif photo:
-        current = f"a Telegram photo (<code>…{html_escape(photo[-10:])}</code>)"
+    banner, kind, size = post_banner(), banner_kind(), banner_size()
+    what = banner_kind_label(kind)
+    measured = f" at {banner_size_label(size)}" if size else ""
+    if banner.startswith(("http://", "https://")):
+        shown = banner if len(banner) <= 80 else banner[:79] + "…"
+        current = f"a {what} URL (<code>{html_escape(shown)}</code>)"
+    elif banner:
+        current = f"a Telegram {what}{measured} (<code>…{html_escape(banner[-10:])}</code>)"
     else:
         current = "<b>none</b> — the post is sent as text"
     return (
         "🖼 <b>Post banner</b>\n\n"
         f"Current: {current}\n\n"
-        "With a banner set, the price post is sent as a photo with the report as its caption and "
-        "the buttons underneath — your logo above the prices.\n\n"
-        "Send a photo in this chat, or set an https:// image URL.\n\n"
+        f"With a banner set, the price post is sent as a {what} with the report as its caption "
+        "and the buttons underneath — your logo above the prices.\n\n"
+        "Send a photo or a GIF in this chat, or set an https:// image/GIF URL.\n\n"
+        f"📐 <b>Full HD: {banner_hd_label()}</b> — {banner_hd_note(size, kind)}\n\n"
+        + banner_raw_note() +
         f"⚠️ Telegram caps a caption at {CAPTION_LIMIT} characters, so a longer report is posted "
         "as a plain text message instead (the banner is skipped)."
     )
 
 
 def banner_kb():
-    rows = [[B("📤 Send a photo", callback_data="banner_send"),
-             B("🔗 Use an image URL", callback_data="banner_url")]]
+    rows = [[B("📤 Send a photo or GIF", callback_data="banner_send")],
+            [B("🔗 Use an image URL", callback_data="banner_url"),
+             B("🎞 Use a GIF URL", callback_data="banner_gif_url")],
+            [B(f"📐 Post in full HD: {banner_hd_label()}", callback_data="banner_hd")]]
     if post_banner():
         rows.append([B("👁 Send a test", callback_data="banner_test"),
                      B("🗑 Remove banner", callback_data="banner_clear")])
@@ -1967,8 +2216,10 @@ def settings_text():
         f"🖼 Button icons: <b>{len(button_icons())}</b> emoji configured\n"
         f"   Custom emoji images shown before button labels — one entry per emoji,\n"
         f"   so it applies to every button that starts with it.\n\n"
-        f"🖼 Post banner: <b>{'set ✅' if post_banner() else 'none ❌'}</b>\n"
-        f"   A photo posted with the prices, which travel in its caption.\n\n"
+        f"🖼 Post banner: <b>{'set ✅' if post_banner() else 'none ❌'}</b> · "
+        f"📐 Full HD: <b>{banner_hd_label()}</b>\n"
+        f"   A photo or GIF posted with the prices, which travel in its caption; 📐 keeps a GIF\n"
+        f"   at the size it was uploaded at. Tap 🖼 Post banner to change either.\n\n"
         f"🗑 Auto-delete previous message: <b>{autodel}</b>\n"
         f"   When ON, deletes previous price message on refresh/update.\n\n"
         f"⏰ Auto-delete after: <b>{del_hours}h</b>\n"
@@ -2544,7 +2795,7 @@ def is_own_post(msg, chat, bot=None) -> bool:
     sender, bot_id = getattr(msg, "from_user", None), getattr(bot, "id", None)
     return bool(sender is not None and bot_id is not None and sender.id == bot_id)
 
-async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
+async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE, destination=None) -> bool:
     """↪️ Forward one message from a selected channel/group into the group.
 
     Every relayed message is sent *with the channel name*: ``📢 <b>News</b>``
@@ -2559,25 +2810,26 @@ async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     msg, chat = message_of(u), u.effective_chat
     if (not msg or not chat or chat.type not in FORWARD_SOURCE_TYPES
-            or not is_forward_source(chat.id)):
+            or (destination is None and not is_forward_source(chat.id))):
         return False
     if is_own_post(msg, chat, getattr(c, "bot", None)):
         return False
-    group = state["group"]
+    group = destination if destination is not None else state["group"]
     header = relay_header(chat)
     text = getattr(msg, "text", None)
     try:
         if text is not None:
             body = getattr(msg, "text_html", None) or html_escape(text)
-            await c.bot.send_message(chat_id=group, text=f"{header}\n\n{body}",
-                                     parse_mode="HTML")
+            sent = await c.bot.send_message(chat_id=group, text=f"{header}\n\n{body}",
+                                            parse_mode="HTML")
         else:
             caption = getattr(msg, "caption", None) or ""
             body = getattr(msg, "caption_html", None) or html_escape(caption)
-            await c.bot.copy_message(chat_id=group, from_chat_id=chat.id,
+            sent = await c.bot.copy_message(chat_id=group, from_chat_id=chat.id,
                                      message_id=msg.message_id,
                                      caption=f"{header}\n\n{body}" if body else header,
                                      parse_mode="HTML")
+        remember_own_message(group, sent.message_id)
         log.info("Relayed %s message %s from %s to group %s with its name",
                  chat.type, msg.message_id, chat.id, group)
         return True
@@ -2587,8 +2839,9 @@ async def relay_to_group(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
         # from" header shows the source name too, so the name is there either
         # way.  Protected channel content is rejected by both API methods.
         try:
-            await c.bot.forward_message(chat_id=group, from_chat_id=chat.id,
+            sent = await c.bot.forward_message(chat_id=group, from_chat_id=chat.id,
                                         message_id=msg.message_id)
+            remember_own_message(group, sent.message_id)
             log.info("Forwarded %s message %s from %s to group %s",
                      chat.type, msg.message_id, chat.id, group)
             return True
@@ -2606,6 +2859,25 @@ async def on_channel_post(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
 async def on_source_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
     """↪️ Relay each new message of a selected group into the group."""
     return await relay_to_group(u, c)
+
+async def on_group_to_channel(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg, chat = message_of(u), u.effective_chat
+    if (not group_to_channel_enabled() or not msg or not chat
+            or chat.id != state.get("group") or not isinstance(state.get("channel"), int)
+            or state["channel"] == chat.id):
+        return False
+    user = u.effective_user
+    if user and pending_captcha(chat.id, user.id):
+        # Never publish verification answers or messages from a locked newcomer.
+        await on_group_text(u, c)
+        return False
+    return await relay_to_group(u, c, destination=state["channel"])
+
+class GroupToChannelFilter(filters.MessageFilter):
+    def filter(self, message):
+        return (group_to_channel_enabled() and state.get("channel") is not None
+                and message.chat_id == state.get("group"))
+
 
 class ForwardSourceFilter(filters.MessageFilter):
     """Matches a message sent in one of the ↪️ selected relay chats.
@@ -3141,18 +3413,96 @@ def icon_saved_reply(key: str, emoji_id: str):
             f"<code>{html_escape(emoji_id)}</code>\n\n" + icon_editor_text(key))
 
 
-async def on_photo(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """An admin sends a photo → the post banner, or 📤 a repost to the group."""
-    if not is_admin(u) or u.effective_chat.type != "private": return
-    if edit_get(u, "awaiting_custom") != "banner_photo":
-        await forward_to_targets(u, c)
-        return
-    photos = u.message.photo or []
-    if not photos: return
-    state["settings"]["post_photo"] = photos[-1].file_id       # largest size Telegram sent
+def animation_file(message) -> tuple[str, bool]:
+    """The GIF the admin sent, as ``(file_id, sent_as_a_plain_file)``.
+
+    Telegram hands a GIF over as ``message.animation`` when it is sent as a GIF
+    and as ``message.document`` (mime ``image/gif``) when it is sent as a file;
+    both make a perfectly good animated banner.  The file keeps every byte — a
+    GIF uploaded "without compression" is as HD as it gets — but its id is a
+    *document* id, which ``sendAnimation`` does not always accept, and the flag
+    is what lets the post prepare for that.
+    """
+    animation = getattr(message, "animation", None)
+    file_id = getattr(animation, "file_id", "")
+    if file_id:
+        return file_id, False
+    document = getattr(message, "document", None)
+    if document and (getattr(document, "mime_type", "") or "").lower() == "image/gif":
+        return getattr(document, "file_id", "") or "", True
+    return "", False
+
+
+def largest_photo(sizes):
+    """The biggest copy Telegram made of an uploaded picture.
+
+    ``message.photo`` is a list of the same picture downscaled, the largest one
+    conventionally last.  The order is not guaranteed, so the areas are compared
+    and a tie keeps the later entry — storing anything but the largest copy is
+    how a banner ends up blurry, since the earlier ones are previews.
+    """
+    best, best_area = None, -1
+    for size in sizes or []:
+        area = (getattr(size, "width", 0) or 0) * (getattr(size, "height", 0) or 0)
+        if area >= best_area:
+            best, best_area = size, area
+    return best
+
+
+def media_size(*media) -> dict:
+    """What an uploaded GIF (or one copy of a photo) measures, as Telegram saw it.
+
+    A GIF that arrived as a plain *file* is a document and carries no
+    dimensions, so a banner built from one is stored without a size — the post
+    then lets Telegram read the file itself rather than guessing.
+    """
+    for item in media:
+        if item is None:
+            continue
+        size = clean_banner_size({"width": getattr(item, "width", None),
+                                  "height": getattr(item, "height", None),
+                                  "duration": getattr(item, "duration", None)})
+        if size:
+            return size
+    return {}
+
+
+async def save_banner_media(u: Update, c: ContextTypes.DEFAULT_TYPE, file_id: str, kind: str,
+                            size=None, raw: bool = False):
+    """Store what the admin just sent as the post banner and confirm it."""
+    if not file_id: return
+    set_banner(file_id, kind, size, raw)
     edit_pop(u, "awaiting_custom")                             # saves
     await u.message.reply_html("✅ Banner saved — the next price post uses it.\n\n" + banner_text(),
                                reply_markup=banner_kb())
+
+
+async def on_photo(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """An admin sends a photo → the post banner, or 📤 a repost to the group."""
+    if not is_admin(u) or u.effective_chat.type != "private": return
+    if edit_get(u, "awaiting_custom") not in BANNER_AWAITING:
+        await forward_to_targets(u, c)
+        return
+    photo = largest_photo(getattr(u.message, "photo", None))
+    if photo is None: return
+    # the largest size Telegram sent, with the size it stands for
+    return await save_banner_media(u, c, getattr(photo, "file_id", "") or "", "photo",
+                                   media_size(photo))
+
+
+async def on_animation(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """An admin sends a GIF → the animated post banner, or 📤 a repost."""
+    if not is_admin(u) or u.effective_chat.type != "private": return
+    if edit_get(u, "awaiting_custom") not in BANNER_AWAITING:
+        await forward_to_targets(u, c)
+        return
+    file_id, as_file = animation_file(u.message)
+    if not file_id:                                            # nothing we could reuse
+        await forward_to_targets(u, c)
+        return
+    # the GIF's own width/height/duration travel with it, so the post shows it full size
+    return await save_banner_media(u, c, file_id, "animation",
+                                   media_size(getattr(u.message, "animation", None)), as_file)
 
 
 async def on_sticker(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -3180,14 +3530,18 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     awaiting = edit_get(u, "awaiting_custom")
 
-    if awaiting == "banner_url":
+    if awaiting in ("banner_url", "banner_gif_url"):
         if txt.lower() == "/cancel":
             edit_pop(u, "awaiting_custom")
             return await u.message.reply_text("❌ Cancelled.", reply_markup=banner_kb())
         if not valid_photo_url(txt):
             return await u.message.reply_text(
-                "❌ Send an https:// (or http://) URL of a JPG/PNG image, or /cancel.")
-        state["settings"]["post_photo"] = txt
+                "❌ Send an https:// (or http://) URL of an image (JPG/PNG) or a GIF, or /cancel.")
+        # 🎞 GIF URL is an animation by choice; a bare image URL that happens to
+        # end in .gif/.mp4 is one too, so a GIF link can never be posted flat.
+        kind = "animation" if (awaiting == "banner_gif_url"
+                               or banner_kind_from_url(txt) == "animation") else "photo"
+        set_banner(txt, kind)
         save()
         edit_pop(u, "awaiting_custom")
         return await u.message.reply_html("✅ Banner saved — the next price post uses it.\n\n"
@@ -3611,7 +3965,9 @@ async def post(bot, force=False):
     snap["_link_mode"] = link_mode()
     snap["_ad_templates"] = ad_templates()
     snap["_price_links"] = bool(s.get("price_links", True))
-    snap["_photo"] = post_banner()      # changing the banner must repost too
+    # changing the banner — or switching a photo banner for a GIF, or turning the
+    # HD delivery off — must repost
+    snap["_photo"] = (post_banner(), banner_kind(), banner_hd(), banner_size())
     snap["_button_icons"] = button_icons()
     # The group and the channel each keep their own copy of the snapshot, so a
     # channel added later gets its own post without reposting to the group.
@@ -3801,6 +4157,11 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    elif d == "toggle_group_to_channel":
+        enabled = toggle_group_to_channel()
+        await q.answer(f"↪️ Group → channel: {'ON' if enabled else 'OFF'}")
+        return await q.edit_message_text(settings_text(), parse_mode="HTML", reply_markup=settings_kb())
+
     elif d == "toggle_channel_to_group":
         enabled = toggle_channel_to_group()
         await q.answer(f"↪️ Channel → group: {'ON' if enabled else 'OFF'}")
@@ -3954,12 +4315,17 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await q.edit_message_text(banner_text(), parse_mode="HTML", reply_markup=banner_kb())
 
     elif d == "banner_send":
-        edit_set(u, "awaiting_custom", "banner_photo")
-        await q.answer("Send the photo")
+        edit_set(u, "awaiting_custom", "banner_media")
+        await q.answer("Send the photo or GIF")
         return await q.edit_message_text(
-            "🖼 <b>Send the photo for the post banner</b>\n\n"
-            "Send it as a photo and the bot stores it (Telegram keeps the file, so the post "
-            "reuses it without re-uploading).\n\nSend /cancel to stop.",
+            "🖼 <b>Send the photo or GIF for the post banner</b>\n\n"
+            "Send a picture and it sits above the prices as a photo; send a GIF and the post "
+            "plays it as an animation. Either way the bot stores Telegram's file id, so the "
+            "post reuses it without re-uploading.\n\n"
+            "📐 <b>Full HD</b> keeps the file you sent: a GIF travels with its own width, height "
+            "and duration, and a photo is stored as the largest copy Telegram made of it. The "
+            "post your group gets is the one you uploaded, not a preview.\n\n"
+            "Send /cancel to stop.",
             parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="banner_menu")]]))
 
     elif d == "banner_url":
@@ -3968,11 +4334,31 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await q.edit_message_text(
             "🔗 <b>Send the image URL</b>\n\n"
             "An <code>https://</code> link to a picture (JPG/PNG) Telegram can download — for "
-            "example a file you host yourself or a CDN link.\n\nSend /cancel to stop.",
+            "example a file you host yourself or a CDN link. A link that ends in "
+            "<code>.gif</code> is posted as an animation.\n\nSend /cancel to stop.",
             parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="banner_menu")]]))
 
+    elif d == "banner_gif_url":
+        edit_set(u, "awaiting_custom", "banner_gif_url")
+        await q.answer("Send the GIF URL")
+        return await q.edit_message_text(
+            "🎞 <b>Send the GIF URL</b>\n\n"
+            "An <code>https://</code> link to a GIF (or a silent MP4) — it is posted with "
+            "<code>sendAnimation</code>, so Telegram plays it in the post, with the prices as "
+            "its caption.\n\n"
+            "A GIF the group can reach at its full size is a GIF you host yourself: Telegram "
+            "downloads the link, so the banner is exactly what the URL serves.\n\n"
+            "Send /cancel to stop.",
+            parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="banner_menu")]]))
+
+    elif d == "banner_hd":
+        enabled = toggle_banner_hd()
+        await q.answer("📐 Full HD ON — the banner keeps its own size" if enabled
+                       else "📐 Full HD OFF")
+        return await q.edit_message_text(banner_text(), parse_mode="HTML", reply_markup=banner_kb())
+
     elif d == "banner_clear":
-        state["settings"]["post_photo"] = ""
+        set_banner("", "photo")
         save()
         await q.answer("🗑 Banner removed")
         return await q.edit_message_text(banner_text(), parse_mode="HTML", reply_markup=banner_kb())
@@ -4429,7 +4815,7 @@ async def captcha_preview(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def banner_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Send the admin the post exactly as the group receives it, banner included."""
+    """Send the admin the post exactly as the group receives it, banner and size included."""
     if state["merchants"]:
         prices = await get_prices()
         text = report(prices)
@@ -4437,8 +4823,21 @@ async def banner_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     else:
         text, kb = preview_payload()
     sent = await send_report(c.bot, u.effective_user.id, text, kb)
-    if getattr(sent, "photo", None):
+    if (getattr(sent, "photo", None) or getattr(sent, "animation", None)
+            or getattr(sent, "document", None)):
         note = "✅ That is the post with your banner."
+        if getattr(sent, "document", None):
+            note += ("\n📎 Telegram would not play that GIF, so the file itself went out — with "
+                     "the prices in its caption and none of its quality given away.")
+            hd = {}
+        else:
+            hd = banner_send_kwargs()
+        if hd:                                  # what Telegram was told to render it at
+            note += f"\n📐 Full HD — the GIF goes out at its own {hd['width']}×{hd['height']}."
+        elif banner_hd():
+            note += "\n📐 Full HD — the file is posted as it is, at whatever size it holds."
+        else:
+            note += "\n📐 Full HD is OFF, so Telegram may show a smaller preview of the GIF."
     else:
         note = ("ℹ️ No banner was used: either none is set, or the report is longer than "
                 f"{CAPTION_LIMIT} characters so Telegram would reject the caption.")
@@ -4448,11 +4847,50 @@ async def error_handler(update, context):
     log.warning("Update %s caused error %s", update, context.error)
 
 # ── run ──
+PRIVATE_COMMANDS = [
+    BotCommand("start", "Open the bot control panel"),
+]
+ADMIN_PRIVATE_COMMANDS = [
+    BotCommand("start", "Open the bot control panel"),
+    BotCommand("setgroup", "Set the group for price updates"),
+    BotCommand("setchannel", "Set a channel for price updates"),
+    BotCommand("forwardfrom", "Set up forwarding from this chat"),
+    BotCommand("stopforward", "Stop forwarding from this chat"),
+    BotCommand("preview", "Preview the price report"),
+    BotCommand("cleanup", "Group cleanup — remove useless messages"),
+    BotCommand("database", "Check the database connection"),
+    BotCommand("cancel", "Cancel the current action"),
+]
+
+
+async def configure_bot_commands(bot, *, include_setup: bool = False):
+    """Publish Telegram's private-chat command menu for users and admins.
+
+    The default private menu only exposes /start. Each configured admin gets a
+    more useful, private menu with the commands the bot actually handles.
+    Failures are non-fatal: an unavailable Bot API must not stop the bot.
+    """
+    try:
+        await bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    except Exception as exc:
+        log.warning("Could not publish the private /start command: %s", exc)
+
+    commands = list(ADMIN_PRIVATE_COMMANDS)
+    if include_setup:
+        commands.append(BotCommand("setup", "Get a one-time reconfiguration link"))
+    for admin_id in ADMINS:
+        try:
+            await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as exc:
+            log.warning("Could not publish private commands for admin %s: %s", admin_id, exc)
+
+
 async def post_init(application):
     global BOT_USERNAME
     me = await application.bot.get_me()
     BOT_USERNAME = me.username
     log.info("Logged in as @%s", BOT_USERNAME)
+    await configure_bot_commands(application.bot)
 
 def register_handlers(app):
     # A command handler only listens to *messages* by default, and a channel
@@ -4477,6 +4915,9 @@ def register_handlers(app):
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGES & ForwardSourceFilter()
                                    & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
                                    on_source_message))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & GroupToChannelFilter()
+                                   & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+                                   on_group_to_channel))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("preview", preview_cmd))
     app.add_handler(CommandHandler(["database", "db"], database_cmd))
@@ -4491,11 +4932,15 @@ def register_handlers(app):
                                    & ~filters.COMMAND, on_group_text))
     # 🧹 group cleanup lives in handler group 1: PTB runs at most one handler per
     # group, so registering it next to the ones above lets it see *every* group
-    # message — including the ones the 🛡 check, the ↪️ relay or the 🖼 editors
+    # message — including the ones the 🛡 check, the ↪️ relays or the 🖼 editors
     # already took in group 0 — without stealing any of them.
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_cleanup), group=1)
-    # banner photos and premium-emoji stickers (the two image inputs)
+    # banner media (a photo or a GIF) and premium-emoji stickers
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    # a GIF arrives as an animation when it is sent as a GIF and as a document
+    # when it is sent as a file — both are accepted
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE
+                                   & (filters.ANIMATION | filters.Document.GIF), on_animation))
     app.add_handler(MessageHandler(filters.Sticker.ALL, on_sticker))
     # private chat: merchant URLs, menu answers and 📤 auto-forward
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT

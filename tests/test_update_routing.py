@@ -18,9 +18,10 @@ from storage import FileStore
 
 GROUP, CHANNEL, ADMIN, NEWCOMER = -100123, -100987, 424242, 555
 
-BOT_METHODS = ("send_message", "send_photo", "copy_message", "forward_message",
-               "delete_message", "restrict_chat_member", "ban_chat_member",
-               "unban_chat_member", "edit_message_text", "get_chat_administrators")
+BOT_METHODS = ("send_message", "send_photo", "send_animation", "copy_message",
+               "forward_message", "delete_message", "restrict_chat_member", "ban_chat_member",
+               "unban_chat_member", "edit_message_text", "answer_callback_query",
+               "get_chat_administrators")
 
 
 class Runner:
@@ -102,6 +103,18 @@ def _join(user_id=NEWCOMER):
         "new_chat_members": [{"id": user_id, "is_bot": False, "first_name": "Sam"}]}}
 
 
+def _callback(data, message_id=13):
+    """An admin tapping a button — routed through the real ``CallbackQuery``."""
+    return {"update_id": 7, "callback_query": {
+        "id": "cq1", "from": {"id": ADMIN, "is_bot": False, "first_name": "Admin"},
+        "chat_instance": "1",
+        "message": {"message_id": message_id, "date": 0,
+                    "chat": {"id": ADMIN, "type": "private"},
+                    "from": {"id": ADMIN, "is_bot": False, "first_name": "Admin"},
+                    "text": "🖼 Post banner"},
+        "data": data}}
+
+
 def _channel_post(text, command=False):
     post = {"message_id": 14, "date": 0, "text": text,
             "chat": {"id": CHANNEL, "type": "channel", "title": "Rates channel"}}
@@ -165,12 +178,131 @@ def test_a_command_is_not_reposted(router):
 
 def test_a_photo_that_the_banner_editor_wanted_is_not_reposted(router):
     router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
-                        "awaiting_custom", "banner_photo")
+                        "awaiting_custom", "banner_media")
     calls = router.send(_private(photo=[{"file_id": "AgACAgIAAxkBAAICbig",
                                          "file_unique_id": "u2", "width": 1, "height": 1}]))
 
     assert calls["copy_message"].await_count == 0
     assert router.bot.post_banner() == "AgACAgIAAxkBAAICbig"
+    assert router.bot.banner_kind() == "photo"
+
+
+def test_a_gif_the_banner_editor_wanted_is_saved_as_an_animation(router):
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+    calls = router.send(_private(animation={"file_id": "CgACAgIAAxkBAAIBnGif",
+                                            "file_unique_id": "u3",
+                                            "width": 1, "height": 1, "duration": 1}))
+
+    assert calls["copy_message"].await_count == 0
+    assert router.bot.post_banner() == "CgACAgIAAxkBAAIBnGif"
+    assert router.bot.banner_kind() == "animation"
+
+
+def test_a_gif_sent_as_a_file_is_saved_as_an_animation_too(router):
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+    calls = router.send(_private(document={"file_id": "BQACAgIAAxkBAAIBnGif",
+                                           "file_unique_id": "u4",
+                                           "mime_type": "image/gif", "file_name": "rates.gif"}))
+
+    assert calls["copy_message"].await_count == 0
+    assert router.bot.post_banner() == "BQACAgIAAxkBAAIBnGif"
+    assert router.bot.banner_kind() == "animation"
+
+
+def test_an_uploaded_gif_is_posted_at_the_size_it_was_uploaded_at(router):
+    """📐 full HD: the GIF's own fields, read off a real Telegram update, reach the API.
+
+    The attribute names are the risky part — a typo here would silently cost the
+    group its full-size banner, so the size is asserted on the call itself.
+    """
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+
+    calls = router.send(_private(animation={"file_id": "CgACAgIAAxkBAAIBnGif",
+                                            "file_unique_id": "u3",
+                                            "width": 1080, "height": 640, "duration": 4}),
+                        _callback("banner_test"))
+
+    assert router.bot.banner_size() == {"width": 1080, "height": 640, "duration": 4}
+    sent = calls["send_animation"].await_args
+    assert sent.kwargs["animation"] == "CgACAgIAAxkBAAIBnGif"
+    assert (sent.kwargs["width"], sent.kwargs["height"], sent.kwargs["duration"]) == (1080, 640, 4)
+    assert sent.kwargs["caption"].startswith("📊 P2P")
+
+
+def test_a_gif_sent_as_a_file_is_posted_without_a_size_it_does_not_have(router):
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+
+    calls = router.send(_private(document={"file_id": "BQACAgIAAxkBAAIBnGif",
+                                           "file_unique_id": "u4",
+                                           "mime_type": "image/gif", "file_name": "rates.gif"}),
+                        _callback("banner_test"))
+
+    assert router.bot.banner_size() == {}
+    sent = calls["send_animation"].await_args
+    assert "width" not in sent.kwargs and "height" not in sent.kwargs
+
+
+def test_a_gif_sent_as_a_file_is_known_as_one_so_the_banner_is_not_lost(router):
+    """📎 the rescue is keyed on which real Telegram field the id came from."""
+    asked = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN))
+
+    router.bot.edit_set(asked, "awaiting_custom", "banner_media")
+    router.send(_private(document={"file_id": "BQACAgIAAxkBAAIBnGif", "file_unique_id": "u4",
+                                  "mime_type": "image/gif", "file_name": "rates.gif"}))
+    assert router.bot.banner_raw() is True                # a document id, maybe unplayable
+
+    router.bot.edit_set(asked, "awaiting_custom", "banner_media")
+    router.send(_private(animation={"file_id": "CgACAgIAAxkBAAIBnGif", "file_unique_id": "u5",
+                                    "width": 480, "height": 480, "duration": 2}))
+    assert router.bot.banner_raw() is False               # a real animation id plays
+
+
+def test_a_photo_banner_is_never_marked_as_a_file(router):
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+
+    router.send(_private(photo=[{"file_id": "AgACAgIAAxkBAAICbig", "file_unique_id": "u2",
+                                 "width": 1600, "height": 900}]))
+
+    assert router.bot.banner_raw() is False
+
+
+def test_turning_full_hd_off_stops_passing_the_size(router):
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+    router.send(_private(animation={"file_id": "CgACAgIAAxkBAAIBnGif", "file_unique_id": "u3",
+                                    "width": 1080, "height": 640, "duration": 4}))
+
+    calls = router.send(_callback("banner_hd"), _callback("banner_test"))
+
+    assert calls["send_animation"].await_args.kwargs.get("width") is None
+
+
+def test_the_largest_copy_of_an_uploaded_photo_becomes_the_banner(router):
+    router.bot.edit_set(SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN)),
+                        "awaiting_custom", "banner_media")
+
+    calls = router.send(_private(photo=[{"file_id": "smallpreview01", "file_unique_id": "u1",
+                                         "width": 100, "height": 100},
+                                        {"file_id": "AgACAgIAAxkBAAICbig", "file_unique_id": "u2",
+                                         "width": 1600, "height": 900}]))
+
+    assert router.bot.post_banner() == "AgACAgIAAxkBAAICbig"
+    assert router.bot.banner_size() == {"width": 1600, "height": 900, "duration": 0}
+    calls["send_animation"].assert_not_awaited()
+
+
+def test_a_gif_nobody_asked_for_is_reposted(router):
+    calls = router.send(_private(animation={"file_id": "CgACAgIAAxkBAAIBnGif",
+                                            "file_unique_id": "u3",
+                                            "width": 1, "height": 1, "duration": 1}))
+
+    calls["copy_message"].assert_awaited_once()
+    assert router.bot.post_banner() == ""
 
 
 # ── 📢 the channel ─────────────────────────────────────────────────────────
@@ -321,6 +453,42 @@ def test_a_message_in_a_selected_channel_is_relayed(router):
     assert calls["send_message"].await_args.kwargs["text"] == \
         "📢 <b>Source</b>\n\nchannel announcement"
 
+# ── ↪️ bidirectional group / channel relay ──────────────────────────────────
+def test_group_to_channel_opt_in_and_no_echo(router):
+    router.bot.state["channel"] = CHANNEL
+    calls = router.send(_group("group news"))
+    calls["send_message"].assert_not_awaited()
+
+    router.bot.state["settings"]["group_to_channel"] = True
+    calls = router.send(_group("group news"))
+    assert calls["send_message"].await_args.kwargs["chat_id"] == CHANNEL
+    assert calls["send_message"].await_args.kwargs["text"] == "👥 <b>Rates</b>\n\ngroup news"
+    assert router.bot.is_own_message(CHANNEL, 42)
+    calls["send_message"].reset_mock()
+    calls = router.send(_chat_message(CHANNEL, "channel", "echo", message_id=42))
+    calls["send_message"].assert_not_awaited()
+
+
+def test_group_to_channel_skips_commands_and_captcha(router):
+    router.bot.state["channel"] = CHANNEL
+    router.bot.state["settings"]["group_to_channel"] = True
+    calls = router.send(_chat_message(GROUP, "supergroup", "/preview", command=True))
+    assert not any(call.kwargs.get("chat_id") == CHANNEL
+                   for call in calls["send_message"].await_args_list)
+    router.send(_join())
+    word = router.bot.pending_captcha(GROUP, NEWCOMER)["word"]
+    calls = router.send(_group(word))
+    assert router.bot.pending_captcha(GROUP, NEWCOMER) is None
+    assert not any(call.kwargs.get("chat_id") == CHANNEL
+                   for call in calls["send_message"].await_args_list)
+
+
+def test_group_to_channel_media(router):
+    router.bot.state["channel"] = CHANNEL
+    router.bot.state["settings"]["group_to_channel"] = True
+    calls = router.send(_chat_message(GROUP, "supergroup", message_id=50, photo=[
+        {"file_id": "AgACAgIAAxkBAAICbig", "file_unique_id": "u3", "width": 1, "height": 1}]))
+    assert calls["copy_message"].await_args.kwargs["chat_id"] == CHANNEL
 
 # ── 🧹 group cleanup runs *next to* the handlers above ─────────────────────
 BOT_ID = 123456          # the user id the stubbed getMe gives the bot

@@ -276,6 +276,9 @@ async def _application_locked(loop: asyncio.AbstractEventLoop):
     # Bot.initialize() calls getMe once: it verifies the token and caches the
     # bot's own user, so /start links work without a second API call.
     await app.initialize()
+    # Unlike polling, Application.initialize() does not run PTB's post_init
+    # hook, so publish the Telegram private-chat command menu explicitly here.
+    await bot_module.configure_bot_commands(app.bot, include_setup=True)
     try:
         bot_module.BOT_USERNAME = app.bot.username
     except Exception as exc:                      # pragma: no cover - defensive

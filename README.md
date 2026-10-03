@@ -349,7 +349,7 @@ P2P profile by default**, where users can choose an ad themselves.
 | 🔗 **BUY / SELL link** | Optional custom URL — overrides the target for that side (`{AD_URL}`, `{AD_ID}`, `{PRICE}`, `{URL}`, `{NICK}`, … available) |
 | 🔗 **Ad link templates** | Edit the deep-link template of each exchange (Binance / Bybit / OKX / Bitget) |
 | 🖼 **Button icons** | Put a custom-emoji image (and a colour) in front of any button label — see below |
-| 🖼 **Post banner** | Post a photo with the prices in its caption — see below |
+| 🖼 **Post banner** | Post a photo **or a GIF** — with the prices in its caption and the media at its own full-HD size — see below |
 | ♻️ **Reset buttons to default** | Restore both Buy/Sell buttons and profile links, clear extras and overrides, and turn buttons ON; asks for confirmation if extras would be deleted |
 
 Defaults:
@@ -433,22 +433,46 @@ emoji do.
 > refuses the icons, the bot notices once, logs it, and keeps posting with plain buttons — a price
 > post is never lost because of a decoration.
 
-### 🖼 Post banner — a photo with the prices in its caption
+### 🖼 Post banner — a photo **or a GIF** in full HD, with the prices in its caption
 
-**⚙️ Settings → 🖼 Post banner** puts a picture (your logo, a banner, a rate card) above the
-prices: the post is then sent as a **photo whose caption is the report**, with the buttons under
-it.
+**⚙️ Settings → 🖼 Post banner** puts a picture (your logo, a banner, a rate card — or an
+animated GIF) above the prices: the post is then sent as a **photo or animation whose caption is
+the report**, with the buttons under it.
 
-* **📤 Send a photo** — send it in the chat; the bot stores Telegram's `file_id` (no re-uploading
-  on every post).
-* **🔗 Use an image URL** — an `https://` JPG/PNG link instead.
-* **👁 Send a test** / **👁 Preview** — see exactly what the group will get.
+* **📤 Send a photo or GIF** — send it in the chat; the bot stores Telegram's `file_id` (no
+  re-uploading on every post). A GIF is posted with `sendAnimation`, so Telegram **plays it in
+  the post**; send it as a GIF or as a `.gif` file, both work.
+* **🔗 Use an image URL** — an `https://` JPG/PNG link instead (a link ending in `.gif` is posted
+  as an animation automatically).
+* **🎞 Use a GIF URL** — an `https://` GIF (or silent MP4) link, always posted as an animation.
+* **📐 Post in full HD** — ON by default, and it is what makes an uploaded GIF stay sharp: the
+  bot remembers the `width`, `height` and `duration` of the file you sent and passes them to
+  `sendAnimation`, so Telegram renders the animation **at its own size** instead of picking a
+  smaller preview. A photo banner needs no such fields — the bot always keeps the **largest** copy
+  Telegram made of your upload. Turn 📐 off if you would rather Telegram choose the display size.
+* **📎 A GIF sent as a file never loses the banner** — sending a GIF *without compression* keeps
+  every byte of it, but the id Telegram gives that upload is a **document** id, and
+  `sendAnimation` does not always play one. When it refuses, the bot posts the **file itself**
+  with the prices in its caption: a banner that the client opens on a tap still beats a price
+  post with no banner at all. 👁 Send a test tells you which of the two the group received.
+* **👁 Send a test** / **👁 Preview** — see exactly what the group will get, including the size the
+  GIF went out at.
 * **🗑 Remove banner** — back to a plain text post.
 
-Telegram caps a **photo caption at 1024 characters**, so a longer report is posted as a plain text
-message and the banner is skipped (logged, and the test tells you). A banner Telegram refuses
-(deleted file, dead URL) also falls back to the text post. Deleting the previous message
+> 📐 **What full HD does and does not do.** The bot never re-encodes, resamples or crops your
+> media: it posts the file Telegram already has, at the size that file measures. What Telegram did
+> to the upload *before* the bot could see it (a GIF sent as media is converted to a silent MP4,
+> and a very large picture is downscaled into its photo copies) is out of the bot's hands — so
+> upload the banner at the size you want your group to see, and tap 👁 Send a test to confirm.
+
+Telegram caps a **caption at 1024 characters** (photo, animation or file alike), so a longer
+report is posted as a plain text message and the banner is skipped (logged, and the test tells
+you). A banner Telegram refuses for good — a deleted file, a dead URL, an upload that has gone
+from its storage — also falls back to the text post. Deleting the previous message
 (**🗑 Auto-delete prev**) and the `N`-hour auto-delete both cover the banner message too.
+
+> 🎞 Switching a photo banner for a GIF (or back), or turning **📐 full HD** on or off, counts as a
+> change, so the next price post goes out again even if the prices have not moved.
 
 ### 👤 Buy/Sell buttons open the **merchant profile**
 
@@ -545,6 +569,9 @@ private. The 🧹 screen also counts what it removed and shows the last reason.
   answer the 🛡 check already took, is handled by both without fighting over it.
 - Telegram only lets a bot delete messages younger than **48 hours**, so this
   cleans what arrives from now on; it cannot purge old history.
+- With **↪️ Group → channel** switched on, a member’s message is mirrored into the
+  channel *first* and then removed from the group — the channel keeps the post,
+  the group stays clean.
 
 ---
 
@@ -604,6 +631,10 @@ is echoed back into the group.
 
 ---
 
+### ↪️ Forward group posts to the channel
+
+In **⚙️ Settings → ↪️ Group → channel**, turn on the independent group-to-channel relay (OFF by default). Ordinary text and media from the configured group are copied to the configured price channel with the group name above them. Commands, join/leave notices, verification answers, and the bot’s own posts are not relayed. Both directions may be enabled at once without echoing the bot’s relayed copies. The bot needs permission to read group messages (admin or privacy mode disabled) and post in the channel.
+
 ## 📤 Auto-forward what you send the bot
 
 Anything you send to the bot in your **private chat** that the menus did not ask for
@@ -622,7 +653,7 @@ is reposted to your group / channel — text, photo, video, sticker, file, voice
 | `OFF` | Nothing is reposted — the bot only answers your menus again |
 
 Not forwarded: **commands** (`/start`, `/cancel`, …), answers the bot asked for
-(a banner photo, a button label, an edited header…) and **merchant URLs**, which are
+(a banner photo or GIF, a button label, an edited header…) and **merchant URLs**, which are
 still added as merchants.
 
 > 📋 An **album** (several photos sent as one message) is reposted photo by photo;
