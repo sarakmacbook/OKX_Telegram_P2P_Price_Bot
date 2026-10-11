@@ -268,7 +268,9 @@ docker compose up -d --build
 5. Optional: **📢 Set channel** to post into a channel too. New posts from that
    channel are also auto-forwarded into the configured group by default; toggle
    this with **⚙️ Settings → ↪️ Channel → group**, and pick *which* channels or
-   groups to forward from in **⚙️ Settings → ↪️ Forward from**. Check **🛡 Anti-scam** so
+   groups to forward from in **⚙️ Settings → ↪️ Forward from** — add one by
+   sending the bot its **link** (`t.me/name`, `@name`) or by **forwarding a post**
+   from it (the way for a private channel), then tap **➕**. Check **🛡 Anti-scam** so
    newcomers have to type a random word before they can post.
 
 ### Panel buttons
@@ -281,7 +283,7 @@ docker compose up -d --build
 | 👥 **Set group** | One click: choose the group that receives updates |
 | 📢 **Set channel** | One click: add the bot to a channel and post the prices there too |
 | 🛡 **Anti-scam** | Mute newcomers until they type a random word — see [🛡 Anti-scam verification](#-anti-scam-verification) |
-| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **🧹 group cleanup** (join notices + the useless messages), **📤 private-message forwarding**, **↪️ forwarding into the group + which chats to forward from**, **🖼 button icons & post banner** |
+| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **🧹 group cleanup** (join notices + the useless messages), **📤 private-message forwarding**, **↪️ forwarding into the group + which chats to forward from** (by deep link, by pasting a link, or by forwarding a post — private channels included), **🖼 button icons & post banner** |
 | 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
 | 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer |
 | 👁 **Preview** | See exactly how the group post will look |
@@ -605,6 +607,9 @@ protected posts) goes out as a real forward instead — Telegram's own
 | Default | Nothing selected → the **configured price channel** is relayed, which is what the bot did before this option existed |
 | Add a channel | **📢 Add a channel** in that menu (a deep link that adds the bot as an admin), or send `/forwardfrom` inside the channel |
 | Add a group | **👥 Add a group** in that menu, or send `/forwardfrom` inside the group |
+| Add by link | Send the chat's **public link** to the bot in its private chat — `t.me/name`, `@name`, `t.me/name/12`, `t.me/s/name` or an invite (`t.me/+hash`). The bot looks the chat up and answers with **➕ Forward from …** |
+| Add a private channel | A private channel has **no public link**: send its `t.me/c/…` link (*Copy link* on a post) **or forward any of its posts** to the bot's private chat — the post itself names the channel. The bot answers with the same ➕ button |
+| Confirming | ➕ starts the relay (and switches it ON if it was OFF); **📤 Post it instead** sends the message the classic 📤 way (nothing is selected); **✖️ Nothing** does neither. An offer stays valid for an hour — the message is never posted or dropped without an answer |
 | Stop | `/stopforward` inside that chat, or tap it in the menu |
 | One tap | **📢 Use the price channel** adds the channel the prices go to |
 
@@ -618,6 +623,13 @@ the group:
   messages it should relay.
 - The **destination group itself** cannot be a source (its messages stay with the
   🛡 anti-scam handler), and the relay can be turned off without losing the list.
+
+When a chat is named by link or by a forwarded post, the bot checks its own
+rights there first and says exactly what is missing — *“Add the bot to that
+channel as an admin first”* — so a source that cannot deliver anything is never
+silently selected. A link that is not a chat at all (a `t.me/bot?start…` deep
+link, a sticker set, an exchange URL) keeps its ordinary meaning and is posted by
+**📤 Auto-forward** like any other message.
 
 Never relayed: **commands** (`/forwardfrom`, `/setchannel`, …), the bot's **own
 price reports** and its **“✅ forwarding from here”** confirmations — so nothing
@@ -649,6 +661,11 @@ is reposted to your group / channel — text, photo, video, sticker, file, voice
 Not forwarded: **commands** (`/start`, `/cancel`, …), answers the bot asked for
 (a banner photo or GIF, a button label, an edited header…) and **merchant URLs**, which are
 still added as merchants.
+
+One answer comes *before* the copy: a message **forwarded from a channel or a group** (or a
+chat **link**) is understood as “relay from this chat?” — the bot replies with **➕ Forward
+from … · 📤 Post it instead · ✖️ Nothing**. 📤 posts that message exactly as this section
+describes, so forwarding a post into the bot still works the way it always did.
 
 > 📋 An **album** (several photos sent as one message) is reposted photo by photo;
 > everything else keeps its caption and formatting.

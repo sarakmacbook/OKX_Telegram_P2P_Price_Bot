@@ -21,7 +21,7 @@ GROUP, CHANNEL, ADMIN, NEWCOMER = -100123, -100987, 424242, 555
 BOT_METHODS = ("send_message", "send_photo", "send_animation", "copy_message",
                "forward_message", "delete_message", "restrict_chat_member", "ban_chat_member",
                "unban_chat_member", "edit_message_text", "answer_callback_query",
-               "get_chat_administrators")
+               "get_chat_administrators", "get_chat", "get_chat_member")
 
 
 class Runner:
@@ -585,3 +585,60 @@ def test_the_cleanup_command_opens_its_screen_in_the_private_chat(router):
     text = calls["send_message"].await_args.kwargs["text"]
     assert "🧹" in text and "Group cleanup" in text
     assert calls["copy_message"].await_count == 0           # it was not reposted
+
+
+# ── ➕ naming a chat to relay from, without a deep link ────────────────────
+def _forwarded(post_chat, text="a post from somewhere"):
+    """A post the admin forwarded from a channel/group into the private chat."""
+    return _private(text, forward_origin={
+        "type": "channel", "date": 0,
+        "chat": {"id": post_chat, "type": "channel", "title": "News"},
+        "message_id": 21})
+
+
+def test_a_channel_link_in_the_private_chat_offers_to_relay_from_it(router):
+    router.calls["get_chat"].return_value = SimpleNamespace(id=NEWS, type="channel", title="News")
+
+    calls = router.send(_private("https://t.me/newsroom"))
+
+    calls["get_chat"].assert_awaited_once_with("@newsroom")
+    assert router.bot.source_offer(ADMIN)["chat_id"] == NEWS
+    assert router.bot.forward_sources() == {}               # a tap is still needed
+    text = calls["send_message"].await_args.kwargs["text"]
+    assert "Forward from this channel?" in text and "News" in text
+    calls["copy_message"].assert_not_awaited()              # not reposted either
+
+
+def test_tapping_add_turns_the_relay_on(router):
+    router.calls["get_chat"].return_value = SimpleNamespace(id=NEWS, type="channel", title="News")
+    router.send(_private("https://t.me/newsroom"))
+
+    router.send(_callback("fwd_src_offer_add"))
+
+    assert router.bot.source_selected(NEWS) is True
+    assert router.bot.channel_to_group_enabled() is True
+    calls = router.send(_chat_message(NEWS, "channel", "relay me", message_id=22))
+    assert calls["send_message"].await_args.kwargs["chat_id"] == GROUP
+    # the live title from the update wins over the stored one ("Source" here)
+    assert calls["send_message"].await_args.kwargs["text"] == "📢 <b>Source</b>\n\nrelay me"
+
+
+def test_a_forwarded_post_offers_its_channel_instead_of_being_reposted(router):
+    calls = router.send(_forwarded(NEWS))
+
+    assert router.bot.source_offer(ADMIN)["chat_id"] == NEWS
+    calls["copy_message"].assert_not_awaited()
+    calls["forward_message"].assert_not_awaited()
+
+
+def test_the_offered_post_can_be_posted_instead_through_a_real_button(router):
+    """📤 Post it instead does what the message would have done on its own."""
+    calls = router.send(_forwarded(NEWS))
+    assert router.bot.source_offer(ADMIN)["message_id"] == 10
+    calls["copy_message"].assert_not_awaited()
+
+    calls = router.send(_callback("fwd_src_offer_post"))
+
+    calls["copy_message"].assert_awaited_once_with(chat_id=GROUP, from_chat_id=ADMIN, message_id=10)
+    assert router.bot.forward_sources() == {}
+    assert router.bot.source_offer(ADMIN) is None

@@ -241,6 +241,28 @@ OWN_MESSAGE_LIMIT = 30            # bot messages in a source chat not to relay b
 # /start payloads that register a chat (deep links: startgroup= / startchannel=)
 SETUP_ACTIONS = ("setgroup", "setchannel", "forwardfrom")
 
+# ➕ Adding a source without a deep link: a **public** channel or group is named
+# by its link (``t.me/name``, ``@name``) and the bot looks it up itself.  A
+# **private** channel has no link Telegram will resolve for a bot — but a post
+# the admin forwards to the bot carries the chat it came from, and the t.me/c/…
+# link Telegram offers in "Copy link" names the chat id directly (‑100 + id).
+# Either way the admin confirms with one ➕ tap, so nothing starts being relayed
+# before they said so — and the chat is checked for readability first.
+SOURCE_OFFER_TTL = 3600           # how long "➕ Forward from this chat?" stays valid
+MAX_SOURCE_OFFERS = 20            # unanswered offers kept (one small record each)
+CHAT_LINK_HOSTS = ("t.me", "telegram.me", "telegram.dog", "www.t.me")
+#: t.me/<first part> values that are a Telegram feature, never a chat
+CHAT_LINK_RESERVED = frozenset((
+    "joinchat", "addstickers", "addemoji", "addtheme", "share", "proxy", "socks",
+    "login", "iv", "setlanguage", "bg", "giftcode", "boost", "confirmphone",
+    "contact", "web", "k"))
+#: t.me/s/<name> is the public *web preview* of a channel — the name follows
+CHAT_LINK_PREVIEW = "s"
+#: t.me/c/<internal id>/<message> — the link of a private chat, so the id is
+#: the chat id Telegram uses once ``-100`` is put in front of it
+PRIVATE_LINK_PREFIX = "-100"
+MAX_PRIVATE_LINK_DIGITS = 15      # Telegram's own ids stop well before this
+
 # ── anti-scam verification (captcha) ────────────────────────────────────────
 # A new member is muted and has to type a random word.  While pending they may
 # only send plain text (no links, media or stickers), so a scammer cannot post
@@ -944,6 +966,339 @@ def source_selected(chat_id) -> bool:
     except (TypeError, ValueError):
         return False
 
+
+# ── ➕ naming a chat by link (public) or by a forwarded post (private) ───────
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
+
+
+def _clean_username(value) -> str:
+    """A Telegram @username (5–32 letters, digits, ``_``) — or ``""``."""
+    name = str(value or "").strip().lstrip("@")
+    return name if USERNAME_RE.fullmatch(name) else ""
+
+
+def _invite_target(hash_value):
+    """``t.me/+Hash`` / ``t.me/joinchat/Hash`` → look the invite up as a chat."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", str(hash_value or "")):
+        return None
+    return {"kind": "invite", "hash": str(hash_value)}
+
+
+def _private_link_target(internal_id):
+    """``t.me/c/1234/56`` → the chat id of that private channel/supergroup."""
+    text = str(internal_id or "")
+    if not re.fullmatch(rf"\d{{5,{MAX_PRIVATE_LINK_DIGITS}}}", text):
+        return None
+    return {"kind": "chat_id", "chat_id": int(f"{PRIVATE_LINK_PREFIX}{text}")}
+
+
+def parse_source_link(value):
+    """Read a chat a link names — ``{kind, …}`` for the lookup, else ``None``.
+
+    ``@name``, ``t.me/name``, ``https://t.me/name/12`` (a message link),
+    ``https://t.me/s/name`` (the web preview) and ``https://t.me/+hash`` are all
+    accepted, and so is ``https://t.me/c/1234/56`` — the link Telegram gives for
+    a **private** channel.  Anything that is not a chat at all (a bot deep link
+    like ``t.me/bot?startgroup=…``, a sticker set, an exchange URL, an ordinary
+    sentence) gives ``None``, so the message keeps its normal meaning.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 512 or re.search(r"\s", text):
+        return None
+    if text.startswith("@"):
+        username = _clean_username(text)
+        return {"kind": "username", "username": username} if username else None
+    raw = text if re.match(r"^[a-z][a-z0-9+.\-]*://", text, re.I) else "https://" + text
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    if (parsed.scheme not in ("http", "https")
+            or (parsed.hostname or "").lower() not in CHAT_LINK_HOSTS
+            or parsed.username or parsed.password):
+        return None
+    parts = [part for part in (parsed.path or "").split("/") if part]
+    if not parts:
+        return None
+    # a deep link into a bot carries a payload — that is the bot's own link
+    if (parsed.query or "").lower().startswith(("start", "startgroup", "startchannel")):
+        return None
+    first = parts[0]
+    if first.lower() == "joinchat" and len(parts) > 1:
+        return _invite_target(parts[1])
+    if first.startswith("+") and len(first) > 1:
+        return _invite_target(first[1:])
+    if first.lower() == "c" and len(parts) > 1:
+        return _private_link_target(parts[1])
+    if first.lower() == CHAT_LINK_PREVIEW and len(parts) > 1:
+        first = parts[1]                           # t.me/s/<name> — the preview
+    elif first.lower() in CHAT_LINK_RESERVED:
+        return None
+    username = _clean_username(first)
+    return {"kind": "username", "username": username} if username else None
+
+
+def source_link_label(target) -> str:
+    """``@news`` / ``t.me/+Hash`` / ``‑100…`` — what the link names, for a reply."""
+    if target.get("kind") == "username":
+        return f"@{target.get('username')}"
+    if target.get("kind") == "invite":
+        return f"t.me/+{target.get('hash')}"
+    return str(target.get("chat_id"))
+
+
+async def resolve_source_chat(bot, target):
+    """Ask Telegram for the chat a link points at: ``(chat, error message)``.
+
+    The bot has to be able to see the chat — a public channel or group is
+    resolvable through its username, an invite link or a ``t.me/c/…`` id only
+    when the bot is already a member.
+    """
+    if bot is None or not isinstance(target, dict):
+        return None, "The bot could not look that up — try again in a moment."
+    try:
+        if target.get("kind") == "username":
+            return await bot.get_chat(f"@{target['username']}"), ""
+        if target.get("kind") == "invite":
+            # a chat_id parameter accepts an invite link the bot can already use
+            return await bot.get_chat(f"https://t.me/+{target['hash']}"), ""
+        return await bot.get_chat(int(target["chat_id"])), ""
+    except Exception as e:
+        return None, source_link_error(target, e)
+
+
+def source_link_error(target, error) -> str:
+    """Why the link could not be opened — and the way that does work."""
+    detail = html_escape(str(error))
+    if target.get("kind") == "username":
+        return (f"Telegram could not open <code>{html_escape(source_link_label(target))}</code> "
+                f"({detail}).\n\nA <b>private</b> channel has no public link — forward any of its "
+                "posts here instead, or add the bot there and use 📢 Add a channel.")
+    return ("The bot is not in that chat, so Telegram will not let it look the chat up "
+            f"({detail}).\n\nAdd the bot there as an <b>admin</b> and send the link again — or "
+            "forward any post from the chat here, which needs no link at all.")
+
+
+def source_offers() -> dict:
+    records = state.get("source_offers")
+    return records if isinstance(records, dict) else {}
+
+
+def normalize_source_offers(value) -> dict:
+    """Offers waiting for a ➕ tap: one small record per admin, expired ones gone."""
+    clean: dict = {}
+    if not isinstance(value, dict):
+        return clean
+    now = int(time.time())
+    for key, record in value.items():
+        if not isinstance(record, dict) or record.get("type") not in FORWARD_SOURCE_TYPES:
+            continue
+        try:
+            user_id, chat_id = int(key), int(record.get("chat_id"))
+            offered = int(record.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if now - offered > SOURCE_OFFER_TTL:
+            continue
+        clean[str(user_id)] = {"chat_id": chat_id, "type": record["type"],
+                               "title": str(record.get("title") or "")[:MAX_SOURCE_TITLE],
+                               "ts": offered,
+                               "message_id": _clean_optional_int(record.get("message_id")),
+                               "from_chat_id": _clean_optional_int(record.get("from_chat_id"))}
+    # newest first — an old offer is the one that expires next
+    newest = sorted(clean.items(), key=lambda item: item[1]["ts"], reverse=True)
+    return dict(newest[:MAX_SOURCE_OFFERS])
+
+
+def _clean_optional_int(value):
+    """An int, or ``None`` when there is none — for the ids of an offer."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def remember_source_offer(user_id, chat, message=None) -> None:
+    """Remember the chat an admin pointed at until they tap ➕ (or it expires).
+
+    ``message`` is what they sent (the link, or the forwarded post): keeping its
+    id lets 📤 Post it instead do exactly what would have happened without the
+    offer — so asking the question never swallows a message.
+    """
+    try:
+        user_id, chat_id = int(user_id), int(getattr(chat, "id", 0))
+    except (TypeError, ValueError):
+        return
+    if not user_id or not chat_id:
+        return
+    offers = dict(source_offers())
+    offers[str(user_id)] = {"chat_id": chat_id,
+                            "title": str(getattr(chat, "title", "") or "")[:MAX_SOURCE_TITLE],
+                            "type": source_kind(chat)[0],
+                            "ts": int(time.time()),
+                            "message_id": _clean_optional_int(getattr(message, "message_id", None)),
+                            "from_chat_id": _clean_optional_int(getattr(message, "chat_id", None))}
+    # writing is also the moment to drop what expired — the block stays tiny
+    state["source_offers"] = normalize_source_offers(offers)
+    save()
+
+
+def source_offer(user_id):
+    """The admin's still-valid offer (``None`` once it expired or was used)."""
+    try:
+        record = source_offers().get(str(int(user_id)))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if int(time.time()) - int(record.get("ts") or 0) > SOURCE_OFFER_TTL:
+        return None
+    return record
+
+
+def forget_source_offer(user_id) -> None:
+    """Drop an offer — after ➕, after ✖️, and when it lapsed."""
+    offers = dict(source_offers())
+    try:
+        offers.pop(str(int(user_id)), None)
+    except (TypeError, ValueError):
+        return
+    state["source_offers"] = offers
+    save()
+
+
+def source_kind(chat) -> tuple:
+    """``("channel", "📢", "channel")`` — the type, icon and the noun to print."""
+    kind = getattr(chat, "type", "") or ""
+    if kind not in FORWARD_SOURCE_TYPES:
+        kind = "channel"
+    return kind, FORWARD_SOURCE_ICONS.get(kind, "💬"), "channel" if kind == "channel" else "group"
+
+
+async def source_access_note(bot, chat) -> str:
+    """One line: can the bot already read that chat, or does it have to be added?"""
+    _, _, noun = source_kind(chat)
+    chat_id = getattr(chat, "id", None)
+    why = ("Telegram only sends channel posts to admins" if noun == "channel"
+           else "the bot reads a group's messages as an admin, or with privacy mode off")
+    member = None
+    try:
+        member = await bot.get_chat_member(chat_id, getattr(bot, "id", 0))
+    except Exception as e:
+        log.debug("Cannot check the bot's rights in %s: %s", chat_id, e)
+    status = str(getattr(member, "status", "") or "")
+    if status in ("administrator", "creator"):
+        return "✅ The bot is already an <b>admin</b> there — new messages are relayed right away."
+    return (f"⚠️ Note: add the bot to that {noun} as an <b>admin</b> first — {why}, so until "
+            "then nothing arrives to relay.")
+
+
+async def source_offer_text(bot, chat, can_post: bool = False) -> str:
+    """The ➕ question: what would be relayed, from where, and can the bot read it?"""
+    _, icon, noun = source_kind(chat)
+    title = html_escape(str(getattr(chat, "title", "") or getattr(chat, "id", "")))
+    where = html_escape(group_label() or str(state.get("group")))
+    note = await source_access_note(bot, chat)
+    how = ("<i>The offer is valid for an hour — ➕ relays from that chat from now on, 📤 posts "
+           "just this message, ✖️ does neither.</i>" if can_post else
+           "<i>The offer is valid for an hour — tap ➕ below to start, or ✖️ to leave it.</i>")
+    return (f"➕ <b>Forward from this {noun}?</b>\n\n"
+            f"{icon} <b>{title}</b>\n"
+            f"New messages there are copied into <b>{where}</b>, with the {noun}'s name above "
+            f"them.\n\n{note}\n\n{how}")
+
+
+def source_offer_kb(chat, can_post: bool = False):
+    """The ➕ / 📤 / ✖️ buttons under the offer — how the admin answers it."""
+    _, icon, noun = source_kind(chat)
+    title = str(getattr(chat, "title", "") or getattr(chat, "id", ""))
+    if len(title) > 24:
+        title = title[:23] + "…"
+    rows = [[B(f"➕ Forward from {icon} {title}".rstrip(), callback_data="fwd_src_offer_add")]]
+    if can_post:                 # the message can still be posted the classic way
+        rows.append([B("📤 Post it instead", callback_data="fwd_src_offer_post"),
+                     B("✖️ Nothing", callback_data="fwd_src_offer_no")])
+    else:
+        rows.append([B("✖️ Not now", callback_data="fwd_src_offer_no")])
+    return KB(rows)
+
+
+def source_added_text(title, kind: str = "channel", turned_on: bool = False) -> str:
+    """``✅ New messages in 📢 News are forwarded to …`` — one source, confirmed."""
+    icon = FORWARD_SOURCE_ICONS.get(kind, "💬")
+    where = html_escape(group_label() or str(state.get("group")))
+    note = "\n↪️ Forwarding was OFF — it is ON now." if turned_on else ""
+    return (f"✅ New messages in {icon} <b>{html_escape(str(title))}</b> are forwarded to "
+            f"<b>{where}</b>.{note}\n\n"
+            f"⚙️ <b>↪️ Forward from</b> lists every source and removes one again.")
+
+
+def source_added_kb():
+    """The buttons that follow a confirmed source: the list, and the way out."""
+    return KB([[B("⚙️ ↪️ Forward from", callback_data="forward_sources")]])
+
+
+async def offer_forward_source(u, c, chat, *, forwarded: bool = False) -> bool:
+    """A chat the admin pointed at (a link, or a forwarded post): offer or explain it.
+
+    Returns True when the message was answered here.  A **forwarded** message
+    that cannot become a source keeps its ordinary 📤 meaning, so nothing an
+    admin sends is ever swallowed by accident.
+    """
+    consume = not forwarded                  # a link was meant to name a chat
+    message = u.message if getattr(u, "message", None) else message_of(u)
+    chat_id, chat_type = getattr(chat, "id", None), getattr(chat, "type", "")
+    title = html_escape(str(getattr(chat, "title", "") or chat_id))
+    if chat_type not in FORWARD_SOURCE_TYPES:
+        if consume:
+            await message.reply_html(f"❌ <b>{title}</b> is a user chat, not a channel or a "
+                                     "group — only those can be relayed.")
+        return consume
+    if state.get("group") is None:
+        if consume:
+            await message.reply_html("⚠️ Set the destination group first — 👥 <b>Set group</b> in "
+                                     "the bot, or <code>/setgroup</code> inside that group.")
+        return consume
+    if chat_id == state["group"]:
+        if consume:
+            await message.reply_html(f"⚠️ <b>{title}</b> is the group messages are forwarded "
+                                     "<b>into</b> — choose another channel or group.")
+        return consume
+    if source_selected(chat_id):
+        if not consume:
+            return False                     # already relayed → keep the ordinary 📤 meaning
+        await message.reply_html(f"ℹ️ Already forwarding from <b>{title}</b>.\n\n"
+                                 + forward_sources_text(), reply_markup=forward_sources_kb())
+        return True
+    if len(forward_sources()) >= MAX_FORWARD_SOURCES:
+        if consume:
+            await message.reply_html(f"⚠️ The limit of {MAX_FORWARD_SOURCES} forward sources is "
+                                     "reached — remove one in ⚙️ Settings → ↪️ Forward from.")
+        return consume
+    can_post = bool(forward_targets())
+    remember_source_offer(u.effective_user.id if u.effective_user else 0, chat, message)
+    await message.reply_html(await source_offer_text(getattr(c, "bot", None), chat, can_post),
+                             reply_markup=source_offer_kb(chat, can_post=can_post))
+    return True
+
+
+def forwarded_source_chat(msg):
+    """The channel/group a forwarded message came from — ``None`` for a user.
+
+    ``forward_origin`` (Bot API 7+) names the ``sender_chat``/``chat`` even when
+    the bot is not a member, which is the only way a **private** channel can be
+    named at all; the older ``forward_from_chat`` field is read too.
+    """
+    origin = getattr(msg, "forward_origin", None)
+    sender = (getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
+              or getattr(msg, "forward_from_chat", None))
+    if sender is None or getattr(sender, "type", "") not in FORWARD_SOURCE_TYPES:
+        return None
+    return sender
+
+
 # The bot answers inside a source chat ("✅ forwarding from here"), and Telegram
 # hands that answer back as an ordinary update — without a note of who sent it,
 # because a channel post has no ``from_user``.  So the ids the bot posted itself
@@ -1250,6 +1605,8 @@ def empty_state():
             "forwards": {},
             # ↪️ chats selected as relay sources {chat_id: {chat_id, title, type}}
             "forward_sources": {},
+            # ➕ chats an admin pointed at by link/forward, waiting for their tap
+            "source_offers": {},
             # ↪️ messages the bot itself posted into a source chat ("chat:msg" → ts)
             "own_messages": {}}
 
@@ -1363,6 +1720,8 @@ def load():
         data["forwards"] = {}
     # ↪️ relay sources: keep the valid records, drop anything malformed
     data["forward_sources"] = normalize_forward_sources(data.get("forward_sources"))
+    # ➕ offers waiting for a tap — expired ones are dropped on every load
+    data["source_offers"] = normalize_source_offers(data.get("source_offers"))
     own = data.get("own_messages")
     data["own_messages"] = {k: v for k, v in own.items()
                             if isinstance(k, str) and re.fullmatch(r"-?\d+:\d+", k)} \
@@ -1632,6 +1991,10 @@ def forward_sources_text() -> str:
         f"{lines}\n\n"
         f"Add the bot to any <b>channel</b> or <b>group</b> and tap a button below, or send "
         f"<code>/forwardfrom</code> inside that chat (<code>/stopforward</code> removes it again).\n"
+        f"• No deep link? Send the chat's link here — <code>t.me/name</code>, <code>@name</code>, "
+        f"<code>t.me/+invite</code> — and confirm the ➕ the bot answers with.\n"
+        f"• A <b>private channel</b> has no public link: forward any of its posts to the bot "
+        f"here and confirm the ➕ (that also works for a public one).\n"
         f"• In a <b>channel</b> the bot must be an <b>admin</b> — Telegram only sends channel "
         f"posts to admins.\n"
         f"• In a <b>group</b> the bot must be an <b>admin</b> too, or @BotFather → "
@@ -1648,6 +2011,7 @@ def forward_sources_kb():
     rows = [[B(forward_source_label(record), callback_data=f"fwd_src_del:{record['chat_id']}")]
             for record in forward_source_records()]
     rows.append([add_source_channel_button(), add_source_group_button()])
+    rows.append([B("🔗 Add by link / forwarded post", callback_data="fwd_src_link_help")])
     if state.get("channel") and not source_selected(state["channel"]):
         rows.append([B("📢 Use the price channel", callback_data="fwd_src_use_channel")])
     rows.append([B(f"↪️ Forward to group: {'ON ✅' if channel_to_group_enabled() else 'OFF ❌'}",
@@ -2376,7 +2740,8 @@ def settings_text():
         f"   each topped with the source chat's name (📢 <b>Channel</b>).\n"
         f"   With nothing selected, the configured channel is relayed.\n"
         f"   The bot must be an admin in the source chat and able to send messages in the\n"
-        f"   group. Tap ↪️ Forward from to pick the chats.\n\n"
+        f"   group. Tap ↪️ Forward from to pick the chats — or send a chat's link\n"
+        f"   (t.me/name, @name) here, or forward a post from a private channel.\n\n"
         f"🛡 Anti-scam verification: <b>{'ON ✅' if captcha_enabled() else 'OFF ❌'}</b>\n"
         f"   New members must type a random word before they can post links or media\n"
         f"   ({captcha_attempts()} attempts, {captcha_timeout()} min, then "
@@ -2616,7 +2981,11 @@ async def forwardfrom(u: Update, c):
         return await u.message.reply_html(
             "↪️ <b>Forward from</b>\n\nSend /forwardfrom inside the channel or group whose "
             "messages should reach your group (/stopforward removes it again), or use the "
-            "buttons below.", reply_markup=forward_sources_kb())
+            "buttons below.\n\n"
+            "You can also send the chat's <b>link</b> here (<code>t.me/name</code>, "
+            "<code>@name</code>, <code>t.me/+invite</code>) — or <b>forward</b> a post from a "
+            "channel that has no public link — and confirm the ➕ the bot answers with.",
+            reply_markup=forward_sources_kb())
     if not trusted(u): return
     await register_forward_source(u, c, chat)
 
@@ -2863,6 +3232,47 @@ def message_of(u):
     """The message of an update — ``channel_post`` included (via effective_message)."""
     return getattr(u, "effective_message", None) or getattr(u, "message", None)
 
+async def repost_to_targets(bot, from_chat_id, message_id, reply_to=None) -> bool:
+    """Copy one message into every 📤 destination, with the 🗑 Undo button.
+
+    Returns True when at least one copy went out.  ``reply_to`` is the message
+    the answer (and the 🗑 Undo button) is written under; without one the post
+    happens silently, which is what a button that posts on demand wants.
+    """
+    targets = forward_targets()
+    if not targets:
+        return False
+    sent, failed = [], []
+    for kind, chat_id in targets:
+        try:
+            copied = await bot.copy_message(chat_id=chat_id, from_chat_id=from_chat_id,
+                                            message_id=message_id)
+            sent.append({"kind": kind, "chat_id": chat_id, "message_id": copied.message_id})
+        except Exception as e:
+            log.info("copy_message to %s failed (%s) — trying a real forward", kind, e)
+            try:
+                forwarded = await bot.forward_message(chat_id=chat_id, from_chat_id=from_chat_id,
+                                                      message_id=message_id)
+                sent.append({"kind": kind, "chat_id": chat_id, "message_id": forwarded.message_id})
+            except Exception as e2:
+                log.warning("Could not forward the message to %s %s: %s", kind, chat_id, e2)
+                failed.append(f"{kind} ({e2})")
+    if not sent:
+        if reply_to is not None:
+            await reply_to.reply_text("⚠️ Nothing was sent — check that the bot can still post in "
+                                      f"the {' and the '.join(k for k, _ in targets)}.\n"
+                                      + "\n".join(failed))
+        return False
+    token = secrets.token_hex(4)
+    remember_forward(token, sent)
+    names = " + ".join(dict.fromkeys(destination_label(item["kind"]) for item in sent))
+    extra = "" if not failed else "\n\n⚠️ Not sent to: " + html_escape(", ".join(failed))
+    if reply_to is not None:
+        await reply_to.reply_html(f"📤 Sent to <b>{html_escape(names)}</b>.{extra}",
+                                  reply_markup=KB([[B("🗑 Undo", callback_data=f"fwd_undo:{token}")]]))
+    log.info("Forwarded message %s to %s", message_id, names)
+    return True
+
 async def forward_to_targets(u, c) -> bool:
     """Copy an admin's private message into the group / channel.
 
@@ -2872,36 +3282,21 @@ async def forward_to_targets(u, c) -> bool:
     msg, chat = message_of(u), u.effective_chat
     if not is_admin(u) or not msg or chat.type != "private":
         return False
-    targets = forward_targets()
-    if not targets:
+    # ➕ A post forwarded from a channel/group *names* that chat — including a
+    # private channel, which no link can.  Nothing else can name it, so ask
+    # about it here; the ask carries a 📤 button that posts the message anyway,
+    # and a chat that is already relayed (or cannot be one) keeps its ordinary
+    # 📤 meaning and falls through to the copy below.
+    origin = forwarded_source_chat(msg)
+    if origin is not None and await offer_forward_source(u, c, origin, forwarded=True):
+        return True
+    bot = getattr(c, "bot", None)
+    if bot is None:
         return False
-    sent, failed = [], []
-    for kind, chat_id in targets:
-        try:
-            copied = await c.bot.copy_message(chat_id=chat_id, from_chat_id=chat.id,
-                                              message_id=msg.message_id)
-            sent.append({"kind": kind, "chat_id": chat_id, "message_id": copied.message_id})
-        except Exception as e:
-            log.info("copy_message to %s failed (%s) — trying a real forward", kind, e)
-            try:
-                forwarded = await c.bot.forward_message(chat_id=chat_id, from_chat_id=chat.id,
-                                                        message_id=msg.message_id)
-                sent.append({"kind": kind, "chat_id": chat_id, "message_id": forwarded.message_id})
-            except Exception as e2:
-                log.warning("Could not forward the message to %s %s: %s", kind, chat_id, e2)
-                failed.append(f"{kind} ({e2})")
-    if not sent:
-        await msg.reply_text("⚠️ Nothing was sent — check that the bot can still post in the "
-                             f"{' and the '.join(k for k, _ in targets)}.\n" + "\n".join(failed))
-        return True      # the message was meant for the group; do not re-use it
-    token = secrets.token_hex(4)
-    remember_forward(token, sent)
-    names = " + ".join(dict.fromkeys(destination_label(item["kind"]) for item in sent))
-    extra = "" if not failed else "\n\n⚠️ Not sent to: " + html_escape(", ".join(failed))
-    await msg.reply_html(f"📤 Sent to <b>{html_escape(names)}</b>.{extra}",
-                         reply_markup=KB([[B("🗑 Undo", callback_data=f"fwd_undo:{token}")]]))
-    log.info("Forwarded message %s from admin %s to %s", msg.message_id, u.effective_user.id, names)
-    return True
+    posted = await repost_to_targets(bot, chat.id, msg.message_id, reply_to=msg)
+    # a message the destinations refused was still meant for them: it is not
+    # handed to the merchant-URL hint below, and the admin was told why
+    return posted or bool(forward_targets())
 
 def is_own_post(msg, chat, bot=None) -> bool:
     """True for a message the bot itself posted — never echo it back.
@@ -3878,6 +4273,15 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_html(buttons_menu_text(), reply_markup=buttons_menu_kb())
         return
 
+    # 🔗 A chat the admin named by link: the bot looks it up and asks ➕.  This
+    # runs before the merchant-URL check because a t.me link is never one.
+    target = parse_source_link(txt)
+    if target:
+        chat, error = await resolve_source_chat(getattr(c, "bot", None), target)
+        if error:
+            return await u.message.reply_html(f"❌ {error}")
+        return await offer_forward_source(u, c, chat)
+
     m = parse_url(txt, ASSET, FIAT)
     if not m:
         # not a merchant URL — 📤 repost it to the group / channel when that is on
@@ -4340,6 +4744,58 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif d == "fwd_src_help":
         return await q.answer("Add the bot to that channel or group (as an admin), then send "
                               "/forwardfrom inside it.", show_alert=True)
+
+    elif d == "fwd_src_link_help":
+        return await q.answer("Send me the chat's link (t.me/name, @name or t.me/+invite), or "
+                              "forward a post from a channel with no public link — a private "
+                              "channel. I answer with ➕ to confirm.", show_alert=True)
+
+    elif d in ("fwd_src_offer_add", "fwd_src_offer_no", "fwd_src_offer_post"):
+        # ➕ / 📤 / ✖️ on "forward from this chat?" — how an admin answers the
+        # offer that a link or a forwarded post produced.
+        user_id = u.effective_user.id if u.effective_user else None
+        record = source_offer(user_id)
+        forget_source_offer(user_id)
+        if d == "fwd_src_offer_post":
+            if not record or record.get("message_id") is None or record.get("from_chat_id") is None:
+                return await q.answer("⌛️ This offer expired — send the message again.",
+                                      show_alert=True)
+            await q.answer("📤 Posting it")
+            posted = await repost_to_targets(c.bot, record["from_chat_id"], record["message_id"],
+                                             reply_to=q.message)
+            try:
+                await q.edit_message_text(
+                    "📤 Posted without adding that chat as a source." if posted else
+                    "⚠️ Nothing was posted — check that 📤 Auto-forward has a destination the "
+                    "bot can still post in.", parse_mode="HTML")
+            except Exception:              # the answer said it already
+                pass
+            return
+        if d == "fwd_src_offer_no":
+            await q.answer("✖️ Nothing done")
+            try:
+                return await q.edit_message_text("✖️ Nothing was added and the message was not "
+                                                 "posted. Send the link (or a post from the chat) "
+                                                 "again if you change your mind.", parse_mode="HTML")
+            except Exception:
+                return
+        if not record:
+            return await q.answer("⌛️ This offer expired — send the link or forward a post again.",
+                                  show_alert=True)
+        turned_on = not channel_to_group_enabled()
+        if turned_on:                      # selecting a source means "use it"
+            state["settings"]["channel_to_group"] = True
+        added = add_forward_source(record["chat_id"], record.get("title"), record.get("type"))
+        if turned_on:
+            save()                         # add_forward_source already saved the source
+        await q.answer("➕ Forwarding from there" if added else "Already selected")
+        try:
+            return await q.edit_message_text(
+                source_added_text(record.get("title") or record["chat_id"], record.get("type"),
+                                  turned_on), parse_mode="HTML",
+                reply_markup=source_added_kb())
+        except Exception:                  # unchanged text — the answer already said it
+            pass
 
     elif d == "fwd_src_toggle" or d == "fwd_src_use_channel" or d.startswith("fwd_src_del:"):
         # ↪️ Forward-from menu: switch the relay, add the price channel, drop one
