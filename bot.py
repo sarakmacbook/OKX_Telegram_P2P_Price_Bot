@@ -16,7 +16,8 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
 from exchanges import Merchant, parse_url, fetch, HEADERS
 from adlinks import (EXCHANGE_NAMES, AD_LINK_TEMPLATES, ad_link, market_link,
                      resolve_templates, render_template, template_is_exact, taker_side)
-from storage import build_store, database_link, database_connected, probe_store
+import storage
+from storage import build_store, database_connected, probe_store
 
 # ── paths: always relative to this file (works with systemd WorkingDirectory) ──
 # P2P_CONFIG_FILE / P2P_STATE_FILE override them (tests, or installs that keep
@@ -26,10 +27,10 @@ CONFIG = Path(os.getenv("P2P_CONFIG_FILE") or (BASE_DIR / "config.json"))
 DB = BASE_DIR / "data.json"
 
 # ── state store ──
-# Apply settings saved by the setup page before selecting a backend.  In
-# particular, this lets a stored P2P_STATE_BACKEND choice take effect in polling
-# installs as well as in the serverless entry points (which already apply the
-# runtime settings before importing this module).
+# Apply stored bot settings and Telegram-selected custom DB credentials before
+# selecting the state store. The setup page contributes bot settings only; the
+# terminal wizard/deployment environment select the backend, while /database in
+# Telegram stores and activates a custom REST pair.
 try:
     import runtime_config
     runtime_config.apply(BASE_DIR)
@@ -1431,18 +1432,44 @@ def db_health(force: bool = False) -> tuple[bool, str]:
     return bool(ok), str(detail)
 
 
+def _store_config_signature() -> tuple:
+    """Settings that decide which state store ``build_store`` will select."""
+    return (storage.state_backend(), storage.redis_config(),
+            os.getenv("P2P_STATE_KEY", ""), os.getenv("P2P_STATE_FILE", ""),
+            os.getenv("P2P_DATA_DIR", ""))
+
+
+_STORE_CONFIG_SIGNATURE = _store_config_signature()
+
+
+def sync_store_from_config() -> bool:
+    """Adopt a database selected by another serverless instance, without copying stale state."""
+    global STORE, _STORE_CONFIG_SIGNATURE
+    signature = _store_config_signature()
+    if signature == _STORE_CONFIG_SIGNATURE:
+        return False
+    STORE = build_store(BASE_DIR)
+    _STORE_CONFIG_SIGNATURE = signature
+    refresh_state()              # the instance that changed DB already migrated current state
+    _db_probe["at"] = 0.0
+    log.info("State store refreshed from shared configuration: %s", STORE.describe())
+    return True
+
+
 def rebuild_store() -> str:
     """Re-select the state backend, carrying the in-memory state over.
 
-    Credentials can appear after the process started — the setup page writes
-    them into the shared store and ``python setup_cli.py`` into the environment.
-    Whatever this process already knows is written into the newly selected store
+    Credentials can appear after the process started — Telegram stores a custom
+    pair in the shared runtime configuration, while the terminal wizard can
+    update the deployment environment. Whatever this process already knows is
+    written into the newly selected store
     first, so switching databases never loses the group or the merchants.  Like
     every write in ``storage.py`` this is best-effort and never raises.
     """
-    global STORE
+    global STORE, _STORE_CONFIG_SIGNATURE
     previous = STORE
     STORE = build_store(BASE_DIR)
+    _STORE_CONFIG_SIGNATURE = _store_config_signature()
     if previous.describe() != STORE.describe():
         STORE.save(dict(state))
         log.info("State store switched from %s to %s", previous.describe(), STORE.describe())
@@ -1629,8 +1656,8 @@ def forward_sources_kb():
     return KB(rows)
 
 def database_button():
-    """The link to the page where a database is connected (Vercel → Storage)."""
-    return B("🔌 Connect database ↗", url=database_link())
+    """Open database management in the private Telegram panel."""
+    return B("🗄 Manage database", callback_data="database")
 
 def panel():
     a = state["auto"]
@@ -1649,7 +1676,7 @@ def panel():
     # No shared database means this install forgets its group, merchants and
     # prices; put the way to fix that in front of the admin, not in a manual.
     if not db_is_persistent():
-        rows.append([database_button(), B("❓ Why", callback_data="database")])
+        rows.append([database_button()])
     rows.append([B("👁 Preview", callback_data="preview"), B("🔄 Refresh", callback_data="panel")])
     return KB(rows)
 
@@ -1683,11 +1710,12 @@ def settings_kb():
     ])
 
 def database_kb():
-    return KB([
-        [database_button()],
-        [B("🔄 Check connection", callback_data="db_check")],
-        [B("⬅️ Back", callback_data="panel")],
-    ])
+    rows = [[B("➕ Set / change custom database", callback_data="db_custom")]]
+    if storage.custom_redis_config():
+        rows.append([B("↩️ Use deployment database", callback_data="db_reset")])
+    rows.append([B("🔄 Check connection", callback_data="db_check")])
+    rows.append([B("⬅️ Back", callback_data="panel")])
+    return KB(rows)
 
 def buttons_menu_kb():
     s = get_settings()
@@ -2080,42 +2108,141 @@ def banner_kb():
     return KB(rows)
 
 
+def _clear_database_edit(u: Update) -> None:
+    """Discard a database setup draft without leaving credentials in bot state."""
+    edits = edits_of(u)
+    edits.pop("db_custom_url", None)
+    edits.pop("awaiting_custom", None)
+    save()
+
+
+def set_custom_database(url: str, token: str, update: Update | None = None) -> tuple[bool, str]:
+    """Test, persist and select a custom Redis REST database.
+
+    The configuration is saved in the bootstrap settings store before switching
+    the state store, so other instances can discover it on their next request.
+    """
+    import runtime_config
+
+    values, errors = runtime_config.validate({
+        runtime_config.CUSTOM_REDIS_URL: url,
+        runtime_config.CUSTOM_REDIS_TOKEN: token,
+    })
+    if errors:
+        return False, errors[0]
+    clean_url = values[runtime_config.CUSTOM_REDIS_URL]
+    clean_token = values[runtime_config.CUSTOM_REDIS_TOKEN]
+    state_key = (os.getenv("P2P_STATE_KEY") or storage.DEFAULT_KEY).strip() or storage.DEFAULT_KEY
+    target = storage.RedisStore(clean_url, clean_token, key=state_key)
+    reachable, _detail = probe_store(target, timeout=6.0)
+    if not reachable:
+        return False, "The Redis REST service did not answer. Check the URL and token, then try again."
+
+    saved = runtime_config.save(values, BASE_DIR)
+    if any(saved.get(name) != value for name, value in values.items()):
+        return False, "I could not save the database settings persistently; the current store was left unchanged."
+
+    # Keep a copy with the selected DB too. The bootstrap store above remains
+    # the source of truth on cold starts; this replica is useful when moving the
+    # deployment's environment pair later.
+    config_replica = storage.RedisStore(clean_url, clean_token,
+                                        key=runtime_config.config_key())
+    config_replica.save(saved)
+
+    # The URL is a conversation draft in the old state store. Clear it there
+    # before carrying state to the selected database; only the runtime config
+    # should retain the actual credentials.
+    if update is not None:
+        edits = edits_of(update)
+        edits.pop("db_custom_url", None)
+        edits.pop("awaiting_custom", None)
+        save()
+
+    os.environ[runtime_config.CUSTOM_REDIS_URL] = clean_url
+    os.environ[runtime_config.CUSTOM_REDIS_TOKEN] = clean_token
+    runtime_config.mark(values)
+    runtime_config.invalidate()
+    rebuild_store()                 # copies the live group/merchant state first
+    refresh_state()
+    _db_probe["at"] = 0.0
+    return True, "Custom database connected and selected."
+
+
+def use_deployment_database() -> tuple[bool, str]:
+    """Remove the Telegram-selected DB after verifying the fallback store."""
+    import runtime_config
+
+    custom = storage.custom_redis_config()
+    if not custom:
+        return False, "No custom database is selected."
+
+    # Build and probe the backend the bot will fall back to, with Telegram's
+    # override temporarily hidden. This avoids switching into an empty/broken
+    # store and keeps Vercel on persistent storage.
+    names = storage.CUSTOM_REDIS_ENV_PAIR
+    previous = {name: os.environ.pop(name, None) for name in names}
+    try:
+        fallback = storage.build_store(BASE_DIR)
+        healthy, _detail = probe_store(fallback, timeout=6.0)
+    finally:
+        for name, value in previous.items():
+            if value is not None:
+                os.environ[name] = value
+    if on_vercel() and getattr(fallback, "backend", "none") != "redis":
+        return False, ("There is no deployment-managed Redis database to return to. Keep the "
+                       "custom database selected or connect a Vercel KV/Redis store first.")
+    if not healthy:
+        return False, "The deployment's default store did not answer; the custom database is still active."
+
+    removed = runtime_config.remove(names=names, base_dir=BASE_DIR)
+    if not removed:
+        return False, "I could not remove the saved custom credentials; the current store was left unchanged."
+    remaining = runtime_config.load(BASE_DIR)
+    # Remove the backup copy as well; the database state itself is preserved.
+    try:
+        storage.RedisStore(custom[0], custom[1], key=runtime_config.config_key()).save(remaining)
+    except Exception as exc:                           # pragma: no cover - defensive
+        log.warning("Could not clear the custom database config replica: %s", exc)
+
+    for name in names:
+        os.environ.pop(name, None)
+    runtime_config.invalidate()
+    rebuild_store()                 # copies the live state into the verified fallback
+    refresh_state()
+    _db_probe["at"] = 0.0
+    return True, "Returned to the deployment's default database."
+
+
 def database_text():
-    """Where the state lives, and the link that makes it survive a redeploy."""
+    """Where state lives and how an admin switches to a custom REST database."""
     persistent = db_is_persistent()
+    custom = storage.custom_redis_config() is not None
     if persistent:
         state_block = (
-            "✅ The group, the merchants, the settings and the prices are kept there, "
-            "so they survive restarts, redeploys and extra instances.\n\n"
-            "Change the database URL/token on the setup page or with "
-            "<code>python setup_cli.py</code>, then tap 🔄 Check connection."
+            "✅ The group, merchants, settings and prices are stored in this shared database, "
+            "so they survive restarts and extra instances.\n\n"
+            + ("A <b>custom Redis REST database</b> selected in Telegram is active. Its token is "
+               "never shown. Use the buttons below to replace it or return to the deployment's "
+               "database."
+               if custom else
+               "The deployment's default Redis / KV database is active. Use the button below to "
+               "switch to a custom Redis REST endpoint.")
         )
     elif on_vercel():
         state_block = (
-            "⚠️ No shared database is connected: the state is kept on this host only. "
-            "A redeploy, a cold instance or a second instance starts empty.\n\n"
-            "<b>Connect one</b>\n"
-            "1. Open the Vercel dashboard → <b>Storage</b> (link below).\n"
-            "2. Add <b>Upstash for Redis</b> (or <b>Vercel KV</b>) → "
-            "<b>Connect to this project</b>. That writes "
-            "<code>KV_REST_API_URL</code> + <code>KV_REST_API_TOKEN</code> for you.\n"
-            "3. <b>Redeploy</b> — environment variables only apply to new deployments — "
-            "then tap 🔄 Check connection.\n\n"
-            "No redeploy needed instead: paste the REST URL + token into the browser "
-            "setup page (<code>/api/setup</code>) or answer <code>python setup_cli.py</code>, "
-            "then tap 🔄 Check connection."
+            "⚠️ No shared database is connected: Vercel instances do not share local files, so "
+            "a restart or another instance forgets the state.\n\n"
+            "For the first Vercel start, connect a KV / Redis store through the deployment's "
+            "Storage or environment settings and redeploy. Once the bot is running, use "
+            "<b>Set custom database</b> below to enter a custom Redis REST URL and token here "
+            "in private Telegram."
         )
     else:
         state_block = (
-            "⚠️ No shared database is connected: the state is kept in a local file on this "
-            "host, so a second instance (or a reinstalled machine) starts empty.\n\n"
-            "<b>Connect one</b>\n"
-            "1. Create a Redis-compatible REST database — a free Upstash one is enough "
-            "(link below).\n"
-            "2. Put its REST URL and token in <code>KV_REST_API_URL</code> + "
-            "<code>KV_REST_API_TOKEN</code> (.env / the service environment), or run "
-            "<code>python setup_cli.py</code> — it can store the pair for you.\n"
-            "3. Restart the bot if you edited .env, then tap 🔄 Check connection."
+            "⚠️ The bot is using a local file, so another instance or a reinstalled host will "
+            "not share its state.\n\n"
+            "Use <b>Set custom database</b> below to switch to a custom Redis-compatible REST "
+            "database. The URL and token are tested before the bot switches."
         )
     # "configured" is not "answering": load() reports a database that went away
     # exactly like an empty one, so it is probed here instead.
@@ -2123,19 +2250,17 @@ def database_text():
     if persistent and not answers:
         label = "NOT answering ⚠️"
         outage = (f"\n\n🚨 <b>Configured, but not answering</b> — {html_escape(detail)}\n"
-                  f"Until it responds the bot starts from an empty state every time and "
-                  f"forgets the group, the merchants and the prices. Fix the URL and token "
-                  f"on <code>/api/setup</code> or with <code>python setup_cli.py</code>, "
-                  f"then tap 🔄 Check connection.")
+                  "The bot may forget state until the store responds. Use the buttons below to "
+                  "switch to another database. On Vercel, a broken bootstrap store must first "
+                  "be restored in the deployment environment so Telegram updates can reach the bot.")
     else:
         label = "connected ✅" if persistent else "NOT connected ⚠️"
         outage = ""
     return (
-        f"🗄 <b>Database — where the bot keeps its state</b>\n\n"
+        f"🗄 <b>Database — state storage</b>\n\n"
         f"Current store: <code>{html_escape(STORE.describe())}</code>\n"
         f"Shared database: <b>{label}</b>\n\n"
-        f"{state_block}{outage}\n\n"
-        f"🔗 {html_escape(database_link())}"
+        f"{state_block}{outage}"
     )
 
 def group_label():
@@ -2171,7 +2296,7 @@ def panel_text():
         f"Channel: <code>{channel_label() or 'not set — tap 📢 Set channel'}</code>\n"
         f"Merchants: {len(state['merchants'])} · Pair: {ASSET}/{FIAT} · every {INTERVAL}s\n"
         f"🗄 Database: <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>"
-        f"{'' if db_is_persistent() else ' — tap 🔌 Connect database'}\n"
+        f"{'' if db_is_persistent() else ' — use /database to configure a custom store'}\n"
         f"💧 Liquidity: <b>{liq}</b> · 🔘 Buttons: <b>{btns}</b> · 🗑 AutoDel: <b>{autodel}</b>\n"
         f"🔄 Btn order: <b>{order_label()}</b> · 🎯 Links: <b>{'EXACT AD' if link_mode() == 'ad' else 'PROFILE'}</b>\n"
         f"🧹 Group cleanup: <b>{html_escape(cleanup)}</b> · 🚪 Join/Left: <b>{joinleft}</b>\n"
@@ -2259,7 +2384,7 @@ def settings_text():
         f"   Tap 🛡 Anti-scam to change it and to write your own challenge message.\n\n"
         f"🗄 Database (state store): <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>\n"
         f"   <code>{html_escape(STORE.describe())}</code>\n"
-        f"   Tap 🗄 Database for the connection link and what to do with it.\n\n"
+        f"   Tap 🗄 Database to check the store or configure a custom Redis REST endpoint.\n\n"
         f"📝 Custom Header:\n{header}\n\n"
         f"📝 Custom Body (per merchant):\n{body}\n\n"
         f"📝 Custom Footer:\n{footer}\n\n"
@@ -3530,6 +3655,41 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     awaiting = edit_get(u, "awaiting_custom")
 
+    if awaiting == "database_url":
+        import runtime_config
+        clean_url, error = runtime_config.clean_redis_rest_url(txt)
+        if error:
+            return await u.message.reply_text(f"❌ {error} Send /cancel to stop.")
+        edits = edits_of(u)
+        edits["db_custom_url"] = clean_url
+        edits["awaiting_custom"] = "database_token"
+        save()
+        return await u.message.reply_text(
+            "🔑 Now send the <b>REST token</b> for that database. I will test the connection "
+            "without repeating the token in my reply. Keep it in this private chat; send /cancel "
+            "to stop.",
+            parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="db_cancel")]]))
+
+    if awaiting == "database_token":
+        import runtime_config
+        clean_token, error = runtime_config.clean_redis_rest_token(txt)
+        if error:
+            return await u.message.reply_text(f"❌ {error} Send the token again, or /cancel.")
+        url = edit_get(u, "db_custom_url", "")
+        if not url:
+            _clear_database_edit(u)
+            return await u.message.reply_text(
+                "❌ The database URL draft expired. Open /database and start again.",
+                reply_markup=database_kb())
+        okay, detail = set_custom_database(url, clean_token, update=u)
+        if not okay:
+            return await u.message.reply_text(
+                f"❌ {html_escape(detail)} Send the token again, or /cancel.")
+        return await u.message.reply_html(
+            "✅ Custom database connected and selected. Your group, merchants and settings were "
+            "carried over.\n\n" + database_text(),
+            reply_markup=database_kb(), disable_web_page_preview=True)
+
     if awaiting in ("banner_url", "banner_gif_url"):
         if txt.lower() == "/cancel":
             edit_pop(u, "awaiting_custom")
@@ -4368,14 +4528,56 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await banner_test(u, c)
 
     elif d == "database":
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Manage database settings in a private chat with the bot.",
+                                  show_alert=True)
         await q.answer()
         return await q.edit_message_text(database_text(), parse_mode="HTML",
                                          reply_markup=database_kb(),
                                          disable_web_page_preview=True)
 
+    elif d == "db_custom":
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Open the bot in a private chat before sending database credentials.",
+                                  show_alert=True)
+        edits = edits_of(u)
+        edits.pop("db_custom_url", None)
+        edit_set(u, "awaiting_custom", "database_url")
+        await q.answer("Send the custom Redis REST URL")
+        return await q.edit_message_text(
+            "➕ <b>Set a custom database</b>\n\n"
+            "Send the Redis-compatible <b>REST URL</b> for your database. It must be an "
+            "<code>https://</code> endpoint (or <code>http://</code> for a private/self-hosted "
+            "service). The bot tests it before switching and carries your current state over.\n\n"
+            "Keep both the URL and token in this private chat — never send them to a group. "
+            "Send /cancel to stop.",
+            parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="db_cancel")]]))
+
+    elif d == "db_cancel":
+        _clear_database_edit(u)
+        await q.answer("Database setup cancelled")
+        return await q.edit_message_text(database_text(), parse_mode="HTML",
+                                         reply_markup=database_kb(),
+                                         disable_web_page_preview=True)
+
+    elif d == "db_reset":
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Manage database settings in a private chat with the bot.",
+                                  show_alert=True)
+        okay, detail = use_deployment_database()
+        await q.answer("Deployment database selected" if okay else "Could not switch database",
+                       show_alert=not okay)
+        return await q.edit_message_text(
+            (database_text() if okay else f"⚠️ {html_escape(detail)}\n\n{database_text()}"),
+            parse_mode="HTML", reply_markup=database_kb(),
+            disable_web_page_preview=True)
+
     elif d == "db_check":
-        # Credentials are usually added outside the bot (Vercel Storage, the
-        # setup page, setup_cli.py), so re-read them and re-select the backend.
+        # Re-read settings saved in the bootstrap store, then test the selected
+        # database rather than merely checking whether credentials are present.
         try:
             import runtime_config
             runtime_config.apply(BASE_DIR)
@@ -4383,7 +4585,8 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
             log.warning("Stored settings unavailable: %s", e)
         rebuild_store()
         refresh_state()
-        await q.answer(f"State store: {'connected ✅' if db_is_persistent() else 'not connected ⚠️'}")
+        healthy, _detail = db_health(force=True) if db_is_persistent() else (False, "")
+        await q.answer(f"State store: {'connected ✅' if healthy else 'not connected ⚠️'}")
         return await q.edit_message_text(database_text(), parse_mode="HTML",
                                          reply_markup=database_kb(),
                                          disable_web_page_preview=True)
@@ -4763,15 +4966,24 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u): return
-    if edit_get(u, "awaiting_custom"):
-        edit_pop(u, "awaiting_custom")
-        await u.message.reply_text("❌ Editing cancelled.", reply_markup=panel())
+    awaiting = edit_get(u, "awaiting_custom")
+    if awaiting:
+        if awaiting in ("database_url", "database_token"):
+            _clear_database_edit(u)
+            await u.message.reply_html("❌ Database setup cancelled.\n\n" + database_text(),
+                                       reply_markup=database_kb())
+        else:
+            edit_pop(u, "awaiting_custom")
+            await u.message.reply_text("❌ Editing cancelled.", reply_markup=panel())
     else:
         await u.message.reply_text("Nothing to cancel.", reply_markup=panel())
 
 async def database_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """/database — the state store, and the link that makes it persistent."""
+    """/database — check, connect or switch the bot's state database."""
     if not is_admin(u): return
+    chat = getattr(u, "effective_chat", None)
+    if chat is not None and getattr(chat, "type", "") != "private":
+        return await u.message.reply_text("Open a private chat with the bot to manage database settings.")
     await u.message.reply_html(database_text(), reply_markup=database_kb(),
                                disable_web_page_preview=True)
 

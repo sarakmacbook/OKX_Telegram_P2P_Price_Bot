@@ -18,7 +18,8 @@ os.environ.setdefault("FIAT", "USD")
 os.environ.setdefault("INTERVAL", "60")
 os.environ["P2P_STATE_FILE"] = str(_STATE_DIR / "data.json")
 os.environ["P2P_CONFIG_FILE"] = str(_STATE_DIR / "config.json")
-for _var in ("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL", "REDIS_REST_URL"):
+for _var in ("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL", "REDIS_REST_URL",
+             "P2P_CUSTOM_KV_REST_API_URL", "P2P_CUSTOM_KV_REST_API_TOKEN"):
     os.environ.pop(_var, None)
 
 import pytest  # noqa: E402

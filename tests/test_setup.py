@@ -1,15 +1,10 @@
-"""Both halves of the first-start setup: the browser form and the terminal wizard.
+"""First-start setup via the browser form and terminal wizard.
 
 The deployment needs ``BOT_TOKEN`` / ``ADMIN_IDS`` (and a KV store on Vercel).
-They can be added
-
-* in the browser — ``POST /api/setup`` stores them in ``runtime_config`` and the
-  bot picks them up on the next request, no redeploy, or
-* in a terminal — ``python setup_cli.py``, which writes to the same store and can
-  be skipped (``--skip``) with the web UI printed instead.
-
-These tests pin both paths, the validation they share, the lock-down of the
-public form, and the fact that neither one ever echoes a secret back.
+The browser form stores Telegram and optional bot settings in ``runtime_config``
+for the next request, but has no database selector or credentials. The terminal
+wizard can also configure the state backend and Redis REST pair. These tests pin
+the supported inputs, validation, public-form lock-down, and secret redaction.
 """
 
 import asyncio
@@ -84,6 +79,7 @@ def isolated_store(tmp_path, monkeypatch):
     monkeypatch.delenv("P2P_CONFIG_KEY", raising=False)
     for name in ("KV_REST_API_URL", "KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_URL",
                  "UPSTASH_REDIS_REST_TOKEN", "REDIS_REST_URL", "REDIS_REST_TOKEN",
+                 "P2P_CUSTOM_KV_REST_API_URL", "P2P_CUSTOM_KV_REST_API_TOKEN",
                  "VERCEL", "VERCEL_ENV", "VERCEL_URL", "VERCEL_PROJECT_PRODUCTION_URL",
                  "SETUP_SECRET"):
         monkeypatch.delenv(name, raising=False)
@@ -225,20 +221,38 @@ def test_the_summary_is_secret_free():
 
 
 # ── GET /api/setup — the page and its form ─────────────────────────────────
-def test_the_setup_page_offers_the_form(unconfigured):
+def test_the_setup_page_offers_the_form_without_database_controls(unconfigured):
     status, headers, payload = call()
     text = payload.decode()
     assert status == 200 and headers["content-type"].startswith("text/html")
     assert 'method="post" action="/api/setup"' in text
     assert 'name="BOT_TOKEN"' in text and 'name="ADMIN_IDS"' in text
-    assert 'name="KV_REST_API_URL"' in text            # no store connected → it is asked for
+    assert 'name="KV_REST_API_URL"' not in text
+    assert 'name="KV_REST_API_TOKEN"' not in text
+    assert 'name="P2P_STATE_BACKEND"' not in text
     assert "python setup_cli.py" in text               # …and the terminal way is right there
+    assert "/database" in text                         # database changes move to Telegram
     assert "SUPERSECRET" not in text
 
 
-def test_setup_page_does_not_ask_for_database_credentials_when_vercel_kv_is_connected(
+def test_setup_page_reports_telegram_custom_database_without_credentials(unconfigured, monkeypatch):
+    monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_URL", "https://private.custom.example/rest")
+    monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_TOKEN", "custom-secret-token")
+
+    status, _, payload = call()
+    text = payload.decode()
+
+    assert status == 200
+    assert "Telegram-selected custom Redis REST database" in text
+    assert "private.custom.example" not in text
+    assert "custom-secret-token" not in text
+    assert 'name="P2P_CUSTOM_KV_REST_API_URL"' not in text
+    assert 'name="P2P_CUSTOM_KV_REST_API_TOKEN"' not in text
+
+
+def test_setup_page_never_exposes_database_credentials_when_vercel_kv_is_connected(
         unconfigured, monkeypatch):
-    """A connected Vercel KV/Upstash integration supplies both credentials in env."""
+    """A connected Vercel KV/Upstash integration is diagnostic-only in the Web UI."""
     monkeypatch.setenv("KV_REST_API_URL", "https://example.upstash.io")
     monkeypatch.setenv("KV_REST_API_TOKEN", "private-test-token")
 
@@ -258,8 +272,9 @@ def test_setup_page_does_not_ask_for_database_credentials_when_vercel_kv_is_conn
     assert status == 200
     assert 'name="KV_REST_API_URL"' not in text
     assert 'name="KV_REST_API_TOKEN"' not in text
-    assert "database is already connected" in text
-    assert "no database" in text
+    assert 'name="P2P_STATE_BACKEND"' not in text
+    assert "persistent KV / Redis store is already available" in text
+    assert "This web UI does not accept database credentials" in text
     assert "How to insert the database" not in text
     assert "private-test-token" not in text
 
@@ -358,20 +373,23 @@ def test_a_json_body_works_too(unconfigured):
     assert status == 200 and json.loads(payload)["ok"] is True
 
 
-def test_the_kv_pair_is_checked_before_anything_is_written(unconfigured, monkeypatch):
-    def refuse(*a, **k):
-        raise RuntimeError("connection refused")
-
+def test_the_webui_rejects_kv_credentials_without_probing_or_saving(unconfigured, monkeypatch):
     import httpx
-    monkeypatch.setattr(httpx, "post", refuse)
+    probes = []
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: probes.append((a, k)))
+
     status, _, payload = post_form({"BOT_TOKEN": "123456:ABCdef",
                                     "KV_REST_API_URL": "https://eu1-x.upstash.io",
                                     "KV_REST_API_TOKEN": "kv-token"})
-    assert status == 400 and b"did not accept the connection" in payload
+    data = json.loads(payload)
+
+    assert status == 400 and "not accepted on the Web UI" in data["errors"][0]
+    assert probes == []
     assert runtime_config.load() == {}
+    assert "kv-token" not in payload.decode()
 
 
-def test_a_working_kv_pair_is_used_by_this_instance(unconfigured, monkeypatch):
+def test_the_webui_never_switches_to_a_supplied_working_kv_pair(unconfigured, monkeypatch):
     class Reply:
         status_code = 200
 
@@ -382,14 +400,17 @@ def test_a_working_kv_pair_is_used_by_this_instance(unconfigured, monkeypatch):
             return {"result": None}
 
     import httpx
-    monkeypatch.setattr(httpx, "post", lambda *a, **k: Reply())
+    probes = []
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: probes.append((a, k)) or Reply())
     status, _, payload = post_form({"BOT_TOKEN": "123456:ABCdef", "ADMIN_IDS": "424242",
                                     "KV_REST_API_URL": "https://eu1-x.upstash.io/",
                                     "KV_REST_API_TOKEN": "kv-token"})
     data = json.loads(payload)
-    assert status == 200 and data["ok"] is True
-    assert "KV_REST_API_URL" not in data["saved"], "the KV pair is not stored, only used"
-    assert any("cold start" in note for note in data["notes"])
+
+    assert status == 400 and data["ok"] is False
+    assert "not accepted on the Web UI" in data["errors"][0]
+    assert probes == []
+    assert runtime_config.load() == {}
 
 
 def test_the_form_is_locked_once_the_deployment_is_ready():
@@ -582,91 +603,99 @@ def test_state_database_choice_is_validated_and_stored():
     assert errors == ["P2P_STATE_BACKEND must be auto, file, or redis."]
 
 
-def test_setup_page_exposes_state_database_selector(unconfigured):
-    status, _, payload = call()
-    text = payload.decode()
-    assert 'name="P2P_STATE_BACKEND"' in text
-    assert 'value="auto" selected' in text
-    assert 'value="file"' in text and 'value="redis"' in text
+def test_custom_database_credentials_are_validated_and_never_echoed():
+    values = {runtime_config.CUSTOM_REDIS_URL: "https://redis.example/rest",
+              runtime_config.CUSTOM_REDIS_TOKEN: "custom-secret-token"}
+    cleaned, errors = runtime_config.validate(values)
+
+    assert errors == []
+    assert cleaned == values
+    assert runtime_config.mask(cleaned[runtime_config.CUSTOM_REDIS_TOKEN]) != "custom-secret-token"
+
+    cleaned, errors = runtime_config.validate({
+        runtime_config.CUSTOM_REDIS_URL: "https://user:pass@redis.example?secret=x",
+        runtime_config.CUSTOM_REDIS_TOKEN: "custom-secret-token"})
+    assert cleaned == {}
+    assert errors and "username, password, query or fragment" in errors[0]
+
+    cleaned, errors = runtime_config.validate({
+        runtime_config.CUSTOM_REDIS_URL: "https://redis.example",
+        runtime_config.CUSTOM_REDIS_TOKEN: "has spaces"})
+    assert cleaned == {}
+    assert errors and "whitespace" in errors[0]
 
 
-def test_setup_page_explains_how_to_insert_the_database(unconfigured):
-    """The page walks through getting the KV pair, not just naming the fields."""
+def test_custom_database_config_stays_in_the_bootstrap_store(monkeypatch):
+    monkeypatch.setenv("KV_REST_API_URL", "https://deployment.example")
+    monkeypatch.setenv("KV_REST_API_TOKEN", "deployment-token")
+    monkeypatch.setenv(runtime_config.CUSTOM_REDIS_URL, "https://custom.example")
+    monkeypatch.setenv(runtime_config.CUSTOM_REDIS_TOKEN, "custom-token")
+
+    store = runtime_config.config_store()
+
+    assert store.url == "https://deployment.example"
+
+
+def test_remove_custom_database_settings_keeps_other_runtime_settings():
+    runtime_config.save({"BOT_TOKEN": "123456:ABCdef", "ADMIN_IDS": "424242",
+                         runtime_config.CUSTOM_REDIS_URL: "https://custom.example",
+                         runtime_config.CUSTOM_REDIS_TOKEN: "custom-token"})
+
+    assert runtime_config.remove((runtime_config.CUSTOM_REDIS_URL,
+                                  runtime_config.CUSTOM_REDIS_TOKEN)) is True
+    saved = runtime_config.load()
+    assert saved == {"BOT_TOKEN": "123456:ABCdef", "ADMIN_IDS": "424242"}
+
+
+def test_setup_web_ui_has_no_database_selector_or_credentials(unconfigured, monkeypatch):
+    monkeypatch.setenv("P2P_DATABASE_LINK", "https://console.upstash.com/redis/secret")
     _, _, payload = call()
     text = payload.decode()
-    assert "How to insert the database" in text
-    assert "console.upstash.com" in text                    # where the database is created
-    assert "REST API" in text                               # where the pair is shown
-    assert "KV_REST_API_URL" in text and "KV_REST_API_TOKEN" in text
-    assert "Storage" in text and "Connect to this project" in text   # the Vercel path too
-    assert "Save settings" in text                          # and it ends at the form's button
 
-
-def test_setup_page_links_to_the_database_connection_page(unconfigured, monkeypatch):
-    """The panel that explains the KV pair starts with the way to get it."""
-    monkeypatch.delenv("P2P_DATABASE_LINK", raising=False)
-    _, _, payload = call()
-    text = payload.decode()
-
-    assert "Connect database" in text
-    assert 'href="https://vercel.com/dashboard/stores"' in text
-    assert "Connect to this project" in text               # what to press when it opens
-
-
-def test_setup_page_honours_a_configured_database_link(unconfigured, monkeypatch):
-    monkeypatch.setenv("P2P_DATABASE_LINK", "https://console.upstash.com/redis/1")
-    _, _, payload = call()
-
-    assert 'href="https://console.upstash.com/redis/1"' in payload.decode()
-    assert "https://vercel.com/dashboard/stores" not in payload.decode()
-
-
-def test_setup_page_hides_the_connect_button_once_a_database_is_connected(
-        unconfigured, monkeypatch):
-    """A connected store needs no call to action — the checklist says it is ready."""
-    monkeypatch.setenv("KV_REST_API_URL", "https://example.upstash.io")
-    monkeypatch.setenv("KV_REST_API_TOKEN", "private-test-token")
-    _, _, payload = call()
-    text = payload.decode()
-
+    assert 'name="P2P_STATE_BACKEND"' not in text
+    assert 'name="KV_REST_API_URL"' not in text
+    assert 'name="KV_REST_API_TOKEN"' not in text
     assert "Connect database" not in text
-    assert "database is already connected" in text
+    assert "console.upstash.com" not in text
+    assert "/database" in text
+    assert "This web UI does not accept database credentials" in text
+
+
+def test_setup_endpoint_rejects_database_settings_from_the_web_ui(unconfigured):
+    status, _, payload = post_json({
+        "BOT_TOKEN": "123456:ABCdef", "ADMIN_IDS": "424242",
+        "KV_REST_API_URL": "https://example.upstash.io", "KV_REST_API_TOKEN": "kv-token"})
+    data = json.loads(payload)
+    assert status == 400 and data["ok"] is False
+    assert "not accepted on the Web UI" in data["errors"][0]
+    assert "kv-token" not in payload.decode()
 
 
 def test_vercel_save_does_not_claim_ready_without_redis(unconfigured, monkeypatch):
     monkeypatch.setenv("VERCEL", "1")
     status, _, payload = call(
         method="POST",
-        body=urlencode({"BOT_TOKEN": "123456:ABCdef", "ADMIN_IDS": "424242",
-                        "P2P_STATE_BACKEND": "auto"}).encode(),
+        body=urlencode({"BOT_TOKEN": "123456:ABCdef", "ADMIN_IDS": "424242"}).encode(),
         headers={"content-type": "application/x-www-form-urlencoded", "accept": "text/html"})
     text = payload.decode()
     assert status == 200
     assert "setup is not complete" in text
     assert "the bot can start now" not in text
     assert 'class="banner info"' in text
-    assert "save the settings again" in text
+    assert "Before the bot can start on Vercel, connect a KV / Redis store" in text
+    assert "This web UI does not accept database credentials" in text
+    assert 'name="KV_REST_API_URL"' not in text
 
 
-def test_vercel_new_redis_connection_warns_about_environment(unconfigured, monkeypatch):
+def test_webui_rejects_custom_redis_credentials(unconfigured, monkeypatch):
     monkeypatch.setenv("VERCEL", "1")
-
-    class Reply:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"result": None}
-
-    import httpx
-    monkeypatch.setattr(httpx, "post", lambda *a, **k: Reply())
     status, _, payload = post_form({
         "BOT_TOKEN": "123456:ABCdef", "ADMIN_IDS": "424242",
         "KV_REST_API_URL": "https://example.upstash.io", "KV_REST_API_TOKEN": "kv-token"})
     data = json.loads(payload)
-    assert status == 200
-    assert any("applies only to this instance" in warning for warning in data["warnings"])
-    assert not any("No KV/Redis is connected" in warning for warning in data["warnings"])
+    assert status == 400 and data["ok"] is False
+    assert "not accepted on the Web UI" in data["errors"][0]
+    assert "kv-token" not in payload.decode()
 
 
 # ── a database that stopped answering ──────────────────────────────────────
@@ -723,8 +752,8 @@ def test_a_database_that_stopped_answering_is_reported_not_hidden(monkeypatch):
     assert "database" in status["message"]
 
 
-def test_a_dead_database_reopens_the_form_and_asks_for_credentials(monkeypatch):
-    """The page that reports the outage is the page that can repair it."""
+def test_a_dead_database_is_reported_but_not_editable_in_the_webui(monkeypatch):
+    """The web checklist reports database outages but exposes no credential fields."""
     monkeypatch.setenv("VERCEL", "1")
     _kv_pair(monkeypatch)
     _redis_dead(monkeypatch)
@@ -734,19 +763,25 @@ def test_a_dead_database_reopens_the_form_and_asks_for_credentials(monkeypatch):
 
     assert status == 200
     assert "Not responding" in text                     # its own badge, not "missing"
-    assert 'name="KV_REST_API_URL"' in text             # credentials can be entered again
-    assert 'name="KV_REST_API_TOKEN"' in text
-    assert "How to insert the database" in text         # …and the guide is back
+    assert 'name="KV_REST_API_URL"' not in text
+    assert 'name="KV_REST_API_TOKEN"' not in text
+    assert "How to insert the database" not in text
+    assert "database credentials are not accepted on this web page" in text
     assert "Locked" not in text
 
 
-def test_a_dead_database_lets_the_form_save_a_repair(monkeypatch):
+def test_a_dead_database_cannot_be_repaired_through_the_webui(monkeypatch):
     monkeypatch.setenv("VERCEL", "1")
     _kv_pair(monkeypatch)
     _redis_dead(monkeypatch)
 
-    status, _, payload = post_form({"ADMIN_IDS": "424242"})
-    assert status == 200 and json.loads(payload)["ok"] is True
+    status, _, payload = post_form({"ADMIN_IDS": "424242",
+                                    "KV_REST_API_URL": "https://other.upstash.io",
+                                    "KV_REST_API_TOKEN": "new-token"})
+    data = json.loads(payload)
+    assert status == 400 and data["ok"] is False
+    assert "not accepted on the Web UI" in data["errors"][0]
+    assert "new-token" not in payload.decode()
 
 
 def test_a_database_that_answers_keeps_the_deployment_ready(monkeypatch):

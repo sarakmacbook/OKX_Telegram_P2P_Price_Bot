@@ -1,16 +1,11 @@
-"""Detecting the database that is already there — and skipping the step for it.
+"""Read-only database detection in the setup checklist and diagnostics.
 
-The setup page used to ask for a KV/Redis pair whenever the *environment* had
-none, which is the wrong question on Vercel: the project can have a store
-connected long before its credentials reach a deployment (they only land on a
-redeploy).  So the page asks twice — first the environment, then Vercel itself
-(``api.vercel.com``) — and skips the database step the moment either one
-answers, saying *where* the database was found.
-
-These tests pin both answers, the skip, the explanation for the "connected but
-not redeployed" case, and the fact that a look-up that cannot be made (no token,
-a refused token, an offline host) is reported instead of silently breaking the
-page.
+The browser setup page never accepts database credentials. It reports a
+configured deployment pair or, when available, the Vercel project's existing
+storage connection so operators can tell whether a redeploy is needed. Custom
+Redis REST credentials selected through Telegram are reported without exposing
+the URL or token. These tests cover all detection paths and ensure failed Vercel
+lookups are reported instead of breaking the page.
 """
 
 import asyncio
@@ -134,6 +129,7 @@ def clean_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("P2P_RUNTIME_CONFIG_FILE", str(tmp_path / "runtime_config.json"))
     for name in ("KV_REST_API_URL", "KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_URL",
                  "UPSTASH_REDIS_REST_TOKEN", "REDIS_REST_URL", "REDIS_REST_TOKEN",
+                 "P2P_CUSTOM_KV_REST_API_URL", "P2P_CUSTOM_KV_REST_API_TOKEN",
                  "VERCEL", "VERCEL_PROJECT_ID", "VERCEL_PROJECT_NAME", "VERCEL_TEAM_ID",
                  "VERCEL_TOKEN", "P2P_VERCEL_TOKEN", "P2P_VERCEL_PROJECT_ID"):
         monkeypatch.delenv(name, raising=False)
@@ -160,6 +156,21 @@ def test_a_complete_kv_pair_is_detected_in_the_environment(monkeypatch):
     assert found["provider"] == "Vercel KV / Upstash"
     assert "Vercel KV / Upstash" in found["where"] and "environment" in found["where"]
     assert found["skipped"] is True
+
+
+def test_telegram_selected_custom_database_is_reported_without_credentials(monkeypatch):
+    monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_URL", "https://custom.example/rest")
+    monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_TOKEN", "custom-secret")
+    monkeypatch.setenv("KV_REST_API_URL", "https://deployment.example")
+    monkeypatch.setenv("KV_REST_API_TOKEN", "deployment-secret")
+
+    found = serverless.detect_database()
+
+    assert found["found"] and found["wired"]
+    assert found["source"] == "telegram-custom"
+    assert "Telegram-selected custom Redis REST database" in found["where"]
+    assert "custom-secret" not in json.dumps(found)
+    assert "https://custom.example" not in json.dumps(found)
 
 
 def test_the_environment_answer_costs_no_vercel_call(monkeypatch):
@@ -190,7 +201,7 @@ def test_a_second_alias_counts_as_well(monkeypatch):
 
 
 # ── Vercel answers second ──────────────────────────────────────────────────
-def test_a_store_vercel_reports_is_detected_and_skipped(on_vercel, monkeypatch):
+def test_a_store_vercel_reports_is_detected_without_database_controls(on_vercel, monkeypatch):
     calls = fake_vercel(monkeypatch, stores=[{"id": "store_1", "name": "p2p-kv",
                                               "type": "redis"}])
 
@@ -325,23 +336,24 @@ def test_the_answer_is_cached_and_can_be_forgotten(on_vercel, monkeypatch):
     assert len(calls) == 2
 
 
-# ── the setup page skips the step, and says where it found the database ────
-def test_the_page_skips_the_database_step_when_vercel_has_one(on_vercel, monkeypatch):
+# ── database status stays visible, while configuration moves to Telegram ──
+def test_setup_page_reports_a_detected_database_without_edit_controls(on_vercel, monkeypatch):
     fake_vercel(monkeypatch, stores=[{"name": "p2p-kv", "type": "redis"}])
 
     status, text = get_setup_page()
 
     assert status == 200
-    assert "Database detected — step skipped" in text
-    assert "Detected from" in text and "p2p-kv" in text
-    assert "How to insert the database" not in text, "no guide for a step that is skipped"
+    assert "p2p-kv" in text and "Vercel → Storage" in text
+    assert 'name="KV_REST_API_URL"' not in text
+    assert 'name="KV_REST_API_TOKEN"' not in text
+    assert 'name="P2P_STATE_BACKEND"' not in text
+    assert "How to insert the database" not in text
     assert "Connect database" not in text
-    assert "database was detected" in text                   # the form says so too
-    assert "Database detected — redeploy to apply it" in text
-    assert "detected: Vercel → Storage" in text              # the checklist names the source
+    assert "/database" in text
+    assert "This web UI does not accept database credentials" in text
 
 
-def test_the_page_says_the_environment_is_where_a_wired_database_came_from(monkeypatch):
+def test_setup_page_reports_the_environment_database_without_inputs(monkeypatch):
     monkeypatch.setenv("KV_REST_API_URL", "https://example.upstash.io")
     monkeypatch.setenv("KV_REST_API_TOKEN", "kv-token")
     fake_vercel(monkeypatch)                                # must not be needed
@@ -349,14 +361,14 @@ def test_the_page_says_the_environment_is_where_a_wired_database_came_from(monke
     status, text = get_setup_page()
 
     assert status == 200
-    assert "Database detected — step skipped" in text
-    assert "database is already connected" in text
     assert "Vercel KV / Upstash" in text
-    assert "Database detected — skipped" in text             # the walkthrough step
+    assert "persistent KV / Redis store is already available" in text
+    assert 'name="KV_REST_API_URL"' not in text
+    assert "kv-token" not in text
 
 
-def test_a_detected_database_that_stopped_answering_is_not_skipped(on_vercel, monkeypatch):
-    """Skipping a step that needs repairing would hide the outage."""
+def test_a_detected_database_that_stopped_answering_is_read_only_in_the_webui(
+        on_vercel, monkeypatch):
     monkeypatch.setenv("KV_REST_API_URL", "https://example.upstash.io")
     monkeypatch.setenv("KV_REST_API_TOKEN", "kv-token")
     import httpx
@@ -369,20 +381,24 @@ def test_a_detected_database_that_stopped_answering_is_not_skipped(on_vercel, mo
 
     status, text = get_setup_page()
 
-    assert "Database detected — step skipped" not in text
-    assert "How to insert the database" in text, "the page that reports it must repair it"
     assert "Not responding" in text
+    assert 'name="KV_REST_API_URL"' not in text
+    assert 'name="KV_REST_API_TOKEN"' not in text
+    assert "database credentials are not accepted on this web page" in text
+    assert "How to insert the database" not in text
 
 
-def test_without_any_database_the_guide_is_still_there(on_vercel, monkeypatch):
+def test_without_a_database_the_webui_points_to_telegram_for_custom_configuration(
+        on_vercel, monkeypatch):
     fake_vercel(monkeypatch, stores=[])
 
     status, text = get_setup_page()
 
     assert status == 200
-    assert "How to insert the database" in text
-    assert "Database detected" not in text
-    assert "Connect database" in text
+    assert "How to insert the database" not in text
+    assert "Connect database" not in text
+    assert "Before the bot can start on Vercel, connect a KV / Redis store" in text
+    assert "/database" in text
 
 
 def test_a_connected_store_still_blocks_the_deployment_with_an_explanation(
@@ -401,7 +417,8 @@ def test_a_connected_store_still_blocks_the_deployment_with_an_explanation(
 
     steps = serverless.setup_steps(status)
 
-    assert "Database detected — skipped" in steps[1]
+    assert "Database detected on Vercel → Storage" in steps[1]
+    assert "/database" in steps[1]
     assert len(steps) == 3
 
 

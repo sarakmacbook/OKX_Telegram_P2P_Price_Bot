@@ -1,16 +1,21 @@
-"""The required settings, kept outside the deployment's environment variables.
+"""Bot settings and Telegram-selected custom database credentials, kept outside
+the deployment's environment variables.
 
-A Vercel deployment reads ``BOT_TOKEN`` / ``ADMIN_IDS`` from its environment, and
-changing them means editing the dashboard and redeploying.  That is fine, but it
-is not the only way: the same values can be handed over
+A Vercel deployment can keep ``BOT_TOKEN`` / ``ADMIN_IDS`` in its environment,
+or they can be stored without a redeploy:
 
-* in the **browser**, on the first-start setup page (``POST /api/setup``), or
-* in the **terminal**, with ``python setup_cli.py`` (which you can also skip and
-  finish in the browser later — ``--skip`` prints the link and exits).
+* the **browser** form (``POST /api/setup``) handles bot credentials and
+  optional asset/fiat/interval settings only;
+* the **terminal** wizard (``python setup_cli.py``) handles the same bot settings
+  and can additionally select the state backend and configure a deployment KV /
+  Redis REST pair;
+* custom Redis REST credentials entered in a private Telegram chat are stored
+  here separately from the deployment-managed pair.
 
-Both write into this module's store, and :func:`apply` copies whatever the
-environment does not already provide into ``os.environ`` **before** ``bot.py`` is
-imported, so the very same configuration code (``env_or_cli``) serves both paths.
+The browser form and terminal wizard write bot settings into this module's
+store, and :func:`apply` copies values not already supplied by the environment
+into ``os.environ`` **before** ``bot.py`` is imported. This keeps the bot
+configuration path consistent without exposing database credentials in the Web UI.
 
 Where the values live follows ``storage.py``:
 
@@ -39,20 +44,22 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import storage
 
 log = logging.getLogger("p2p-bot.config")
 
-#: Settings the browser form and the terminal wizard may store.  Everything else
-#: stays environment-only on purpose — ``CRON_SECRET`` for example is sent by
-#: Vercel's own cron from the *deployment* environment, so a stored copy would
-#: lock the cron out instead of protecting it.
-# P2P_STATE_BACKEND is stored too so the browser selector and terminal wizard
-# can make the same choice as a deployment environment variable.
-SUPPORTED = ("BOT_TOKEN", "ADMIN_IDS", "ASSET", "FIAT", "INTERVAL", "P2P_STATE_BACKEND")
+#: Runtime settings for the browser form, terminal wizard, and Telegram DB menu.
+#: The browser writes only bot settings; the CLI can configure the backend and
+#: deployment REST pair, while Telegram stores custom credentials separately.
+#: ``CRON_SECRET`` stays environment-only because Vercel Cron reads it there.
+CUSTOM_REDIS_URL = "P2P_CUSTOM_KV_REST_API_URL"
+CUSTOM_REDIS_TOKEN = "P2P_CUSTOM_KV_REST_API_TOKEN"
+SUPPORTED = ("BOT_TOKEN", "ADMIN_IDS", "ASSET", "FIAT", "INTERVAL", "P2P_STATE_BACKEND",
+             CUSTOM_REDIS_URL, CUSTOM_REDIS_TOKEN)
 REQUIRED = ("BOT_TOKEN", "ADMIN_IDS")
-SECRETS = ("BOT_TOKEN",)
+SECRETS = ("BOT_TOKEN", CUSTOM_REDIS_TOKEN)
 
 CONFIG_FILE = "runtime_config.json"
 DEFAULT_CONFIG_KEY = "p2p-price-bot:config"
@@ -92,16 +99,16 @@ def config_path(base_dir: str | Path | None = None) -> Path:
 
 
 def config_store(base_dir: str | Path | None = None):
-    """The store object for these settings, following the selected state backend.
+    """The bootstrap store for settings, independent of Telegram's custom DB.
 
-    The configuration file remains a deliberate bootstrap fallback when Redis
-    was selected but its credentials are absent: it lets the setup UI explain
-    what is missing instead of making a first-run deployment impossible to
-    configure.  The bot state itself never makes that fallback for an explicit
-    Redis selection (see ``storage.build_store``).
+    A custom state database is selected *from* these settings. Reading this
+    configuration from that selected database would create a circular
+    dependency on cold starts, so config always uses a deployment-managed KV
+    pair when available, or the local runtime-config file otherwise. The bot's
+    state store still follows ``storage.build_store`` and may be a different DB.
     """
     choice = storage.state_backend()
-    redis = storage.redis_config()
+    redis = storage.environment_redis_config()
     if choice != "file" and redis:
         return storage.RedisStore(redis[0], redis[1], key=config_key())
     return storage.FileStore(config_path(base_dir))
@@ -142,6 +149,21 @@ def save(values: dict, base_dir: str | Path | None = None) -> dict[str, str]:
     if any(written.get(name) != merged[name] for name in merged):
         log.warning("Stored settings were not written to %s", store.describe())
     return written
+
+
+def remove(names, base_dir: str | Path | None = None) -> bool:
+    """Remove selected stored settings without touching environment variables."""
+    selected = {str(name).upper() for name in (names or ())} & set(SUPPORTED)
+    if not selected:
+        return True
+    invalidate()
+    values = load(base_dir)
+    for name in selected:
+        values.pop(name, None)
+    store = config_store(base_dir)
+    store.save(values)
+    written = load(base_dir)
+    return all(name not in written for name in selected)
 
 
 def clear(base_dir: str | Path | None = None) -> bool:
@@ -241,6 +263,39 @@ def _clean_admins(value: str) -> tuple[str, str]:
     return ",".join(parts), ""
 
 
+def clean_redis_rest_url(value: str) -> tuple[str, str]:
+    """Normalize a Redis-compatible REST endpoint without accepting credentials in its URL."""
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return "", "A Redis REST URL is required."
+    if len(text) > 2048 or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return "", "The Redis REST URL is too long or contains whitespace."
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+        valid = (parsed.scheme in ("https", "http") and bool(parsed.hostname)
+                 and parsed.username is None and parsed.password is None
+                 and not parsed.query and not parsed.fragment
+                 and (port is None or 1 <= port <= 65535))
+    except ValueError:
+        valid = False
+    if not valid:
+        return "", ("Use a valid https:// Redis REST endpoint (http:// is allowed for "
+                    "self-hosted/private services); do not include a username, password, "
+                    "query or fragment.")
+    return text, ""
+
+
+def clean_redis_rest_token(value: str) -> tuple[str, str]:
+    """Validate the token belonging to a custom Redis REST endpoint."""
+    text = str(value or "").strip()
+    if not text:
+        return "", "A Redis REST token is required."
+    if len(text) > 4096 or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return "", "The Redis REST token is too long or contains whitespace."
+    return text, ""
+
+
 def validate(values: dict) -> tuple[dict[str, str], list[str]]:
     """Split a submission into ``(usable values, human readable problems)``.
 
@@ -284,6 +339,21 @@ def validate(values: dict) -> tuple[dict[str, str], list[str]]:
             errors.append("P2P_STATE_BACKEND must be auto, file, or redis.")
         else:
             cleaned["P2P_STATE_BACKEND"] = normal
+
+    custom_url = str(values.get(CUSTOM_REDIS_URL) or "").strip()
+    custom_token = str(values.get(CUSTOM_REDIS_TOKEN) or "").strip()
+    if bool(custom_url) != bool(custom_token):
+        errors.append("The custom Redis REST URL and token must be provided together.")
+    elif custom_url and custom_token:
+        clean_url, url_error = clean_redis_rest_url(custom_url)
+        clean_token, token_error = clean_redis_rest_token(custom_token)
+        if url_error:
+            errors.append(url_error)
+        if token_error:
+            errors.append(token_error)
+        if not url_error and not token_error:
+            cleaned[CUSTOM_REDIS_URL] = clean_url
+            cleaned[CUSTOM_REDIS_TOKEN] = clean_token
 
     interval = str(values.get("INTERVAL") or "").strip()
     if interval:

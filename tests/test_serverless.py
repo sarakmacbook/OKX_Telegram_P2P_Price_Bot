@@ -651,10 +651,10 @@ def test_price_check_explains_a_geo_blocked_region(serverless, webhook, monkeypa
         _unseed_merchant(bot_module, old)
 
 
-# ── the "connect database" link on the web pages ───────────────────────────
-def test_status_page_links_to_the_database_page_when_state_is_not_persistent(
+# ── database setup has moved out of the browser UI ─────────────────────────
+def test_status_page_has_no_database_management_link_when_state_is_not_persistent(
         serverless, webhook, monkeypatch):
-    """The warning that says state will be lost carries the way to fix it."""
+    """The browser reports the issue and points owners to the deployment/Telegram flow."""
     monkeypatch.setattr(webhook, "ensure_webhook",
                         Recorder(result={"url": "https://bot.vercel.app/api/webhook",
                                          "pending_updates": 0}))
@@ -664,8 +664,9 @@ def test_status_page_links_to_the_database_page_when_state_is_not_persistent(
     text = payload.decode()
 
     assert "NOT persistent" in text                      # the test store is a file, not KV
-    assert "Connect database" in text
-    assert 'href="https://vercel.com/dashboard/stores"' in text
+    assert "Connect database" not in text
+    assert "/database in Telegram" in text
+    assert 'href="https://vercel.com/dashboard/stores"' not in text
 
 
 def test_status_page_hides_the_connect_button_when_a_database_is_connected(serverless, webhook):

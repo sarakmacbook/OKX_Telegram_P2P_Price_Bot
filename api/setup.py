@@ -158,11 +158,10 @@ async def handle(request: Request) -> Response:
         banner = (("ok" if status["ready"] and not result["warnings"] else "info")
                   if result["ok"] else "error",
                   headline + "".join(f" ⚠️ {item}" for item in result["warnings"]))
-        # Non-secret fields are echoed back so a rejected form is not a dead end;
-        # the token and the KV token are never sent to the browser again.
+        # Only non-secret bot fields are echoed back after a rejected form;
+        # token and database fields are never sent to the browser again.
         echo = {name: value for name, value in values.items()
-                if name in ("ADMIN_IDS", "ASSET", "FIAT", "INTERVAL", "P2P_STATE_BACKEND",
-                            "KV_REST_API_URL")}
+                if name in ("ADMIN_IDS", "ASSET", "FIAT", "INTERVAL")}
         return Response.html(_setup_page(message, status, banner=banner,
                                          form_values=None if result["ok"] else echo),
                              status=200 if result["ok"] else 400)

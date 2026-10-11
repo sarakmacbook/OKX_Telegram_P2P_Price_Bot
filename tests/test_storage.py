@@ -119,7 +119,26 @@ def test_backend_aliases_are_normalized(monkeypatch):
     assert storage.normalize_backend("postgres") is None
 
 
-# ── the "connect a database" link ──────────────────────────────────────────
+def test_telegram_custom_database_takes_priority_without_overwriting_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("P2P_STATE_BACKEND", "file")
+    monkeypatch.setenv("KV_REST_API_URL", "https://deployment.example")
+    monkeypatch.setenv("KV_REST_API_TOKEN", "deployment-token")
+    monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_URL", "https://custom.example")
+    monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_TOKEN", "custom-token")
+
+    assert storage.redis_config() == ("https://custom.example", "custom-token")
+    assert storage.environment_redis_config() == ("https://deployment.example", "deployment-token")
+    assert storage.state_backend() == "redis"              # custom selection beats file
+    store = storage.build_store(tmp_path)
+    assert store.backend == "redis" and store.url == "https://custom.example"
+
+    monkeypatch.delenv("P2P_CUSTOM_KV_REST_API_URL")
+    monkeypatch.delenv("P2P_CUSTOM_KV_REST_API_TOKEN")
+    assert storage.state_backend() == "file"               # removing it restores the preference
+    assert storage.redis_config() == ("https://deployment.example", "deployment-token")
+
+
+# ── the legacy JSON connect_database hint ───────────────────────────────────
 def test_database_link_defaults_to_the_vercel_storage_page(monkeypatch):
     monkeypatch.delenv(storage.DATABASE_LINK_ENV, raising=False)
     assert storage.database_link() == "https://vercel.com/dashboard/stores"
