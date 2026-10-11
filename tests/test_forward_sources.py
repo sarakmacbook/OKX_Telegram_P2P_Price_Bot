@@ -6,6 +6,7 @@ that follows it, and the two ways a source can disappear again.
 """
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -34,7 +35,19 @@ def _bot():
         copy_message=AsyncMock(return_value=SimpleNamespace(message_id=99)),
         forward_message=AsyncMock(return_value=SimpleNamespace(message_id=98)),
         delete_message=AsyncMock(),
+        # ➕ adding a source by link: the bot looks the chat up itself
+        get_chat=AsyncMock(return_value=_chat(NEWS_CHANNEL, "channel", "News")),
+        get_chat_member=AsyncMock(return_value=SimpleNamespace(status="administrator")),
     )
+
+
+def _private_text(text, message_id=5, **message):
+    """A message an admin sent to the bot in their private chat."""
+    msg = SimpleNamespace(text=text, caption=None, message_id=message_id, chat_id=ADMIN,
+                          reply_text=AsyncMock(), reply_html=AsyncMock(), **message)
+    return SimpleNamespace(message=msg, effective_message=msg,
+                           effective_user=SimpleNamespace(id=ADMIN, is_bot=False),
+                           effective_chat=SimpleNamespace(id=ADMIN, type="private"), args=None)
 
 
 def _chat(chat_id, chat_type="channel", title="Source"):
@@ -54,7 +67,9 @@ def _update(chat_id, chat_type="channel", message_id=34, title="Source", user=No
 
 def _callback(manager, data, fake=None):
     fake = fake or _bot()
-    query = SimpleNamespace(data=data, message=SimpleNamespace(text="", chat_id=ADMIN),
+    query = SimpleNamespace(data=data,
+                            message=SimpleNamespace(text="", chat_id=ADMIN,
+                                                    reply_text=AsyncMock(), reply_html=AsyncMock()),
                             answer=AsyncMock(), edit_message_text=AsyncMock())
     update = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
                              effective_chat=SimpleNamespace(type="private"),
@@ -474,3 +489,404 @@ def test_the_panel_and_the_settings_show_where_it_forwards_from(manager):
 
     assert "News" in manager.panel_text()
     assert "News" in manager.settings_text()
+
+
+# ── ➕ a chat named by link (public) or by a forwarded post (private) ───────
+@pytest.mark.parametrize("value,expected", [
+    ("https://t.me/Newsroom", {"kind": "username", "username": "Newsroom"}),
+    ("t.me/newsroom", {"kind": "username", "username": "newsroom"}),
+    ("@newsroom", {"kind": "username", "username": "newsroom"}),
+    ("https://t.me/newsroom/12", {"kind": "username", "username": "newsroom"}),
+    ("https://t.me/s/newsroom", {"kind": "username", "username": "newsroom"}),
+    ("https://telegram.me/newsroom", {"kind": "username", "username": "newsroom"}),
+    ("https://t.me/+AbCdEf12", {"kind": "invite", "hash": "AbCdEf12"}),
+    ("https://t.me/joinchat/AbCdEf12", {"kind": "invite", "hash": "AbCdEf12"}),
+    ("https://t.me/c/1234567890/15", {"kind": "chat_id", "chat_id": -1001234567890}),
+])
+def test_a_chat_link_is_read(manager, value, expected):
+    assert manager.parse_source_link(value) == expected
+
+
+@pytest.mark.parametrize("value", [
+    "hello everyone", "0dec824eed", "@ab", "t.me/", "https://t.me/addstickers/Cats",
+    "https://t.me/bot?startgroup=forwardfrom", "https://t.me/bot?startchannel=forwardfrom",
+    "https://t.me/c/12/1", "https://www.okx.com/p2p/ads-merchant?publicUserId=abc123",
+    "https://example.com/t.me/news", "https://t.me/news extra", "",
+])
+def test_anything_that_is_not_a_chat_link_is_left_alone(manager, value):
+    assert manager.parse_source_link(value) is None
+
+
+def test_a_link_asks_before_anything_is_relayed(manager):
+    manager.state["channel"] = CHANNEL
+    update = _private_text("https://t.me/newsroom")
+
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=_bot())))
+
+    assert manager.forward_sources() == {} and manager.is_forward_source(NEWS_CHANNEL) is False
+    assert manager.source_offer(ADMIN)["chat_id"] == NEWS_CHANNEL
+    text = update.message.reply_html.await_args.args[0]
+    assert "Forward from this channel?" in text and "News" in text
+    buttons = update.message.reply_html.await_args.kwargs["reply_markup"]
+    assert [b.callback_data for row in buttons.inline_keyboard for b in row] == \
+        ["fwd_src_offer_add", "fwd_src_offer_post", "fwd_src_offer_no"]
+
+
+def test_the_offer_is_sent_for_a_normalized_handle(manager):
+    fake = _bot()
+    manager.state["group"] = GROUP
+
+    asyncio.run(manager.on_text(_private_text("@newsroom"), SimpleNamespace(bot=fake)))
+
+    fake.get_chat.assert_awaited_once_with("@newsroom")
+    assert manager.source_offer(ADMIN)["title"] == "News"
+
+
+def test_tapping_add_starts_the_relay(manager):
+    manager.state["group"], manager.state["group_title"] = GROUP, "Rates"
+    manager.state["settings"]["channel_to_group"] = False
+    manager.state["forward_sources"] = {}
+
+    asyncio.run(manager.on_text(_private_text("https://t.me/newsroom"), SimpleNamespace(bot=_bot())))
+    query = _callback(manager, "fwd_src_offer_add")
+
+    record = manager.forward_sources()[str(NEWS_CHANNEL)]
+    assert (record["title"], record["type"]) == ("News", "channel")
+    assert manager.channel_to_group_enabled() is True      # selecting a source means "use it"
+    assert manager.source_offer(ADMIN) is None             # the offer is spent
+    text = query.edit_message_text.await_args.args[0]
+    assert "are forwarded to" in text and "Forwarding was OFF" in text
+    assert query.edit_message_text.await_args.kwargs["reply_markup"] is not None
+
+
+def test_tapping_not_now_adds_nothing(manager):
+    manager.state["group"] = GROUP
+    asyncio.run(manager.on_text(_private_text("https://t.me/newsroom"), SimpleNamespace(bot=_bot())))
+
+    query = _callback(manager, "fwd_src_offer_no")
+
+    assert manager.forward_sources() == {}
+    assert manager.source_offer(ADMIN) is None
+    assert "Nothing was added" in query.edit_message_text.await_args.args[0]
+
+
+def test_an_expired_offer_only_says_so(manager):
+    manager.state["group"] = GROUP
+    manager.state["source_offers"] = {str(ADMIN): {"chat_id": NEWS_CHANNEL, "title": "News",
+                                                   "type": "channel", "ts": 1}}
+
+    query = _callback(manager, "fwd_src_offer_add")
+
+    assert manager.forward_sources() == {}
+    assert query.answer.await_args.kwargs["show_alert"] is True
+    assert "expired" in query.answer.await_args.args[0]
+    query.edit_message_text.assert_not_awaited()
+
+
+def test_offers_are_sanitized_and_expire_on_load(manager):
+    manager.state["source_offers"] = {
+        str(ADMIN): {"chat_id": NEWS_CHANNEL, "title": "News", "type": "channel",
+                     "ts": int(time.time())},
+        "999": {"chat_id": SIGNALS_GROUP, "title": "Old", "type": "channel", "ts": 1},
+        "junk": {"chat_id": 1, "title": "Junk", "type": "channel", "ts": int(time.time())},
+    }
+    manager.save()
+
+    manager.refresh_state()
+
+    assert list(manager.state["source_offers"]) == [str(ADMIN)]
+
+
+def test_a_link_to_a_user_chat_is_refused(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    fake.get_chat = AsyncMock(return_value=_chat(ADMIN, "private", "Sam"))
+
+    update = _private_text("https://t.me/sam_smith")
+
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    assert "user chat" in update.message.reply_html.await_args.args[0]
+    assert manager.source_offer(ADMIN) is None
+
+
+def test_a_link_that_telegram_cannot_open_points_at_a_forward(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    fake.get_chat = AsyncMock(side_effect=RuntimeError("Chat not found"))
+
+    update = _private_text("https://t.me/ghost_channel")
+
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    text = update.message.reply_html.await_args.args[0]
+    assert "could not open" in text and "private" in text
+    assert manager.forward_sources() == {}
+
+
+def test_an_invite_link_asks_the_bot_to_be_added_first(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    fake.get_chat = AsyncMock(side_effect=RuntimeError("chat not found"))
+
+    update = _private_text("https://t.me/+AbCdEf12")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    fake.get_chat.assert_awaited_once_with("https://t.me/+AbCdEf12")
+    assert "not in that chat" in update.message.reply_html.await_args.args[0]
+
+
+def test_a_private_channel_link_is_looked_up_by_its_id(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    fake.get_chat = AsyncMock(return_value=_chat(NEWS_CHANNEL, "channel", "News"))
+
+    asyncio.run(manager.on_text(_private_text("https://t.me/c/1234567890/15"),
+                                SimpleNamespace(bot=fake)))
+
+    fake.get_chat.assert_awaited_once_with(-1001234567890)
+    assert manager.source_offer(ADMIN)["chat_id"] == NEWS_CHANNEL
+
+
+def test_the_destination_group_cannot_be_added(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    fake.get_chat = AsyncMock(return_value=_chat(GROUP, "supergroup", "Rates"))
+
+    update = _private_text("https://t.me/rates")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    assert "forwarded <b>into</b>" in update.message.reply_html.await_args.args[0]
+    assert manager.source_offer(ADMIN) is None
+
+
+def test_a_chat_that_is_already_relayed_says_so(manager):
+    manager.state["group"] = GROUP
+    manager.add_forward_source(NEWS_CHANNEL, "News", "channel")
+    fake = _bot()
+    fake.get_chat = AsyncMock(return_value=_chat(NEWS_CHANNEL, "channel", "News"))
+
+    update = _private_text("https://t.me/newsroom")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    text = update.message.reply_html.await_args.args[0]
+    assert "Already forwarding from" in text
+    assert update.message.reply_html.await_args.kwargs["reply_markup"] is not None
+
+
+def test_without_a_group_first_a_link_says_what_is_missing(manager):
+    manager.state["group"] = None
+    update = _private_text("https://t.me/newsroom")
+
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=_bot())))
+
+    assert "Set the destination group first" in update.message.reply_html.await_args.args[0]
+    assert manager.source_offer(ADMIN) is None
+
+
+def test_a_full_picker_says_the_limit_is_reached(manager):
+    manager.state["group"] = GROUP
+    for index in range(manager.MAX_FORWARD_SOURCES):
+        manager.add_forward_source(-200000 - index, f"Chat {index}", "channel")
+
+    update = _private_text("https://t.me/newsroom")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=_bot())))
+
+    assert "limit of" in update.message.reply_html.await_args.args[0]
+    assert manager.source_offer(ADMIN) is None
+
+
+def test_the_offer_warns_when_the_bot_is_not_an_admin(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    fake.get_chat_member = AsyncMock(return_value=SimpleNamespace(status="left"))
+
+    update = _private_text("https://t.me/newsroom")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    text = update.message.reply_html.await_args.args[0]
+    assert "add the bot to that channel as an <b>admin</b>" in text
+    assert "channel posts" in text
+
+
+def test_the_offer_is_quiet_when_the_bot_is_already_an_admin(manager):
+    manager.state["group"] = GROUP
+    update = _private_text("https://t.me/newsroom")
+
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=_bot())))
+
+    text = update.message.reply_html.await_args.args[0]
+    assert "already an <b>admin</b> there" in text
+    assert "add the bot" not in text
+
+
+def test_a_group_offer_explains_privacy_mode(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    fake.get_chat = AsyncMock(return_value=_chat(SIGNALS_GROUP, "supergroup", "Signals"))
+    fake.get_chat_member = AsyncMock(return_value=SimpleNamespace(status="member"))
+
+    update = _private_text("https://t.me/signals_group")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    text = update.message.reply_html.await_args.args[0]
+    assert "Forward from this group?" in text and "privacy mode" in text
+
+
+def test_a_forwarded_post_names_a_private_channel(manager):
+    """A private channel has no link — the post the admin forwarded is the link."""
+    manager.state["group"], manager.state["group_title"] = GROUP, "Rates"
+    fake = _bot()
+    update = _private_text("a post from a private channel",
+                           forward_origin=SimpleNamespace(chat=_chat(NEWS_CHANNEL, "channel", "News")))
+
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    fake.copy_message.assert_not_awaited()                 # asked first, not reposted
+    assert manager.source_offer(ADMIN)["chat_id"] == NEWS_CHANNEL
+    assert manager.forward_sources() == {}
+    assert "Forward from this channel?" in update.message.reply_html.await_args.args[0]
+    fake.get_chat_member.assert_awaited_once_with(NEWS_CHANNEL, fake.id)
+
+
+def test_a_forwarded_post_from_a_relayed_chat_is_still_reposted(manager):
+    manager.state["group"], manager.state["group_title"] = GROUP, "Rates"
+    manager.add_forward_source(NEWS_CHANNEL, "News", "channel")
+    fake = _bot()
+    update = _private_text("hello", forward_from_chat=_chat(NEWS_CHANNEL, "channel", "News"))
+
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    fake.copy_message.assert_awaited_once()
+    assert manager.source_offer(ADMIN) is None
+
+
+def test_a_forward_from_a_user_keeps_its_ordinary_meaning(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    update = _private_text("hello", forward_origin=SimpleNamespace(type="user"))
+
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    fake.copy_message.assert_awaited_once()
+    assert manager.source_offer(ADMIN) is None
+
+
+def test_a_post_from_the_destination_group_is_never_offered(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    update = _private_text("group news",
+                           forward_origin=SimpleNamespace(chat=_chat(GROUP, "supergroup", "Rates")))
+
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    fake.copy_message.assert_awaited_once()
+    assert manager.source_offer(ADMIN) is None
+
+
+def test_a_forwarded_photo_can_name_the_channel_too(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    update = _private_text(None, photo=[SimpleNamespace(file_id="AgACAg")],
+                           forward_origin=SimpleNamespace(sender_chat=_chat(NEWS_CHANNEL, "channel", "News")))
+
+    asyncio.run(manager.on_photo(update, SimpleNamespace(bot=fake)))
+
+    fake.copy_message.assert_not_awaited()
+    assert manager.source_offer(ADMIN)["chat_id"] == NEWS_CHANNEL
+
+
+def test_the_menu_and_the_help_explain_the_link_route(manager):
+    keyboard = manager.forward_sources_kb()
+    data = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert "fwd_src_link_help" in data
+    assert "t.me/name" in manager.forward_sources_text()
+
+    query = _callback(manager, "fwd_src_link_help")
+
+    assert query.answer.await_args.kwargs["show_alert"] is True
+    assert "t.me/name" in query.answer.await_args.args[0]
+
+
+def test_forwardfrom_in_the_private_chat_mentions_the_link_route(manager):
+    update = _private_text(None)
+
+    asyncio.run(manager.forwardfrom(update, SimpleNamespace(bot=_bot())))
+
+    assert "t.me/name" in update.message.reply_html.await_args.args[0]
+
+
+def test_the_offer_can_post_the_message_instead(manager):
+    """Asking about a forwarded post must not swallow it — 📤 posts it anyway."""
+    manager.state["group"], manager.state["group_title"] = GROUP, "Rates"
+    fake = _bot()
+    update = _private_text("hello", message_id=61,
+                           forward_origin=SimpleNamespace(chat=_chat(NEWS_CHANNEL, "channel", "News")))
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    query = _callback(manager, "fwd_src_offer_post", fake)
+
+    fake.copy_message.assert_awaited_once_with(chat_id=GROUP, from_chat_id=ADMIN, message_id=61)
+    assert manager.forward_sources() == {}                 # nothing was selected
+    assert manager.source_offer(ADMIN) is None
+    assert "without adding" in query.edit_message_text.await_args.args[0]
+    # the ordinary 📤 answer, Undo button included, is written under the offer
+    assert "Sent to" in query.message.reply_html.await_args.args[0]
+
+
+def test_a_link_offer_can_be_posted_instead_too(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    asyncio.run(manager.on_text(_private_text("https://t.me/newsroom", message_id=62),
+                                SimpleNamespace(bot=fake)))
+
+    _callback(manager, "fwd_src_offer_post", fake)
+
+    fake.copy_message.assert_awaited_once_with(chat_id=GROUP, from_chat_id=ADMIN, message_id=62)
+
+
+def test_posting_instead_needs_a_live_offer(manager):
+    manager.state["group"] = GROUP
+
+    query = _callback(manager, "fwd_src_offer_post")
+
+    assert query.answer.await_args.kwargs["show_alert"] is True
+    assert "expired" in query.answer.await_args.args[0]
+    query.edit_message_text.assert_not_awaited()
+
+
+def test_posting_instead_says_so_when_nothing_can_be_posted(manager):
+    manager.state["group"] = GROUP
+    fake = _bot()
+    asyncio.run(manager.on_text(_private_text("hello", message_id=63,
+                                forward_origin=SimpleNamespace(chat=_chat(NEWS_CHANNEL, "channel", "News"))),
+                                SimpleNamespace(bot=fake)))
+    manager.state["settings"]["forward_target"] = "off"      # turned off in between
+
+    query = _callback(manager, "fwd_src_offer_post", fake)
+
+    fake.copy_message.assert_not_awaited()
+    assert "Nothing was posted" in query.edit_message_text.await_args.args[0]
+
+
+def test_the_offer_has_no_post_button_when_auto_forward_is_off(manager):
+    manager.state["group"] = GROUP
+    manager.state["settings"]["forward_target"] = "off"
+
+    update = _private_text("https://t.me/newsroom")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=_bot())))
+
+    buttons = update.message.reply_html.await_args.kwargs["reply_markup"]
+    assert [b.callback_data for row in buttons.inline_keyboard for b in row] == \
+        ["fwd_src_offer_add", "fwd_src_offer_no"]
+
+
+def test_nothing_means_neither_added_nor_posted(manager):
+    manager.state["group"] = GROUP
+    update = _private_text("https://t.me/newsroom")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=_bot())))
+
+    query = _callback(manager, "fwd_src_offer_no")
+
+    assert "Nothing was added and the message was not posted" in \
+        query.edit_message_text.await_args.args[0]
