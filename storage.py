@@ -24,10 +24,11 @@ that went *away* looks exactly like an empty one, so every store answers
 :func:`probe_store` — the check the setup page uses to show that a configured
 database is genuinely unreachable instead of silently forgetting the group.
 
-This module is also the single source of the "connect a database" link the bot
-panel, the setup page and the status page show when no shared database is
-connected (:func:`database_link`) — the destination is deployment specific, so
-it is resolved in one place instead of being spelled out in three UIs.
+Custom Redis credentials entered through Telegram take precedence over the
+deployment-managed pair while remaining separate, so the bot can still recover
+its configuration from the bootstrap store. :func:`database_link` is retained
+for the legacy ``connect_database`` field in JSON responses; neither the Web UI
+nor the Telegram database panel exposes that external link.
 """
 
 from __future__ import annotations
@@ -55,11 +56,15 @@ REDIS_ENV_PAIRS = (
     ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
     ("REDIS_REST_URL", "REDIS_REST_TOKEN"),
 )
+# Credentials entered privately through Telegram are kept in runtime_config,
+# separate from deployment-managed variables so an existing Vercel/VPS pair is
+# never overwritten. They take priority for the bot's state store.
+CUSTOM_REDIS_ENV_PAIR = ("P2P_CUSTOM_KV_REST_API_URL", "P2P_CUSTOM_KV_REST_API_TOKEN")
 
-# Where the owner connects a database: Vercel's Storage page, which is where
-# "Connect to this project" writes KV_REST_API_URL + KV_REST_API_TOKEN into the
-# deployment environment.  P2P_DATABASE_LINK overrides it for a team- or
-# project-specific storage page, an Upstash console, or a self-hosted Redis.
+# Legacy destination for JSON clients that still consume connect_database.
+# Initial Vercel storage is configured through the dashboard/environment, while
+# Telegram admins manage custom Redis REST credentials in a private chat.
+# P2P_DATABASE_LINK overrides the default for older script integrations.
 DEFAULT_DATABASE_LINK = "https://vercel.com/dashboard/stores"
 DATABASE_LINK_ENV = "P2P_DATABASE_LINK"
 
@@ -82,6 +87,11 @@ def state_backend() -> str:
     callers such as the setup page can inspect the preference without producing
     a warning on every request.
     """
+    # Choosing a custom database in Telegram is an explicit selection. It takes
+    # precedence over an older ``file`` preference, while removing the custom
+    # pair returns the bot to the deployment's normal backend choice.
+    if custom_redis_config():
+        return "redis"
     raw = os.getenv("P2P_STATE_BACKEND")
     if raw is None or not raw.strip():
         raw = os.getenv("P2P_STORAGE_BACKEND", "")
@@ -93,28 +103,49 @@ def configured_backend_value() -> str:
     return (os.getenv("P2P_STATE_BACKEND") or os.getenv("P2P_STORAGE_BACKEND") or "").strip()
 
 
-def redis_config() -> tuple[str, str] | None:
-    """The first complete ``(url, token)`` pair in the environment, if any.
+def _redis_pair(pair: tuple[str, str]) -> tuple[str, str] | None:
+    """Read one complete REST credential pair from the process environment."""
+    url_var, token_var = pair
+    url = (os.getenv(url_var) or "").strip().rstrip("/")
+    token = (os.getenv(token_var) or "").strip()
+    return (url, token) if url and token else None
 
-    Public because ``runtime_config.py`` stores the settings the setup page and
-    ``setup_cli.py`` collected in the same Redis, under a key of its own.
+
+def custom_redis_config() -> tuple[str, str] | None:
+    """A custom Redis REST pair selected in Telegram, if one is configured."""
+    return _redis_pair(CUSTOM_REDIS_ENV_PAIR)
+
+
+def environment_redis_config() -> tuple[str, str] | None:
+    """The first complete deployment-managed REST pair, if any.
+
+    This deliberately ignores Telegram's custom pair. ``runtime_config`` uses
+    this bootstrap store to retrieve the custom pair again on cold starts; if
+    configuration storage followed the currently selected state database, a
+    switch would make its own credentials undiscoverable on the next request.
     """
-    for url_var, token_var in REDIS_ENV_PAIRS:
-        url = (os.getenv(url_var) or "").strip().rstrip("/")
-        token = (os.getenv(token_var) or "").strip()
-        if url and token:
-            return url, token
+    for pair in REDIS_ENV_PAIRS:
+        credentials = _redis_pair(pair)
+        if credentials:
+            return credentials
     return None
 
 
-def database_link() -> str:
-    """Where to connect a shared database (Vercel's Storage page by default).
+def redis_config() -> tuple[str, str] | None:
+    """The REST pair the bot should use: Telegram's custom pair, then env pairs.
 
-    One link, used by every surface that tells the owner how to make the bot
-    remember things: the panel in Telegram, the first-start page and the status
-    page.  ``P2P_DATABASE_LINK`` points it at your own storage page, an Upstash
-    console or a self-hosted Redis; a value that is not an http(s) URL is
-    ignored, so a typo cannot turn a button into a broken link.
+    The custom pair is kept under separate names and wins without changing any
+    deployment-managed environment variables.
+    """
+    return custom_redis_config() or environment_redis_config()
+
+
+def database_link() -> str:
+    """Legacy destination returned to JSON clients as ``connect_database``.
+
+    The Web UI and Telegram database panel do not show an external connection
+    link. ``P2P_DATABASE_LINK`` remains supported for scripts that consume the
+    legacy field; values that are not HTTP(S) URLs are ignored.
     """
     explicit = (os.getenv(DATABASE_LINK_ENV) or "").strip()
     if explicit.startswith(("http://", "https://")) and len(explicit) > len("https://"):

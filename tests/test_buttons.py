@@ -259,33 +259,32 @@ def test_post_sends_profile_buttons(bot, merchant, prices, monkeypatch):
     assert [b.url for b in _buttons(keyboard)] == [merchant.profile_url] * 2
 
 
-# ── the "connect database" link ────────────────────────────────────────────
-def test_panel_links_to_the_database_page_when_no_shared_store(bot, monkeypatch):
-    """Nothing remembers the group without a database — so say how to connect one."""
+# ── database management is in Telegram, not a web link ─────────────────────
+def test_panel_opens_database_management_when_no_shared_store(bot, monkeypatch):
+    """The panel routes admins to the custom database flow inside Telegram."""
     monkeypatch.setattr(bot, "db_is_persistent", lambda: False)
-    monkeypatch.setenv("P2P_DATABASE_LINK", "https://vercel.com/dashboard/stores")
 
-    connect = [b for b in _buttons(bot.panel()) if b.text.startswith("🔌")]
+    connect = [b for b in _buttons(bot.panel()) if b.callback_data == "database"]
 
     assert len(connect) == 1
-    assert connect[0].url == "https://vercel.com/dashboard/stores"
-    assert connect[0].callback_data is None                  # a plain link, one tap
+    assert connect[0].text == "🗄 Manage database"
+    assert connect[0].url is None
     assert "NOT connected" in bot.panel_text()
 
 
-def test_panel_has_no_connect_button_once_a_database_is_connected(bot, monkeypatch):
-    """A connected store needs no call to action; the settings screen still explains it."""
+def test_panel_hides_database_setup_button_once_a_store_is_connected(bot, monkeypatch):
+    """A connected store still appears in settings but not as a warning in the panel."""
     monkeypatch.setattr(bot, "db_is_persistent", lambda: True)
 
     buttons = _buttons(bot.panel())
 
-    assert not any("Connect database" in b.text for b in buttons)
+    assert not any(b.callback_data == "database" for b in buttons)
     assert not any(b.url and "vercel.com" in b.url for b in buttons)
     assert "connected ✅" in bot.panel_text()
     assert "database" in [b.callback_data for b in _buttons(bot.settings_kb())]
 
 
-def test_database_screen_shows_the_store_and_the_link(bot, monkeypatch):
+def test_database_screen_offers_custom_database_management(bot, monkeypatch):
     monkeypatch.setattr(bot, "db_is_persistent", lambda: False)
     monkeypatch.setenv("P2P_DATABASE_LINK", "https://console.upstash.com/redis/1")
 
@@ -293,20 +292,20 @@ def test_database_screen_shows_the_store_and_the_link(bot, monkeypatch):
     buttons = _buttons(bot.database_kb())
 
     assert "NOT connected" in text
-    assert "console.upstash.com/redis/1" in text
-    assert "KV_REST_API_URL" in text and "python setup_cli.py" in text   # the self-hosted steps
-    assert buttons[0].url == "https://console.upstash.com/redis/1"
-    assert [b.callback_data for b in buttons] == [None, "db_check", "panel"]
+    assert "Set custom database" in text
+    assert "custom Redis-compatible REST database" in text
+    assert "console.upstash.com/redis/1" not in text
+    assert [b.callback_data for b in buttons] == ["db_custom", "db_check", "panel"]
 
 
-def test_database_screen_gives_the_vercel_steps_on_vercel(bot, monkeypatch):
+def test_database_screen_gives_first_start_vercel_steps(bot, monkeypatch):
     monkeypatch.setattr(bot, "db_is_persistent", lambda: False)
     monkeypatch.setenv("VERCEL", "1")
 
     text = bot.database_text()
 
-    assert "Storage" in text and "Connect to this project" in text
-    assert "Redeploy" in text
+    assert "Vercel" in text and "Storage or environment settings" in text
+    assert "Set custom database" in text
 
 
 def test_settings_offers_the_database_screen(bot, monkeypatch):
@@ -360,7 +359,7 @@ def test_database_command_is_admin_only_and_sends_the_screen(bot, monkeypatch):
                             message=message)
     asyncio.run(bot.database_cmd(admin, SimpleNamespace()))
     message.reply_html.assert_awaited()
-    assert "Connect database" in str(message.reply_html.await_args.kwargs["reply_markup"].inline_keyboard[0][0].text)
+    assert "Set / change custom database" in str(message.reply_html.await_args.kwargs["reply_markup"].inline_keyboard[0][0].text)
 
 
 def test_database_screen_reports_a_store_that_stopped_answering(bot, monkeypatch):
@@ -372,7 +371,7 @@ def test_database_screen_reports_a_store_that_stopped_answering(bot, monkeypatch
 
     assert "NOT answering" in text
     assert "ConnectError: refused" in text
-    assert "forgets the group" in text
+    assert "may forget state" in text
     assert "connected ✅" not in text
 
 

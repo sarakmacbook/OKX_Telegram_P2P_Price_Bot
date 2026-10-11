@@ -7,17 +7,21 @@
     python setup_cli.py --clear         forget the stored settings
     python setup_cli.py --token 123:ABC --admins 123456789 --yes     no prompts
     python setup_cli.py --state-backend file                           use data.json
-    python setup_cli.py --state-backend redis --kv-url URL --kv-token TOKEN
+    python setup_cli.py --state-backend redis --kv-url URL --kv-token TOKEN --vercel-env
 
-Every answer is optional: **press Enter on any question to skip it** and add it
-later in the browser, on the first-start page (``/api/setup``) — the wizard
-prints that address when it is done, and ``--skip`` skips the whole thing.
+Bot-setting questions are optional: **press Enter on a question to skip it**
+and finish the Telegram credentials and optional bot settings in the first-start
+browser form (``/api/setup``). Database configuration is not available in that
+form: the terminal can select the backend / set the deployment KV pair, and a
+custom Redis REST store can be managed later in Telegram with ``/database``.
+The wizard prints the setup-page address when it is done; ``--skip`` skips the
+whole wizard.
 
-Both paths write to the same store (``runtime_config``): the connected
-KV/Redis under the key ``p2p-price-bot:config``, or ``runtime_config.json`` next
-to the bot's data file.  That is what makes a Vercel deployment work without a
-redeploy, and what lets you start in the terminal and finish in the browser (or
-the other way round) without losing anything.
+The browser and terminal paths write bot settings to the same ``runtime_config``
+store: the connected KV/Redis under ``p2p-price-bot:config``, or
+``runtime_config.json`` next to the bot's data file. The terminal may also set
+backend/REST settings for its deployment. On Vercel, connect an initial persistent
+store in Vercel Storage before Telegram can manage a custom database.
 
 ``--vercel-env`` additionally writes the values into the deployment's environment
 variables through the Vercel CLI — the only way to set ``CRON_SECRET``, which
@@ -70,13 +74,16 @@ def web_ui_url() -> str:
 
 
 def skip_message(reason: str = "") -> None:
-    """What the user sees when the terminal part is skipped — the browser is next."""
+    """What the user sees when the terminal part is skipped."""
     print("\n🌐 Skipped" + (f" — {reason}" if reason else "") + ".")
-    print("   Finish the setup in the browser instead; the page stores what you enter,")
-    print("   no redeploy needed:\n")
+    print("   Finish Telegram credentials and optional bot settings in the browser;")
+    print("   the form does not configure database credentials:\n")
     print(f"     {web_ui_url()}\n")
-    print("   …or come back to the terminal at any time:  python setup_cli.py")
-    print("   See what is already stored with:            python setup_cli.py --show\n")
+    print("   On Vercel, connect the initial KV/Redis store through Storage or the")
+    print("   deployment environment. After the bot starts, use /database in Telegram")
+    print("   for a custom Redis REST store. The terminal can configure backend/pair too;")
+    print("   use --vercel-env to persist those values to the linked Vercel project.\n")
+    print("   See stored settings with: python setup_cli.py --show\n")
 
 
 class Prompts:
@@ -120,7 +127,7 @@ class Prompts:
         while True:
             value = self._read(f"{label} ({variable}){shown}: ", secret=secret)
             if not value:
-                return ""                      # skipped — the web UI can do it later
+                return ""                      # bot settings can be finished in the browser
             if check is None:
                 return value
             clean, error = check(value)
@@ -202,8 +209,8 @@ def show() -> int:
         value = from_env or stored.get(name, "")
         where = "environment" if from_env and name not in runtime_config.injected() else (
             "stored" if stored.get(name) else "—")
-        # Only the token is a secret: the rest are the owner's own settings, and
-        # this is their terminal.
+        # Tokens are masked; the rest are non-secret settings shown in the
+        # owner's terminal.
         shown = runtime_config.mask(value) if name in runtime_config.SECRETS else value
         print(f"  {name:<12} {(shown or 'not set'):<20} {where}")
     for name in ENV_ONLY:
@@ -221,10 +228,12 @@ def wizard(args: argparse.Namespace) -> int:
     info = runtime_config.describe(ROOT)
 
     print("\n🤖 P2P Price Bot — required settings\n" + "-" * 46)
-    print("  Two ways to finish, both write to the same place:")
+    print("  Bot settings can be entered here or in the browser form:")
     print("    • here in the terminal (this wizard)")
     print(f"    • later in the browser:  {web_ui_url()}")
-    print("  Press Enter on any question to skip it and add it in the browser later.\n")
+    print("  Press Enter to skip bot settings and finish them in the browser later.")
+    print("  Database credentials are not accepted by the browser; use this wizard or")
+    print("  Vercel Storage for the bootstrap store, then Telegram /database for a custom store.\n")
     print(f"  settings will be stored in: {info['store']}"
           f"{' (temporary — no KV/Redis connected)' if not info['persistent'] else ''}")
 
@@ -257,9 +266,8 @@ def wizard(args: argparse.Namespace) -> int:
                                           current=env("INTERVAL", default="60"),
                                           check=interval_check)
 
-    # Database selection is intentionally a flag rather than an extra prompt,
-    # preserving the quick Enter-to-skip wizard flow.  The setup page exposes
-    # the same choice as a select control.
+    # The terminal can set the deployment backend explicitly. The browser form
+    # has no database selector or credential fields.
     if args.state_backend:
         answers["P2P_STATE_BACKEND"] = args.state_backend
 
@@ -329,10 +337,17 @@ def wizard(args: argparse.Namespace) -> int:
         print("   Redeploy for the new variables to apply (Deployments → ⋯ → Redeploy).")
 
     still_missing = [check for check in ("BOT_TOKEN", "ADMIN_IDS") if not env(check)]
-    if still_missing or not storage.redis_config():
-        print(f"\n🌐 Finish the rest in the browser: {web_ui_url()}")
-        if still_missing:
-            print(f"   still missing: {', '.join(still_missing)}")
+    if still_missing:
+        print(f"\n🌐 Finish the Telegram settings in the browser: {web_ui_url()}")
+        print(f"   still missing: {', '.join(still_missing)}")
+    elif env("VERCEL", "VERCEL_ENV", "VERCEL_URL", "VERCEL_PROJECT_PRODUCTION_URL") \
+            and not storage.redis_config():
+        print("\n⚠️ Vercel needs an initial persistent KV/Redis store before the bot can start.")
+        print("   Connect it through Vercel Storage or set the deployment environment variables,")
+        print("   then redeploy. Database credentials are not accepted in the browser form.")
+    elif storage.state_backend() == "redis" and not storage.redis_config():
+        print("\n⚠️ Redis was selected, but no REST URL/token pair is available.")
+        print("   Set the pair in the deployment environment and run this wizard again.")
     else:
         print("\n✅ Nothing else is required — open the status page to register the webhook.")
     print()

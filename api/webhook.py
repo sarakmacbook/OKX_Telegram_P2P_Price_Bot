@@ -88,7 +88,7 @@ async def _status(request: Request) -> Response:
         "auto_posting": bool(bot_module.state.get("auto")),
         "state": state_status(),
         "webhook_secret": webhook_secret_note(),
-        # Scripts get the same "connect a database" link the page renders.
+        # Legacy hint retained for JSON clients; no link is shown in the Web UI.
         "connect_database": database_link(),
         # Where the database was detected — the environment, or Vercel's own
         # store list — and whether this deployment can already use it.
@@ -212,11 +212,12 @@ def _status_page(data: dict) -> str:
     ]
     links: list[tuple[str, str]] = []
     if not state.get("persistent"):
-        notes.append("Make the bot remember anything: Vercel dashboard → Storage → add Upstash for "
-                     "Redis → Connect to this project → Redeploy.")
-        # The one-click way there, right under the warning that says it is needed.
-        links.append(("🔌 Connect database ↗", database_link()))
-    # Change the token, the admins, the pair or the database without a redeploy.
+        notes.append("Make the bot remember anything: connect a KV/Redis store through Vercel "
+                     "Storage or the deployment environment, then redeploy. The Web UI does not "
+                     "accept database credentials; use /database in Telegram to switch a custom "
+                     "REST database after the bot is running.")
+    # Change non-database bot settings without a redeploy; database changes are
+    # managed in the private Telegram /database menu.
     links.append(("⚙️ Reconfigure setup", "/api/setup"))
     links.append(("↻ Check the webhook again", "/api/webhook?register=1"))
     if "prices" in data:
