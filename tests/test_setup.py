@@ -671,7 +671,8 @@ def test_setup_endpoint_rejects_database_settings_from_the_web_ui(unconfigured):
     assert "kv-token" not in payload.decode()
 
 
-def test_vercel_save_does_not_claim_ready_without_redis(unconfigured, monkeypatch):
+def test_vercel_save_starts_without_redis_and_names_the_consequence(unconfigured, monkeypatch):
+    """A token + admin id are enough: the database is connected later in Telegram."""
     monkeypatch.setenv("VERCEL", "1")
     status, _, payload = call(
         method="POST",
@@ -679,11 +680,13 @@ def test_vercel_save_does_not_claim_ready_without_redis(unconfigured, monkeypatc
         headers={"content-type": "application/x-www-form-urlencoded", "accept": "text/html"})
     text = payload.decode()
     assert status == 200
-    assert "setup is not complete" in text
-    assert "the bot can start now" not in text
-    assert 'class="banner info"' in text
-    assert "Before the bot can start on Vercel, connect a KV / Redis store" in text
-    assert "This web UI does not accept database credentials" in text
+    assert "the bot can start now" in text
+    assert "setup is not complete" not in text
+    # …but the page may not look finished: what cannot be remembered is spelled out,
+    # together with the two ways to fix it (Telegram /database, or the environment).
+    assert "No database yet" in text
+    assert "/database" in text
+    assert "KV_REST_API_URL + KV_REST_API_TOKEN" in text
     assert 'name="KV_REST_API_URL"' not in text
 
 
@@ -738,6 +741,11 @@ def _redis_dead(monkeypatch):
 
 
 def test_a_database_that_stopped_answering_is_reported_not_hidden(monkeypatch):
+    """Still reported as broken — but no longer a reason to refuse to start.
+
+    A deployment whose store went away can now be repaired from Telegram, so the
+    bot answers and the panel says the store is not responding.
+    """
     monkeypatch.setenv("VERCEL", "1")
     _kv_pair(monkeypatch)
     _redis_dead(monkeypatch)
@@ -745,11 +753,12 @@ def test_a_database_that_stopped_answering_is_reported_not_hidden(monkeypatch):
     import serverless
     status = serverless.setup_status()
 
-    assert status["ready"] is False, "the bot cannot work without its state"
-    assert status["broken"] == ["state_store"]
+    assert status["ready"] is True, "the bot runs so it can be repaired in Telegram"
+    assert status["broken"] == ["state_store"], "the outage is still not hidden"
     check = {item["name"]: item for item in status["checks"]}["state_store"]
     assert check["status"] == "broken" and "does not answer" in check["detail"]
-    assert "database" in status["message"]
+    assert check["required"] is False
+    assert "/database" in check["detail"]
 
 
 def test_a_dead_database_is_reported_but_not_editable_in_the_webui(monkeypatch):

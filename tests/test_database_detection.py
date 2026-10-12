@@ -390,6 +390,7 @@ def test_a_detected_database_that_stopped_answering_is_read_only_in_the_webui(
 
 def test_without_a_database_the_webui_points_to_telegram_for_custom_configuration(
         on_vercel, monkeypatch):
+    """No database is fine — the page says so and hands over the next step."""
     fake_vercel(monkeypatch, stores=[])
 
     status, text = get_setup_page()
@@ -397,23 +398,30 @@ def test_without_a_database_the_webui_points_to_telegram_for_custom_configuratio
     assert status == 200
     assert "How to insert the database" not in text
     assert "Connect database" not in text
-    assert "Before the bot can start on Vercel, connect a KV / Redis store" in text
+    assert "the bot starts without a database" in text
+    assert "cannot remember" in text
     assert "/database" in text
 
 
-def test_a_connected_store_still_blocks_the_deployment_with_an_explanation(
+def test_a_connected_store_is_explained_without_blocking_startup(
         on_vercel, monkeypatch):
-    """Not ready — but the reason is a missing redeploy, not a missing database."""
+    """Detected but unwired: worth a redeploy, not worth refusing to start.
+
+    The deployment can run and connect a database later in Telegram, so the
+    checklist recommends the redeploy instead of gating the bot on it — while
+    still naming the missing variables.
+    """
     fake_vercel(monkeypatch, stores=[{"name": "p2p-kv", "type": "redis"}])
     status = serverless.setup_status()
 
-    assert status["ready"] is False
+    assert status["ready"] is True, "a database is not a startup requirement"
     assert status["database"]["found"] is True and status["database"]["wired"] is False
-    assert "already has a database" in status["message"]
-    assert "No new database is needed" in status["message"]
     check = {item["name"]: item for item in status["checks"]}["state_store"]
+    assert check["required"] is False and check["ok"] is False
+    assert "No new database is needed" in check["detail"]
     assert check["detected"].startswith("Vercel → Storage")
     assert "Connect to this project" in check["detail"]
+    assert "/database" in check["detail"]
 
     steps = serverless.setup_steps(status)
 
