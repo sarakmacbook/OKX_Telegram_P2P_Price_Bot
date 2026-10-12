@@ -190,6 +190,12 @@ curl -s https://<your-app>.vercel.app/api/webhook | head -40   # JSON status (al
 curl -s "https://<your-app>.vercel.app/api/webhook?register=1"  # force a re-register
 ```
 
+The page also knocks on the deployment's own public URL and tells you whether
+Telegram can actually get in: a webhook can be *registered* and still be
+unreachable (Deployment Protection answering `401`, a domain that answers `404`,
+DNS that answers nothing), and that is the case where the bot goes silent while
+every screen still looks healthy. See §9.
+
 ## 4. Use it from Telegram
 
 1. Open your bot → `/start` → tap **👥 Set group** and pick your group.
@@ -241,7 +247,14 @@ So on the free plan the bot posts **once a day** by default. Two ways around it:
   ```
 
 Every run posts only when a price (or the ad behind it) actually changed, so a
-1-minute cron does not spam the group. `/api/tick` is protected by
+1-minute cron does not spam the group. Each run is remembered in the state store
+(`tick`), and that is what the status page row **Last cron run** and the
+`🕒 Cron:` line in the Telegram panel show — `never`, or how long ago the last
+run was with how many runs so far. A cron that never ran, or stopped more than a
+day ago, is reported there as a warning instead of leaving you with a bot that
+silently posts nothing; a failure inside one step (the webhook check, the post,
+the cleanup) no longer cancels the other steps, because on the free plan this may
+be the only run in 24 hours. `/api/tick` is protected by
 `CRON_SECRET`: Vercel Cron sends `Authorization: Bearer <CRON_SECRET>`
 automatically; other callers must pass the same value in that header or as
 `?secret=<CRON_SECRET>`. If `CRON_SECRET` is unset the endpoint is open (and says so
@@ -267,6 +280,7 @@ in its answer) — anyone who knows the URL could then trigger a post, so set it
 | `WEBHOOK_SECRET` | – | secret Telegram must send with every update; derived from `BOT_TOKEN` when empty |
 | `CRON_SECRET` | – (recommended) | locks `/api/tick` down |
 | `WEBHOOK_DROP_PENDING` | – | `0` (default) preserves queued updates, including /start; set `1` only to deliberately discard them |
+| `P2P_WEBHOOK_PROBE` | – | `1`/`0` to force the "can Telegram reach this deployment?" knock on or off. On by default **on Vercel only**; off elsewhere, so a local `uvicorn` never calls out. Set `0` if you do not want the deployment to request its own URL. |
 | `ASSET`, `FIAT`, `INTERVAL` | – | pair + description only (on Vercel the cron sets the real interval) |
 | `AD_LINK_TEMPLATES` | – | per-exchange deep-link overrides (JSON), same as the polling installs |
 
@@ -283,8 +297,9 @@ store is selected and persisted through Telegram's private `/database` menu.
 |---|---|---|
 | `/` | `GET` | redirects to `/api/webhook`, so the deployment URL itself opens the status page |
 | `/api/webhook` | `POST` | Telegram updates — verified with `X-Telegram-Bot-Api-Secret-Token` (or `?secret=…`, handy for manual tests); everything else is rejected with 403 |
-| `/api/webhook` | `GET` | first-start setup UI when Telegram settings or the required Vercel KV store are missing; otherwise the health page (JSON for scripts, HTML in a browser) that registers the webhook; `?register=1` forces it, `?register=0` only reports. The page reports database health but has no database credential controls. |
+| `/api/webhook` | `GET` | first-start setup UI when Telegram settings or the required Vercel KV store are missing; otherwise the health page (JSON for scripts, HTML in a browser) that registers the webhook; `?register=1` forces it, `?register=0` only reports. The page reports database health but has no database credential controls. It also shows **Reachable** (the result of knocking on the public URL — `yes`, `no` with the reason, or `not checked`) and **Last cron run**, and prints the fix for whatever it finds. |
 | `/api/webhook?check=1` | `GET` | status page + a live price fetch for every merchant — open this when prices are empty to see the per-merchant error |
+| `/api/health` | `GET` | static marker (`{"ok": true, "app": "p2p-price-bot"}`) proving a request reached *this* deployment. It reads no state and calls nothing, so it is the right target for an external uptime check (and the URL the status page knocks on) |
 | `/api/setup` | `GET` | readiness checklist plus a form for Telegram credentials and optional bot settings. Database health is read-only here; database configuration is not editable in the browser. |
 | `/api/setup` | `POST` | stores bot settings (JSON or form-encoded) and applies them at once; rejects database credential/backend fields, returns 403 when the deployment is healthy and no authorization is sent, or 400 with a readable reason when a value is wrong or Telegram rejects the token |
 | `/api/setup` | `POST` `action=send-link` | the 🔧 **Reconfigure** button: sends the admins a one-time link in Telegram that reopens the bot-settings form (see §6) |
@@ -323,6 +338,17 @@ store is selected and persisted through Telegram's private `/database` menu.
   `BOT_TOKEN` therefore shows up as a 500 with a hint instead of a silent bot.
 * **No JobQueue**: `/api/tick` calls the very same functions the polling
   scheduler uses (`auto_post_task`, `cleanup_task`), so behaviour is identical.
+  Its steps are isolated from each other: if the webhook check fails the price
+  post still happens, and anything that failed is listed in the answer's
+  `errors` (and in the runtime logs) instead of being swallowed.
+* **A registered webhook is not a working one**: Telegram's POST can be refused
+  *before* it reaches the function (Deployment Protection, a missing DNS record,
+  a domain that was never connected), which is exactly how the bot goes silent
+  while every page looks fine. `/api/webhook` and `/api/tick` therefore knock on
+  the deployment's own public URL (`GET <PUBLIC_URL>/api/health`, cached for
+  5 minutes, 1 minute after a failure) and the status page turns the answer into
+  a fix. On Vercel the knock is on by default; outside Vercel it runs only with
+  `P2P_WEBHOOK_PROBE=1`, so a local `uvicorn` never calls out.
 * **State freshness**: before every update/tick the state is re-read from the KV
   store, because Vercel may run several instances of the same deployment at the
   same time.
@@ -357,7 +383,13 @@ store is selected and persisted through Telegram's private `/database` menu.
 | Deployment URL shows a Vercel 404 | only `/` (redirects to the status page) and `/api/*` exist — check the URL |
 | Setup UI says the state store is missing (or an older deployment shows `State store: file — NOT persistent ❌`) | add/connect the Upstash or Vercel KV integration, confirm `KV_REST_API_URL` + `KV_REST_API_TOKEN`, then redeploy |
 | `webhook not registered: Cannot tell where this deployment is reachable` | neither `VERCEL_PROJECT_PRODUCTION_URL`/`VERCEL_URL` nor `PUBLIC_URL` is set (e.g. running the file outside Vercel) → set `PUBLIC_URL` |
-| Bot answers nothing in Telegram | open `/api/webhook` — it re-registers and shows the last webhook error from Telegram; make sure the group was set and **Auto** is ON |
+| Bot answers nothing in Telegram | open `/api/webhook` — it re-registers, shows the last webhook error from Telegram **and checks from the outside** whether the deployment can be reached at all. Read the **Reachable** row and the ⚠️ warning: `401`/`403` means Vercel Deployment Protection is in front of this address (see below), `404` means the domain is not connected, `could not be reached` means DNS/TLS. Then make sure the group was set and **Auto** is ON |
+| `Reachable: no — HTTP 401` / Telegram's `Wrong response from the webhook: 401` | this deployment's URL asks anonymous visitors to log in, and Telegram cannot. Vercel Authentication covers **every preview URL and the auto-generated `*-<hash>.vercel.app` production address**; the project's real production domain stays public. So: keep Deployment Protection on *Standard Protection* (not *All Deployments*), point the bot at your own production domain — `PUBLIC_URL=https://your-domain` in the environment — redeploy, then open `/api/webhook?register=1` |
+| `Reachable: no — HTTP 404` | the URL answers, but nothing is deployed there: the domain is not connected to this project (Vercel → project → **Settings → Domains**) or the deployment was removed. Connect the domain and set `PUBLIC_URL` to it |
+| `Reachable: no — could not be reached at all` | DNS does not resolve / TLS fails / the request times out. Fix the domain, or set `PUBLIC_URL` to the address the bot should be reachable at |
+| `Reachable: not checked` | the probe is off (`P2P_WEBHOOK_PROBE=0`), no public URL is known, or this is not a Vercel deployment. Set `PUBLIC_URL`, or `P2P_WEBHOOK_PROBE=1` to force the check |
+| `Last cron run: never` / a ⚠️ warning that it was `… ago` | the cron never ran (or stopped): on the free plan it runs once a day, so give it 24 hours, check **Vercel → your project → Cron Jobs** for failures, and/or add the external 5-minute scheduler of §5 |
+| Cron answer contains an `errors` list | each entry names one step that failed (webhook check, price post, cleanup) — the other steps still ran. The same lines are in the runtime logs |
 | Prices only once a day | free Hobby plan → Pro cron or an external scheduler calling `/api/tick` (see §5) |
 | Telegram keeps retrying one update | check the runtime logs; anything that fails returns a 500 on purpose so Telegram retries |
 | Logs | Vercel dashboard → your project → **Logs**, or `npx vercel logs <deployment-url>` |

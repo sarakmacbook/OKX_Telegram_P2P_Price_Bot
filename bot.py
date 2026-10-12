@@ -1839,6 +1839,22 @@ merchants = lambda: [Merchant(**m) for m in state["merchants"].values()]
 is_admin = lambda u: u.effective_user and u.effective_user.id in ADMINS
 fmt = lambda p: f"{p:.4f}".rstrip("0").rstrip(".") if p is not None else "—"
 
+def short_age(seconds: int) -> str:
+    """``3700`` → ``"1h 1m"`` — a compact age for the panel's cron line.
+
+    ``serverless.py`` carries the same helper for the status page: it is
+    imported in webhook/cron requests only, where importing bot.py eagerly would
+    defeat the setup preflight.
+    """
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
+
 def fmt_amount(a):
     if a is None:
         return None
@@ -2654,11 +2670,29 @@ def panel_text():
     last_msg = f"Last msg: {state.get('last_msg_id')}" if state.get('last_msg_id') else "No group msg yet"
     pending = len([r for r in pending_captchas().values() if not r.get("locked")])
     locked = len([r for r in pending_captchas().values() if r.get("locked")])
+    # 🕒 On Vercel a cron — not the bot's own JobQueue — posts the prices, and on
+    # the free plan it runs once a day. Saying when it last ran is what keeps a
+    # quiet group from looking like a dead bot.
+    cron_line = ""
+    if on_vercel():
+        tick = state.get("tick") if isinstance(state.get("tick"), dict) else {}
+        at = int(tick.get("at") or 0)
+        if at:
+            age = max(0, int(time.time()) - at)
+            cron_line = (f"🕒 Cron: last run {short_age(age)} ago · "
+                         f"{int(tick.get('count') or 0)} runs"
+                         + (" — the free plan runs it once a day (VERCEL.md §5: "
+                            "a 5-minute cadence is possible)" if age > 5400 else ""))
+        else:
+            cron_line = ("🕒 Cron: not run yet — it is what posts the prices; the free plan "
+                         "runs it once a day (VERCEL.md §5 shows a 5-minute option)")
+        cron_line += "\n"
     return (
         f"🤖 <b>P2P Price Bot</b>\n"
         f"Group: <code>{g}</code>\n"
         f"Channel: <code>{channel_label() or 'not set — tap 📢 Set channel'}</code>\n"
         f"Merchants: {len(state['merchants'])} · Pair: {ASSET}/{FIAT} · every {INTERVAL}s\n"
+        f"{cron_line}"
         f"🗄 Database: <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>"
         f"{'' if db_is_persistent() else ' — use /database to configure a custom store'}\n"
         f"💧 Liquidity: <b>{liq}</b> · 🔘 Buttons: <b>{btns}</b> · 🗑 AutoDel: <b>{autodel}</b>\n"
@@ -5512,7 +5546,33 @@ async def banner_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await c.bot.send_message(u.effective_user.id, note, reply_markup=banner_kb())
 
 async def error_handler(update, context):
-    log.warning("Update %s caused error %s", update, context.error)
+    """Report a crashed handler — with its traceback, and not only to the log.
+
+    Polling installs show the traceback on the terminal. A Vercel deployment has
+    no terminal: the webhook still answers Telegram ``200``, so the update is
+    never retried and the owner sees a bot that simply ignores them. Logging the
+    exception (not just its message) puts it in the deployment's Logs, and one
+    short reply in the admin's private chat turns "the bot is dead" into
+    something they can act on. Groups stay clean, strangers get no error spam.
+    """
+    error = getattr(context, "error", None)
+    log.error("Update %s caused error %s", update, error, exc_info=error)
+    chat = getattr(update, "effective_chat", None) if update is not None else None
+    if chat is None or getattr(chat, "type", "") != "private":
+        return
+    try:
+        if not is_admin(update):
+            return
+    except Exception:                                  # unusual update without a user
+        return
+    try:
+        await context.bot.send_message(
+            chat.id,
+            "⚠️ Something went wrong while handling that — the details are in the "
+            "deployment logs (Vercel → your project → Logs, or the terminal). "
+            "Send /start to carry on.")
+    except Exception:                                  # the error reply must never raise
+        log.debug("could not report the error to %s", chat.id)
 
 # ── run ──
 PRIVATE_COMMANDS = [

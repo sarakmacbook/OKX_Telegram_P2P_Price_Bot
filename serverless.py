@@ -258,6 +258,257 @@ def matches(given: str, expected: str) -> bool:
     return bool(expected) and secrets.compare_digest(given.encode(), expected.encode())
 
 
+# ── can Telegram actually reach this deployment? ───────────────────────────
+# A *registered* webhook is not a *working* webhook, and the difference is the
+# silence nobody can explain: Telegram's POST can be refused before it ever
+# reaches the function.  Vercel Deployment Protection (Vercel Authentication,
+# on by default) gates preview deployments **and the auto-generated deployment
+# URLs** (``project-abc123-owner.vercel.app``) with a 401 login page that
+# Telegram cannot pass; a custom domain whose DNS record is missing answers 404;
+# a domain that was never added answers nothing at all.  In every one of those
+# cases the status page still says "webhook registered", Telegram retries with
+# backoff and finally gives up, and the bot simply looks dead.
+#
+# The only way to notice is to knock on the public URL from the outside, which
+# is what ``/api/health`` exists for: a static, side-effect-free answer that
+# proves the request reached *this* deployment (the marker below) or names what
+# stopped it.  Nothing here is on the update path — the probe runs when the
+# status page or the cron asks for it, the answer is cached, and it is switched
+# off unless the deployment looks like Vercel (or ``P2P_WEBHOOK_PROBE=1``
+# says so explicitly), so a local ``uvicorn`` never calls out to the internet.
+HEALTH_PATH = "/api/health"
+HEALTH_MARKER = "p2p-price-bot"
+PROBE_TTL = 300.0               # a public deployment stays public for a while …
+PROBE_FAIL_TTL = 60.0           # … a failure is re-checked sooner
+PROBE_TIMEOUT = 5.0             # room for the relay hop and one cold start
+_probe: dict[str, Any] = {"key": "", "at": 0.0, "result": {}}
+
+
+def reset_reachability_probe() -> None:
+    """Forget the cached answer (tests, and right after the webhook is registered)."""
+    _probe.update(key="", at=0.0)
+
+
+def _probe_allowed() -> bool:
+    """Whether *this* host should spend a request on its own public URL."""
+    explicit = (os.getenv("P2P_WEBHOOK_PROBE") or "").strip()
+    if explicit:
+        return truthy(explicit)
+    return _looks_like_vercel()
+
+
+async def _probe_request(url: str):
+    """Perform the knock itself (kept apart so tests can answer it offline).
+
+    Asynchronous on purpose: the probe runs inside the same event loop that
+    serves Telegram's requests, and a blocking call would stall that loop — on a
+    single Vercel instance it would even deadlock against its own URL, because
+    the wait could never be answered while the loop sits still.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=PROBE_TIMEOUT, follow_redirects=True) as client:
+        return await client.get(url, headers={"User-Agent": "p2p-price-bot/webhook-probe",
+                                             "Cache-Control": "no-cache"})
+
+
+async def _probe_once(url: str) -> dict:
+    """Knock on the health page once and classify the answer — never raises."""
+    try:
+        reply = await _probe_request(url)
+    except Exception as exc:                          # DNS, TLS, timeout, offline …
+        return {"checked": True, "reachable": False, "status": 0, "url": url,
+                "protected": False,
+                "detail": f"the deployment could not be reached at all "
+                          f"({type(exc).__name__}: {exc})",
+                "hint": "Telegram cannot deliver a single update to a URL that does not answer. "
+                        "Check the domain (Vercel → your project → Settings → Domains) and set "
+                        "PUBLIC_URL to the address the bot should be reachable at."}
+    marker = ""
+    try:
+        data = reply.json()
+        marker = str((data or {}).get("app") or "") if isinstance(data, dict) else ""
+    except Exception:                                 # pragma: no cover - non-JSON (a login page)
+        marker = ""
+    status = int(reply.status_code)
+    if status == 200 and marker == HEALTH_MARKER:
+        return {"checked": True, "reachable": True, "status": status, "url": url,
+                "protected": False, "detail": "the public URL reaches this deployment",
+                "hint": ""}
+    if status in (401, 403):
+        return {"checked": True, "reachable": False, "status": status, "url": url,
+                "protected": True,
+                "detail": f"the deployment answers HTTP {status} to anonymous requests — Vercel "
+                          "Deployment Protection (or a firewall rule) stands in front of it",
+                "hint": "Vercel Authentication gates the auto-generated *-<hash>.vercel.app "
+                        "addresses and every preview URL; Telegram cannot log in, so all updates "
+                        "are refused. Point the bot at the project's public production domain "
+                        "(Vercel → Settings → Domains) with PUBLIC_URL=https://that-domain, keep "
+                        "Deployment Protection on *Standard Protection*, then re-register at "
+                        "/api/webhook?register=1."}
+    if status == 404:
+        return {"checked": True, "reachable": False, "status": status, "url": url,
+                "protected": False,
+                "detail": "the URL answers HTTP 404 — it does not reach this deployment",
+                "hint": "The domain is not connected to this project (Vercel → Settings → Domains) "
+                        "or PUBLIC_URL names the wrong host. Telegram posts to that 404 and the bot "
+                        "never sees an update."}
+    return {"checked": True, "reachable": False, "status": status, "url": url,
+            "protected": False,
+            "detail": f"the public URL answered HTTP {status} instead of the bot's health page",
+            "hint": "Something else answers on this URL (a proxy, a firewall rule, another "
+                    "deployment). Check Vercel → your project → Settings → Domains and open the "
+                    "deployment's Logs."}
+
+
+async def webhook_reachability(base: str = "", force: bool = False) -> dict:
+    """Whether an anonymous request reaches this deployment: ``{checked, reachable, hint, …}``.
+
+    ``reachable`` is ``None`` when the check was not possible (no public URL, or
+    the probe is switched off), so a page can say "not checked" instead of
+    pretending everything is fine.  The answer is cached, because a page view or
+    a cron run is not a reason to hammer the deployment's own URL.
+    """
+    if not _probe_allowed():
+        return {"checked": False, "reachable": None, "url": "", "protected": False,
+                "detail": "the public-URL check is off on this host "
+                          "(set P2P_WEBHOOK_PROBE=1 to enable it)", "hint": ""}
+    try:
+        url = (base or public_base_url()).rstrip("/") + HEALTH_PATH
+    except ConfigError as exc:
+        return {"checked": False, "reachable": None, "url": "", "protected": False,
+                "detail": str(exc), "hint": ""}
+
+    now = time.monotonic()
+    if not force and _probe["key"] == url:
+        age = now - float(_probe["at"])
+        if age < (PROBE_TTL if _probe["result"].get("reachable") else PROBE_FAIL_TTL):
+            return {**_probe["result"], "cached": True}
+    result = await _probe_once(url)
+    _probe.update(key=url, at=now, result=result)
+    return {**result, "cached": False}
+
+
+# Telegram reports the last delivery failure to ``getWebhookInfo``.  These are
+# the messages seen in practice, each with the one thing that fixes it.
+_WEBHOOK_ERROR_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("401", "403", "unauthorized", "forbidden"),
+     "Telegram's request is refused before it reaches the bot — that is Vercel Deployment "
+     "Protection (or a firewall rule). Use the public production domain with PUBLIC_URL, keep "
+     "protection on *Standard*, then re-register at /api/webhook?register=1."),
+    (("404", "not found"),
+     "Telegram's request lands on a 404: the domain is not connected to this project, or "
+     "PUBLIC_URL names the wrong host. Fix the domain, then re-register at "
+     "/api/webhook?register=1."),
+    (("timeout", "timed out", "504", "gateway"),
+     "The function takes too long to answer Telegram (usually a cold start). Keep maxDuration as "
+     "configured in vercel.json and check the deployment's Logs."),
+    (("ssl", "certificate", "tls", "cert"),
+     "The domain's TLS certificate is not valid yet — Vercel issues it a few minutes after the "
+     "domain is added. Re-register once the domain loads over HTTPS."),
+    (("429", "too many requests", "rate limit"),
+     "Telegram is rate-limiting the webhook, usually a retry storm after an earlier failure. "
+     "Set WEBHOOK_DROP_PENDING=1 once to clear the backlog and re-register."),
+    (("500", "502", "503", "internal", "error"),
+     "The function answered an error to Telegram and the update will be retried with backoff. "
+     "The traceback is in the deployment's Logs (Vercel → your project → Logs)."),
+)
+
+
+def webhook_error_hint(message: str) -> str:
+    """One actionable sentence for Telegram's ``last_error_message`` (``""`` if unknown)."""
+    text = (message or "").lower()
+    if not text:
+        return ""
+    for needles, hint in _WEBHOOK_ERROR_HINTS:
+        if any(needle in text for needle in needles):
+            return hint
+    return ""
+
+
+# ── the cron is the deployment's heartbeat ─────────────────────────────────
+# On Vercel nothing runs between requests: the cron drives the price posts, and
+# on the free plan it runs **once a day**.  A quiet group therefore has two very
+# different explanations — "nothing changed" and "nothing is running it" — and
+# only a recorded timestamp can tell them apart.
+TICK_KEY = "tick"
+TICK_STALE_SECONDS = 25 * 3600        # daily cron + Vercel's ±59 min precision
+
+
+def short_age(seconds: int) -> str:
+    """``3700`` → ``"1h 1m"`` — short enough for a Telegram panel line."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
+
+
+def tick_status(bot_module=None) -> dict:
+    """When the cron last ran and how often: ``{at, count, age, …}`` (``at=0`` before the first)."""
+    bot_module = bot_module or get_bot()
+    record = bot_module.state.get(TICK_KEY)
+    record = record if isinstance(record, dict) else {}
+    at = int(record.get("at") or 0)
+    return {"at": at, "count": int(record.get("count") or 0),
+            "age": (max(0, int(time.time()) - at) if at else None),
+            "serverless": _looks_like_vercel()}
+
+
+def tick_note(status: dict | None = None, bot_module=None) -> str:
+    """One readable line about the cron, for the status page and the Telegram panel."""
+    status = status if isinstance(status, dict) else tick_status(bot_module)
+    if not status.get("at"):
+        return ("never — on Vercel the cron posts the prices, and on the free plan it runs once a "
+                "day (see VERCEL.md §5 for a five-minute cadence)")
+    return (f"{short_age(int(status.get('age') or 0))} ago — run "
+            f"{int(status.get('count') or 0)}, next one within a day on the free plan")
+
+
+def tick_warning(status: dict | None = None, bot_module=None) -> str:
+    """Why the group can be quiet even though everything looks configured."""
+    status = status if isinstance(status, dict) else tick_status(bot_module)
+    if not status.get("serverless"):
+        return ""                                  # a polling install has its own JobQueue
+    if not status.get("at"):
+        return ("The cron has not run yet, so it has never posted a price. It replaces the "
+                "polling bot's JobQueue: open /api/webhook to check the webhook and give the cron "
+                "its first run at /api/tick, or set up an external scheduler (VERCEL.md §5).")
+    if int(status.get("age") or 0) > TICK_STALE_SECONDS:
+        return (f"The last cron run was {short_age(int(status['age']))} ago, so prices are only as "
+                "fresh as that run. Vercel's free plan runs a cron once a day (with up to ±59 "
+                "minutes of jitter); for five-minute prices let an external scheduler call "
+                "/api/tick — VERCEL.md §5 has a ready-made recipe.")
+    return ""
+
+
+def webhook_diagnostics(summary: dict | None = None, reachability: dict | None = None) -> dict:
+    """The public-URL probe, Telegram's last error and its fix, in one place.
+
+    Used by the status page, its JSON twin and the cron answer, so all three say
+    the same thing about why Telegram may not be reaching the bot.
+    """
+    summary = summary if isinstance(summary, dict) else {}
+    reachability = reachability if isinstance(reachability, dict) else {}
+    last_error = str(summary.get("last_error") or "")
+    hint = webhook_error_hint(last_error)
+    warning = ""
+    if reachability and reachability.get("checked") and not reachability.get("reachable"):
+        warning = f"Telegram cannot reach this deployment: {reachability.get('detail')}. " \
+                  f"{reachability.get('hint')}".strip()
+    elif hint:
+        warning = f"Telegram reports a webhook problem ({last_error}): {hint}"
+    elif int(summary.get("pending_updates") or 0) > 20:
+        warning = (f"Telegram still holds {int(summary['pending_updates'])} undelivered updates — "
+                   "the webhook is registered but the deployment is not answering them. Check the "
+                   "deployment's Logs and open /api/webhook?register=1.")
+    return {"public": reachability or {"checked": False, "reachable": None},
+            "last_error": last_error or None, "hint": hint, "warning": warning}
+
+
 # ── one PTB application per warm container ─────────────────────────────────
 _apps: dict[int, Any] = {}
 _locks: dict[int, asyncio.Lock] = {}
@@ -368,6 +619,7 @@ async def set_webhook(app=None) -> dict:
     )
     bot_module.state[MARKER_KEY] = {"url": target, "secret_fp": _fingerprint(secret)}
     bot_module.save()
+    reset_reachability_probe()      # the address just changed — knock on it afresh
     log.info("Webhook registered: %s", target)
     return _webhook_summary(await app.bot.get_webhook_info())
 
@@ -393,33 +645,94 @@ async def ensure_webhook(force: bool = False, app=None) -> dict:
 
 
 async def run_tick() -> dict:
-    """One round of the periodic work the polling bot does in its JobQueue."""
+    """One round of the periodic work the polling bot does in its JobQueue.
+
+    Every step is isolated.  On the free plan this may be the only run in 24
+    hours, so a failing webhook check must not cost the day's price post: each
+    step keeps going, and what failed is listed in ``errors`` rather than
+    swallowed.  The run itself is remembered in the state store (``tick``), so
+    the status page and the Telegram panel can tell "prices didn't change" apart
+    from "nothing is running this deployment".
+    """
     bot_module = get_bot()
     loop = asyncio.get_running_loop()
-    result: dict = {}
+    result: dict = {"errors": []}
     async with _lock_for(loop):
         app = await _application_locked(loop)
         bot_module.refresh_state()
+
+        # 1. keep the webhook registered — the one step whose failure would
+        #    silence the bot completely, so it is reported in full.
         try:
             result["webhook"] = await ensure_webhook(app=app)
         except ConfigError:
             raise
-        except Exception as exc:                  # pragma: no cover - network
-            result["webhook"] = {"error": str(exc)}
-        result["posted"] = bool(await bot_module.auto_post_task(app.bot))
-        result["deleted_stale_message"] = bool(await bot_module.cleanup_task(app.bot))
+        except Exception as exc:                      # pragma: no cover - network
+            log.warning("webhook check failed: %s", exc)
+            result["webhook"] = {"error": f"{type(exc).__name__}: {exc}"}
+            result["errors"].append(f"webhook: {exc}")
+
+        # 2. post the prices when they changed
+        try:
+            result["posted"] = bool(await bot_module.auto_post_task(app.bot))
+        except Exception as exc:                      # pragma: no cover - Telegram
+            log.warning("auto post failed: %s", exc)
+            result["posted"] = False
+            result["errors"].append(f"post prices: {exc}")
+
+        # 3. delete the stale group message
+        try:
+            result["deleted_stale_message"] = bool(await bot_module.cleanup_task(app.bot))
+        except Exception as exc:                      # pragma: no cover - Telegram
+            log.warning("cleanup failed: %s", exc)
+            result["deleted_stale_message"] = False
+            result["errors"].append(f"cleanup: {exc}")
+
         # serverless has no JobQueue: expired anti-scam checks are swept here
-        result["captcha_expired"] = int(await bot_module.sweep_captcha(app.bot))
+        try:
+            result["captcha_expired"] = int(await bot_module.sweep_captcha(app.bot))
+        except Exception as exc:                      # pragma: no cover - Telegram
+            log.warning("anti-scam sweep failed: %s", exc)
+            result["captcha_expired"] = 0
+            result["errors"].append(f"anti-scam sweep: {exc}")
+
         # 🧹 …and so are the group-cleanup warnings still standing in the group
         result["cleanup"] = bot_module.cleanup_summary()
-        result["cleanup_warnings_removed"] = int(await bot_module.sweep_cleanup_notices(app.bot))
+        try:
+            result["cleanup_warnings_removed"] = int(await bot_module.sweep_cleanup_notices(app.bot))
+        except Exception as exc:                      # pragma: no cover - Telegram
+            log.warning("group cleanup sweep failed: %s", exc)
+            result["cleanup_warnings_removed"] = 0
+            result["errors"].append(f"group cleanup sweep: {exc}")
+
         result["auto"] = bool(bot_module.state.get("auto"))
         result["group"] = bot_module.state.get("group")
         result["channel"] = bot_module.state.get("channel")
         # ↪️ the chats whose messages are relayed into the group
         result["forward_from"] = bot_module.forward_source_summary()
         result["merchants"] = len(bot_module.state.get("merchants") or {})
+
+        # Remember that the cron ran, and how often: the group's silence is
+        # otherwise indistinguishable from a deployment nobody starts.
+        previous = bot_module.state.get(TICK_KEY)
+        previous = previous if isinstance(previous, dict) else {}
+        bot_module.state[TICK_KEY] = {"at": int(time.time()),
+                                      "count": int(previous.get("count") or 0) + 1}
+        try:
+            bot_module.save()
+        except Exception as exc:                      # pragma: no cover - stores never raise
+            log.debug("tick bookkeeping could not be saved: %s", exc)
+        result["tick"] = dict(bot_module.state[TICK_KEY])
+
     result["state"] = state_status()
+    # The cron may be the only chance in 24 hours (free plan) to notice that
+    # Telegram cannot reach the deployment at all, so ask the public URL too.
+    result["public"] = await webhook_reachability()
+    result["diagnostics"] = webhook_diagnostics(
+        result.get("webhook") if isinstance(result.get("webhook"), dict) else {},
+        result["public"])
+    if result["diagnostics"]["warning"]:
+        result["errors"].append(result["diagnostics"]["warning"])
     return result
 
 
