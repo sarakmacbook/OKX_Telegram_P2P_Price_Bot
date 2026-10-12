@@ -292,10 +292,10 @@ def test_database_screen_offers_custom_database_management(bot, monkeypatch):
     buttons = _buttons(bot.database_kb())
 
     assert "NOT connected" in text
-    assert "Set custom database" in text
-    assert "custom Redis-compatible REST database" in text
+    assert "Add / change database" in text
+    assert "MySQL / MariaDB" in text                      # every database type is offered
     assert "console.upstash.com/redis/1" not in text
-    assert [b.callback_data for b in buttons] == ["db_custom", "db_check", "panel"]
+    assert [b.callback_data for b in buttons] == ["db_types", "db_check", "panel"]
 
 
 def test_database_screen_never_echoes_the_custom_token(bot, monkeypatch):
@@ -317,7 +317,7 @@ def test_database_screen_gives_first_start_vercel_steps(bot, monkeypatch):
     text = bot.database_text()
 
     assert "Vercel" in text and "Storage or environment settings" in text
-    assert "Set / change custom database" in text
+    assert "Add / change database" in text
     assert "cannot remember" in text                    # the consequence, named
     assert "pinned message" in text                     # how the choice survives a restart
 
@@ -373,7 +373,8 @@ def test_database_command_is_admin_only_and_sends_the_screen(bot, monkeypatch):
                             message=message)
     asyncio.run(bot.database_cmd(admin, SimpleNamespace()))
     message.reply_html.assert_awaited()
-    assert "Set / change custom database" in str(message.reply_html.await_args.kwargs["reply_markup"].inline_keyboard[0][0].text)
+    assert "Add / change database" in str(message.reply_html.await_args.kwargs["reply_markup"].inline_keyboard[0][0].text)
+    assert message.reply_html.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "db_types"
 
 
 def test_database_screen_reports_a_store_that_stopped_answering(bot, monkeypatch):

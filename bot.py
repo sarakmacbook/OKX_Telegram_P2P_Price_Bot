@@ -1608,7 +1608,9 @@ def empty_state():
             # ➕ chats an admin pointed at by link/forward, waiting for their tap
             "source_offers": {},
             # ↪️ messages the bot itself posted into a source chat ("chat:msg" → ts)
-            "own_messages": {}}
+            "own_messages": {},
+            # 💾 first /start asked which database type to add (asked once)
+            "db_setup_offered": False}
 
 
 def load():
@@ -1793,7 +1795,7 @@ def db_health(force: bool = False) -> tuple[bool, str]:
 
 def _store_config_signature() -> tuple:
     """Settings that decide which state store ``build_store`` will select."""
-    return (storage.state_backend(), storage.redis_config(),
+    return (storage.state_backend(), storage.redis_config(), storage.custom_database_uri(),
             os.getenv("P2P_STATE_KEY", ""), os.getenv("P2P_STATE_FILE", ""),
             os.getenv("P2P_DATA_DIR", ""))
 
@@ -2090,12 +2092,93 @@ def settings_kb():
     ])
 
 def database_kb():
-    rows = [[B("➕ Set / change custom database", callback_data="db_custom")]]
-    if storage.custom_redis_config():
+    rows = [[B("➕ Add / change database", callback_data="db_types")]]
+    if storage.custom_redis_config() or storage.custom_database_spec() is not None:
         rows.append([B("↩️ Use deployment database", callback_data="db_reset")])
     rows.append([B("🔄 Check connection", callback_data="db_check")])
     rows.append([B("⬅️ Back", callback_data="panel")])
     return KB(rows)
+
+def database_type_kb(*, later: bool = False):
+    """Every database type the bot can store its state in — one button each.
+
+    ``later`` adds the first-start escape hatch (the bot must be able to run
+    without a database, and asking is not the same as insisting).
+    """
+    rows = [
+        [B("🐬 MySQL / MariaDB", callback_data="db_type:mysql"),
+         B("🐘 PostgreSQL", callback_data="db_type:postgres")],
+        [B("🍃 MongoDB", callback_data="db_type:mongo"),
+         B("🔴 Redis", callback_data="db_type:redis")],
+        [B("🗃 SQLite (local file)", callback_data="db_type:sqlite")],
+        [B("⚡ Redis REST (Upstash / Vercel KV)", callback_data="db_custom")],
+    ]
+    if later:
+        rows.append([B("⏳ Later", callback_data="db_skip")])
+    else:
+        rows.append([B("⬅️ Back", callback_data="database")])
+    return KB(rows)
+
+def database_offer_text() -> str:
+    """The first-start question: add database support now, or later."""
+    return (
+        "👋 <b>Welcome!</b> One quick setup step:\n\n"
+        "💾 <b>Add database support</b> — where should this bot keep your group, merchants, "
+        "settings and prices?\n\n"
+        "Without a database everything lives in memory or a local file: a restart — or a second "
+        "bot instance — forgets it all. All database types are supported:\n"
+        "🐬 MySQL / MariaDB · 🐘 PostgreSQL · 🍃 MongoDB · 🔴 Redis · 🗃 SQLite · "
+        "⚡ Redis REST (Upstash / Vercel KV)\n\n"
+        "Pick one below and send the connection URI — it is tested before anything is switched, "
+        "and your current data is carried over. You can also do this later with /database."
+    )
+
+def database_uri_prompt(kind: str) -> str:
+    """What the admin sends next, with one example URI for the chosen type."""
+    from database_adapters import EXAMPLES, KIND_LABELS, driver_hint
+    title = {
+        "sqlite": "🗃 <b>SQLite</b> — a local database file",
+        "mysql": "🐬 <b>MySQL / MariaDB</b>",
+        "postgres": "🐘 <b>PostgreSQL</b>",
+        "mongo": "🍃 <b>MongoDB</b>",
+        "redis": "🔴 <b>Redis</b>",
+    }.get(kind, f"🗄 <b>{KIND_LABELS.get(kind, kind)}</b>")
+    if kind == "sqlite":
+        ask = ("Send the <b>file path</b> for the database, for example:\n"
+               f"<code>{EXAMPLES['sqlite']}</code>")
+    else:
+        ask = ("Send the <b>connection URI</b>, for example:\n"
+               f"<code>{EXAMPLES[kind]}</code>")
+    hint = driver_hint(kind)
+    warning = f"\n\n⚠️ {hint}" if hint else ""
+    secrecy = ("The password is never shown back" if kind != "sqlite"
+               else "Nothing but this bot ever sees the path")
+    return (
+        f"{title}\n\n{ask}\n\n"
+        f"I test the connection first, then carry your group, merchants and settings over. {secrecy}"
+        " — the details stay in this private chat (sealed in the pinned settings copy on "
+        "deployments without a disk). Send /cancel to stop."
+        f"{warning}"
+    )
+
+async def offer_database_setup(u: Update) -> None:
+    """First start with no database: ask the admin to add one (all types offered).
+
+    Asked exactly once per deployment — ``db_setup_offered`` lives in the shared
+    state, so a second ``/start`` does not nag.  The 🗄 button on the panel and
+    ``/database`` remain available afterwards, and the bot keeps working either
+    way.
+    """
+    if db_is_persistent() or state.get("db_setup_offered"):
+        return
+    state["db_setup_offered"] = True
+    save()
+    try:
+        await u.message.reply_html(database_offer_text(),
+                                   reply_markup=database_type_kb(later=True),
+                                   disable_web_page_preview=True)
+    except Exception as e:                               # pragma: no cover - defensive
+        log.warning("Could not send the database setup offer: %s", e)
 
 def buttons_menu_kb():
     s = get_settings()
@@ -2492,6 +2575,7 @@ def _clear_database_edit(u: Update) -> None:
     """Discard a database setup draft without leaving credentials in bot state."""
     edits = edits_of(u)
     edits.pop("db_custom_url", None)
+    edits.pop("db_kind", None)
     edits.pop("awaiting_custom", None)
     save()
 
@@ -2575,6 +2659,11 @@ def set_custom_database(url: str, token: str, update: Update | None = None) -> t
     if not reachable:
         return False, "The Redis REST service did not answer. Check the URL and token, then try again."
 
+    # A custom database selection is exclusive: the REST pair replaces any
+    # custom URI database chosen earlier (and vice versa in
+    # ``set_custom_database_uri``).  Clear the previous selection first so the
+    # saved settings can never hold both.
+    runtime_config.remove(names=(runtime_config.CUSTOM_DB_URL,), base_dir=BASE_DIR)
     saved = runtime_config.save(values, BASE_DIR)
     if any(saved.get(name) != value for name, value in values.items()):
         return False, "I could not save the database settings persistently; the current store was left unchanged."
@@ -2592,12 +2681,74 @@ def set_custom_database(url: str, token: str, update: Update | None = None) -> t
     if update is not None:
         edits = edits_of(update)
         edits.pop("db_custom_url", None)
+        edits.pop("db_kind", None)
         edits.pop("awaiting_custom", None)
         save()
 
+    os.environ.pop(storage.CUSTOM_DB_ENV, None)
     os.environ[runtime_config.CUSTOM_REDIS_URL] = clean_url
     os.environ[runtime_config.CUSTOM_REDIS_TOKEN] = clean_token
     runtime_config.mark(values)
+    runtime_config.invalidate()
+    rebuild_store()                 # copies the live group/merchant state first
+    refresh_state()
+    _db_probe["at"] = 0.0
+    return True, "Custom database connected and selected."
+
+
+def set_custom_database_uri(kind: str, uri: str, update: Update | None = None) -> tuple[bool, str]:
+    """Test, persist and select a custom database of any supported type.
+
+    ``uri`` is one connection URI (``mysql://…``, ``postgres://…``, ``mongodb://…``,
+    ``redis://…``, ``sqlite://…`` or a plain SQLite file path).  Like the Redis
+    REST flow above: the connection is tested first, the settings are saved in
+    the bootstrap store before the state store switches, and the current group,
+    merchants and settings are carried over.  The URI (and the password inside
+    it) is never echoed back and never lands in the bot's state.
+    """
+    import runtime_config
+    from database_adapters import (KIND_LABELS, build_store as build_database,
+                                  driver_hint, parse_database_uri)
+
+    spec, error = parse_database_uri(kind or "", uri)
+    if error:
+        return False, error
+    missing = driver_hint(spec["kind"])
+    if missing:
+        # The hint is written for an HTML reply; strip the tags for this plain-text path.
+        return False, missing.replace("<code>", "").replace("</code>", "")
+
+    state_key = (os.getenv("P2P_STATE_KEY") or storage.DEFAULT_KEY).strip() or storage.DEFAULT_KEY
+    target = build_database(spec, key=state_key)
+    reachable, _detail = probe_store(target, timeout=6.0)
+    if not reachable:
+        return (False, f"The {KIND_LABELS[spec['kind']]} database did not answer. Check the "
+                       "connection details, then try again.")
+
+    # Exclusive selection: this database replaces any previous custom one.
+    runtime_config.remove(names=(runtime_config.CUSTOM_REDIS_URL, runtime_config.CUSTOM_REDIS_TOKEN),
+                          base_dir=BASE_DIR)
+    saved = runtime_config.save({runtime_config.CUSTOM_DB_URL: spec["uri"]}, BASE_DIR)
+    if saved.get(runtime_config.CUSTOM_DB_URL) != spec["uri"]:
+        return False, "I could not save the database settings persistently; the current store was left unchanged."
+
+    # Keep a copy with the selected DB too (see ``set_custom_database``).
+    try:
+        build_database(spec, key=runtime_config.config_key()).save(saved)
+    except Exception as exc:                           # pragma: no cover - defensive
+        log.warning("Could not write the config replica to the custom database: %s", exc)
+
+    if update is not None:
+        edits = edits_of(update)
+        edits.pop("db_custom_url", None)
+        edits.pop("db_kind", None)
+        edits.pop("awaiting_custom", None)
+        save()
+
+    os.environ.pop(runtime_config.CUSTOM_REDIS_URL, None)
+    os.environ.pop(runtime_config.CUSTOM_REDIS_TOKEN, None)
+    os.environ[runtime_config.CUSTOM_DB_URL] = spec["uri"]
+    runtime_config.mark((runtime_config.CUSTOM_DB_URL,))
     runtime_config.invalidate()
     rebuild_store()                 # copies the live group/merchant state first
     refresh_state()
@@ -2609,14 +2760,15 @@ def use_deployment_database() -> tuple[bool, str]:
     """Remove the Telegram-selected DB after verifying the fallback store."""
     import runtime_config
 
-    custom = storage.custom_redis_config()
-    if not custom:
+    custom = storage.custom_database_spec()          # any type chosen in Telegram
+    custom_rest = storage.custom_redis_config()
+    if custom is None and custom_rest is None:
         return False, "No custom database is selected."
 
     # Build and probe the backend the bot will fall back to, with Telegram's
     # override temporarily hidden. This avoids switching into an empty/broken
     # store and keeps Vercel on persistent storage.
-    names = storage.CUSTOM_REDIS_ENV_PAIR
+    names = storage.CUSTOM_REDIS_ENV_PAIR + (storage.CUSTOM_DB_ENV,)
     previous = {name: os.environ.pop(name, None) for name in names}
     try:
         fallback = storage.build_store(BASE_DIR)
@@ -2625,8 +2777,8 @@ def use_deployment_database() -> tuple[bool, str]:
         for name, value in previous.items():
             if value is not None:
                 os.environ[name] = value
-    if on_vercel() and getattr(fallback, "backend", "none") != "redis":
-        return False, ("There is no deployment-managed Redis database to go back to, and Vercel "
+    if on_vercel() and not database_connected(fallback):
+        return False, ("There is no deployment-managed database to go back to, and Vercel "
                        "cannot keep this state in a local file. Keep the custom database "
                        "connected, or connect a KV / Redis store for the deployment (Vercel → "
                        "Storage) and redeploy.")
@@ -2639,7 +2791,12 @@ def use_deployment_database() -> tuple[bool, str]:
     remaining = runtime_config.load(BASE_DIR)
     # Remove the backup copy as well; the database state itself is preserved.
     try:
-        storage.RedisStore(custom[0], custom[1], key=runtime_config.config_key()).save(remaining)
+        if custom is not None:
+            from database_adapters import build_store as build_database
+            build_database(custom, key=runtime_config.config_key()).save(remaining)
+        else:
+            storage.RedisStore(custom_rest[0], custom_rest[1],
+                               key=runtime_config.config_key()).save(remaining)
     except Exception as exc:                           # pragma: no cover - defensive
         log.warning("Could not clear the custom database config replica: %s", exc)
 
@@ -2653,19 +2810,25 @@ def use_deployment_database() -> tuple[bool, str]:
 
 
 def database_text():
-    """Where state lives and how an admin switches to a custom REST database."""
+    """Where state lives and how an admin switches to a custom database."""
     persistent = db_is_persistent()
     custom = storage.custom_redis_config() is not None
+    custom_kind = storage.custom_database_kind()
+    from database_adapters import KIND_LABELS
     if persistent:
         state_block = (
             "✅ The group, merchants, settings and prices are stored in this shared database, "
             "so they survive restarts and extra instances.\n\n"
-            + ("A <b>custom Redis REST database</b> selected in Telegram is active. Its token is "
-               "never shown. Use the buttons below to replace it or return to the deployment's "
-               "database."
+            + (f"A <b>custom {KIND_LABELS.get(custom_kind, custom_kind)} database</b> selected "
+               "in Telegram is active. Its password (if any) is never shown. Use the buttons "
+               "below to replace it or return to the deployment's database."
+               if custom_kind else
+               "A <b>custom Redis-compatible REST database</b> selected in Telegram is active. "
+               "Its token is never shown. Use the buttons below to replace it or return to the "
+               "deployment's database."
                if custom else
-               "The deployment's default Redis / KV database is active. Use the button below to "
-               "switch to a custom Redis REST endpoint.")
+               "The deployment's default database is active. Use the button below to switch to "
+               "a custom database.")
         )
     elif on_vercel():
         # The bot is *allowed* to run without a database — that is the point of
@@ -2674,19 +2837,21 @@ def database_text():
             "⚠️ <b>No database connected</b> — the bot runs, but this deployment cannot "
             "remember: Vercel instances do not share local files, so a restart or another "
             "instance forgets the group, the merchants and the prices.\n\n"
-            "Use <b>Set / change custom database</b> below to connect a Redis-compatible REST "
-            "database right here: the URL and token are tested, the current group and merchants "
-            "are carried over, and the bot keeps the credentials in a pinned message of this "
-            "chat so it reconnects by itself after a restart. Connecting a KV / Redis store in "
-            "the deployment's Storage or environment settings works too, and is preferred for "
+            "Use <b>Add / change database</b> below to connect any database type right here — "
+            "MySQL / MariaDB, PostgreSQL, MongoDB, Redis, SQLite, or a Redis-compatible REST "
+            "endpoint (Upstash / Vercel KV). The connection is tested, the current group and "
+            "merchants are carried over, and the bot keeps the details in a pinned message of "
+            "this chat so it reconnects by itself after a restart. Connecting a KV / Redis store "
+            "in the deployment's Storage or environment settings works too, and is preferred for "
             "heavy use."
         )
     else:
         state_block = (
             "⚠️ The bot is using a local file, so another instance or a reinstalled host will "
             "not share its state.\n\n"
-            "Use <b>Set custom database</b> below to switch to a custom Redis-compatible REST "
-            "database. The URL and token are tested before the bot switches."
+            "Use <b>Add / change database</b> below to switch to any database type — MySQL / "
+            "MariaDB, PostgreSQL, MongoDB, Redis, SQLite, or a Redis-compatible REST endpoint. "
+            "The connection is tested before the bot switches."
         )
     # "configured" is not "answering": load() reports a database that went away
     # exactly like an empty one, so it is probed here instead.
@@ -3011,6 +3176,9 @@ async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     if is_admin(u):
         remember_private_chat(u)          # where a pinned settings copy would live
+        # First start without a database: ask which database type to add before
+        # showing the panel (once per deployment — /database stays available).
+        await offer_database_setup(u)
         await u.message.reply_html(panel_text(), reply_markup=panel())
     else: await u.message.reply_text("⛔ You are not authorized. Ask the bot admin to add your ID.")
 
@@ -4165,6 +4333,28 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     awaiting = edit_get(u, "awaiting_custom")
 
+    if awaiting == "database_uri":
+        kind = edit_get(u, "db_kind", "")
+        okay, detail = set_custom_database_uri(kind, txt, update=u)
+        if not okay:
+            return await u.message.reply_text(
+                f"❌ {html_escape(detail)} Send another connection URI, or /cancel to stop.")
+        # The copy in this chat is what makes the connection survive a restart
+        # on a host without a disk, so it is said right here — in the message
+        # that reports the new database, not buried in a manual.
+        pin = ""
+        if settings_in_chat():
+            reachable, where = verify_pinned_settings()
+            pin = ("\n\n" + pinned_copy_note() if reachable else
+                   "\n\n⚠️ I could not read the pinned settings copy back (" + where + ") — "
+                   "this deployment may not reconnect by itself after a restart. Keep the "
+                   "connection details to hand, or set KV_REST_API_URL + KV_REST_API_TOKEN in "
+                   "the deployment environment.")
+        return await u.message.reply_html(
+            "✅ Custom database connected and selected. Your group, merchants and settings were "
+            "carried over." + pin + "\n\n" + database_text(),
+            reply_markup=database_kb(), disable_web_page_preview=True)
+
     if awaiting == "database_url":
         import runtime_config
         clean_url, error = runtime_config.clean_redis_rest_url(txt)
@@ -5120,6 +5310,56 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
                                          reply_markup=database_kb(),
                                          disable_web_page_preview=True)
 
+    elif d == "db_types":
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Open a private chat with the bot to set up a database.",
+                                  show_alert=True)
+        remember_private_chat(u)
+        _clear_database_edit(u)
+        await q.answer()
+        return await q.edit_message_text(
+            "🗄 <b>Add / change database</b> — every database type is supported. Pick one; "
+            "you then send its connection URI and I test it before switching.\n\n"
+            "A custom database replaces the current store — your group, merchants and settings "
+            "are carried over.",
+            parse_mode="HTML", reply_markup=database_type_kb(),
+            disable_web_page_preview=True)
+
+    elif d.startswith("db_type:"):
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Open a private chat with the bot to set up a database.",
+                                  show_alert=True)
+        from database_adapters import normalize_kind
+        kind = normalize_kind(d.split(":", 1)[1])
+        if not kind:
+            return await q.answer("Unknown database type.", show_alert=True)
+        remember_private_chat(u)          # a pinned settings copy belongs in this chat
+        edits = edits_of(u)
+        edits.pop("db_custom_url", None)
+        edits["db_kind"] = kind
+        edit_set(u, "awaiting_custom", "database_uri")
+        await q.answer()
+        return await q.edit_message_text(
+            database_uri_prompt(kind), parse_mode="HTML",
+            reply_markup=KB([[B("❌ Cancel", callback_data="db_cancel")]]),
+            disable_web_page_preview=True)
+
+    elif d == "db_skip":
+        state["db_setup_offered"] = True
+        save()
+        await q.answer("OK — add one later with /database")
+        return await q.edit_message_text(
+            "👌 No problem — the bot keeps running as it is.\n\n"
+            "Add a database anytime with /database (or ⚙️ Settings → 🗄 Database). All types "
+            "are supported: MySQL / MariaDB, PostgreSQL, MongoDB, Redis, SQLite, and Redis "
+            "REST (Upstash / Vercel KV).",
+            parse_mode="HTML",
+            reply_markup=KB([[B("🗄 Add database", callback_data="db_types"),
+                              B("🎛 Panel", callback_data="panel")]]),
+            disable_web_page_preview=True)
+
     elif d == "db_custom":
         chat = getattr(u, "effective_chat", None)
         if chat is not None and getattr(chat, "type", "") != "private":
@@ -5128,6 +5368,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         remember_private_chat(u)          # a pinned settings copy belongs in this chat
         edits = edits_of(u)
         edits.pop("db_custom_url", None)
+        edits.pop("db_kind", None)
         edit_set(u, "awaiting_custom", "database_url")
         await q.answer("Send the custom Redis REST URL")
         return await q.edit_message_text(
@@ -5553,7 +5794,7 @@ async def cancel_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u): return
     awaiting = edit_get(u, "awaiting_custom")
     if awaiting:
-        if awaiting in ("database_url", "database_token"):
+        if awaiting in ("database_url", "database_token", "database_uri"):
             _clear_database_edit(u)
             await u.message.reply_html("❌ Database setup cancelled.\n\n" + database_text(),
                                        reply_markup=database_kb())
