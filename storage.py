@@ -12,6 +12,13 @@ accepted as an alias):
            credentials happen to be present.  This is useful for a local or
            Docker installation that should not share its data with another bot.
 
+Above that deployment-level choice sits the database an admin selects in
+Telegram with ``/database`` — **any** database type, sent as one connection URI
+and kept in ``P2P_CUSTOM_DB_URL`` (see ``database_adapters.py``): SQLite, MySQL
+/ MariaDB, PostgreSQL, MongoDB, or Redis over TCP.  A Telegram-selected custom
+database always wins, exactly like the custom Redis REST pair below; selecting a
+new one clears the previous selection.
+
 Redis is configured by any of::
 
     KV_REST_API_URL      + KV_REST_API_TOKEN
@@ -61,6 +68,12 @@ REDIS_ENV_PAIRS = (
 # never overwritten. They take priority for the bot's state store.
 CUSTOM_REDIS_ENV_PAIR = ("P2P_CUSTOM_KV_REST_API_URL", "P2P_CUSTOM_KV_REST_API_TOKEN")
 
+#: A custom database of *any* type selected in Telegram (``/database``): one
+#: connection URI whose scheme names the type — sqlite://, mysql://, mariadb://,
+#: postgres://, mongodb://, redis:// …  Mutually exclusive with the REST pair
+#: above: selecting one clears the other (the setters in bot.py enforce it).
+CUSTOM_DB_ENV = "P2P_CUSTOM_DB_URL"
+
 # Legacy destination for JSON clients that still consume connect_database.
 # Initial Vercel storage is configured through the dashboard/environment, while
 # Telegram admins manage custom Redis REST credentials in a private chat.
@@ -82,6 +95,9 @@ def normalize_backend(value: str | None) -> str | None:
 def state_backend() -> str:
     """Configured backend, canonicalised; invalid/missing values mean ``auto``.
 
+    A custom database selected in Telegram (any type, ``P2P_CUSTOM_DB_URL``)
+    reports its own kind (``sqlite``/``mysql``/``postgres``/``mongo``/``redis``)
+    and outranks everything else; the custom Redis REST pair next; then
     ``P2P_STATE_BACKEND`` wins over the older, more generic
     ``P2P_STORAGE_BACKEND`` alias.  Logging is done by :func:`build_store` so
     callers such as the setup page can inspect the preference without producing
@@ -90,6 +106,9 @@ def state_backend() -> str:
     # Choosing a custom database in Telegram is an explicit selection. It takes
     # precedence over an older ``file`` preference, while removing the custom
     # pair returns the bot to the deployment's normal backend choice.
+    custom = custom_database_spec()
+    if custom is not None:
+        return custom["kind"]
     if custom_redis_config():
         return "redis"
     raw = os.getenv("P2P_STATE_BACKEND")
@@ -114,6 +133,41 @@ def _redis_pair(pair: tuple[str, str]) -> tuple[str, str] | None:
 def custom_redis_config() -> tuple[str, str] | None:
     """A custom Redis REST pair selected in Telegram, if one is configured."""
     return _redis_pair(CUSTOM_REDIS_ENV_PAIR)
+
+
+_custom_db_warned: set[str] = set()
+
+
+def custom_database_uri() -> str | None:
+    """The raw connection URI of the custom database selected in Telegram."""
+    raw = (os.getenv(CUSTOM_DB_ENV) or "").strip()
+    return raw or None
+
+
+def custom_database_spec() -> dict | None:
+    """The parsed custom database (``database_adapters`` spec), if one is usable.
+
+    An unusable value is logged once and treated as absent: a typo must not
+    silently split state across two stores, and it must not crash every request
+    either.  :func:`build_store` then falls back to the normal selection.
+    """
+    raw = custom_database_uri()
+    if not raw:
+        return None
+    from database_adapters import parse_database_uri
+    spec, error = parse_database_uri("", raw)
+    if spec is None:
+        if raw not in _custom_db_warned:
+            _custom_db_warned.add(raw)
+            log.warning("P2P_CUSTOM_DB_URL is not usable (%s) — ignoring it", error)
+        return None
+    return spec
+
+
+def custom_database_kind() -> str | None:
+    """``"sqlite"`` / ``"mysql"`` / ``"postgres"`` / ``"mongo"`` / ``"redis"`` — or ``None``."""
+    spec = custom_database_spec()
+    return spec["kind"] if spec is not None else None
 
 
 def environment_redis_config() -> tuple[str, str] | None:
@@ -166,15 +220,20 @@ def serverless_host() -> bool:
 
 
 def database_connected(store=None) -> bool:
-    """Whether state is kept in a shared Redis-compatible database.
+    """Whether state is kept in a real database (not a plain JSON file).
+
+    Every database type counts — SQLite, MySQL/MariaDB, PostgreSQL, MongoDB,
+    Redis (TCP or REST): the state survives restarts and is a database the
+    operator chose.  ``file`` and ``none`` do not count.
 
     Pass the store in use (``bot.STORE``) for the verified answer; without one
-    this reports whether a complete credential pair exists in the environment,
-    which is what the setup page can know before the bot may import.
+    this reports whether a custom database URI or a complete Redis REST pair
+    exists in the environment, which is what the setup page can know before the
+    bot may import.
     """
     if store is not None:
-        return getattr(store, "backend", "none") == "redis"
-    return redis_config() is not None
+        return getattr(store, "backend", "none") not in ("file", "none")
+    return custom_database_spec() is not None or redis_config() is not None
 
 
 class RedisStore:
@@ -368,6 +427,17 @@ def build_store(base_dir: str | Path, default_name: str = "data.json"):
     if raw_choice and normalize_backend(raw_choice) is None:
         log.warning("Unknown P2P_STATE_BACKEND=%r; using auto (choose: %s)",
                     raw_choice, ", ".join(BACKENDS))
+
+    # A custom database of any type selected in Telegram outranks every other
+    # choice — and like an explicit ``redis`` it never silently falls back to a
+    # different store.  ``database_adapters`` builds the right adapter for the
+    # URI's type (SQLite, MySQL/MariaDB, PostgreSQL, MongoDB, Redis over TCP).
+    custom = custom_database_spec()
+    if custom is not None:
+        from database_adapters import build_store as build_custom_store
+        store = build_custom_store(custom, key=key)
+        log.info("State backend (custom %s): %s", custom["kind"], store.describe())
+        return store
 
     redis = redis_config()
     if choice == "redis":

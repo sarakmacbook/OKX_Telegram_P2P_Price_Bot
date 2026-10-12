@@ -106,12 +106,15 @@ A database is **not required to start**. With only `BOT_TOKEN` and `ADMIN_IDS`
 the bot comes up on every host, including Vercel, and a store is connected
 whenever you want from Telegram:
 
-* `/start` → the panel shows **🗄 Database: NOT connected ⚠️** and what that
-  costs: the group, the merchants and the prices are not remembered between
-  requests (Vercel has no shared disk).
-* `/database` → **➕ Set / change custom database** connects an Upstash/Redis
-  REST endpoint; the bot tests it, carries the current group and merchants over,
-  and switches. Nothing has to be redeployed.
+* `/start` (first start) → the bot **asks you to add database support** and
+  offers every database type as a button: MySQL / MariaDB, PostgreSQL, MongoDB,
+  Redis, SQLite, or a Redis REST endpoint (Upstash / Vercel KV). Tap one, send
+  the connection URI, and the bot tests it before switching — or tap **⏳ Later**
+  and the bot keeps running as it is (the ask is made once; the panel shows
+  **🗄 Database: NOT connected ⚠️** and what that costs while nothing is
+  connected).
+* `/database` → **➕ Add / change database** opens the same type chooser at any
+  time; nothing has to be redeployed.
 
 On a host whose filesystem cannot survive a request (Vercel) the bot keeps the
 values it needs — including the database you connect later — in a **pinned
@@ -135,19 +138,34 @@ controls that behaviour:
 
 #### Add or switch a custom database in Telegram
 
-An admin can manage the shared store from a private chat with the bot:
+An admin can manage the shared store from a private chat with the bot — **all
+database types are supported**:
 
 1. Send `/database` (or open **⚙️ Settings → 🗄 Database**).
-2. Tap **➕ Set / change custom database**, send the Redis-compatible REST URL,
-   then send its token in the private chat.
-3. The bot tests the credentials before switching and copies the live group,
-   merchants and settings to the new store. The token is never repeated in the
-   bot's reply.
+2. Tap **➕ Add / change database** and pick the type. The bot asks for one
+   connection URI (SQLite: a file path) and tests it before switching:
 
-The custom database overrides the deployment's normal KV/Redis pair without
-changing those environment variables. **↩️ Use deployment database** verifies
-the fallback store before switching back. Credentials are stored in the bot's
-runtime settings, not in the browser UI.
+   | Type | Example connection URI |
+   |---|---|
+   | 🐬 MySQL / MariaDB | `mysql://user:password@db-host:3306/p2p` (or `mariadb://…`) |
+   | 🐘 PostgreSQL | `postgres://user:password@db-host:5432/p2p` (or `postgresql://…`) |
+   | 🍃 MongoDB | `mongodb://user:password@db-host:27017/p2p` (or `mongodb+srv://…`) |
+   | 🔴 Redis | `redis://user:password@db-host:6379/0` (or `rediss://…`) |
+   | 🗃 SQLite | `sqlite:///home/user/p2p-bot.db` (or the plain file path) |
+   | ⚡ Redis REST | `https://…` REST URL **and** its token (Upstash / Vercel KV — two messages) |
+
+3. The bot tests the connection before switching and copies the live group,
+   merchants and settings to the new store. Passwords and tokens are never
+   repeated in the bot's reply.
+
+The custom database overrides the deployment's normal store without changing
+those environment variables (it is remembered as `P2P_CUSTOM_DB_URL` in the
+bot's runtime settings — the same value can be set in the deployment
+environment to skip the chat flow). **↩️ Use deployment database** verifies the
+fallback store before switching back. Credentials are stored in the bot's
+runtime settings, not in the browser UI. The drivers ship with the bot
+(`PyMySQL`, `pg8000`, `pymongo`, `redis`); if a deployment is missing one, the
+bot says which `pip install` line fixes it.
 
 > **Vercel:** you do not need to create anything before deploying. Open the bot,
 > send `/database`, and connect the store there — the credentials are kept in a
@@ -845,8 +863,8 @@ The bot writes the connection into a **pinned message of the admin chat**, seale
 with the current `BOT_TOKEN`, and reads it back with `getChat` on the next start.
 It forgets the credentials if:
 
-* the pinned message was deleted or edited (send `/database` → **➕ Set / change
-  custom database** again),
+* the pinned message was deleted or edited (send `/database` → **➕ Add / change
+  database** again),
 * `BOT_TOKEN` changed after the copy was written (a different token cannot open
   the seal), or
 * the deployment has a KV/Redis pair *and* you expect the chat copy to win — the

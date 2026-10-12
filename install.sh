@@ -414,11 +414,14 @@ elif [[ ! -d "$INSTALL_DIR" ]]; then
       mkdir -p "$INSTALL_DIR"
       fetch_repo "$INSTALL_DIR" || {
         warn "Archive download failed too — fetching the core files one by one..."
-        fetch "$RAW_URL/bot.py"           "$INSTALL_DIR/bot.py"           || true
-        fetch "$RAW_URL/exchanges.py"     "$INSTALL_DIR/exchanges.py"     || true
-        fetch "$RAW_URL/adlinks.py"       "$INSTALL_DIR/adlinks.py"       || true
-        fetch "$RAW_URL/storage.py"       "$INSTALL_DIR/storage.py"       || true
-        fetch "$RAW_URL/requirements.txt" "$INSTALL_DIR/requirements.txt" || true
+        fetch "$RAW_URL/bot.py"              "$INSTALL_DIR/bot.py"              || true
+        fetch "$RAW_URL/exchanges.py"        "$INSTALL_DIR/exchanges.py"        || true
+        fetch "$RAW_URL/adlinks.py"          "$INSTALL_DIR/adlinks.py"          || true
+        fetch "$RAW_URL/storage.py"          "$INSTALL_DIR/storage.py"          || true
+        fetch "$RAW_URL/database_adapters.py" "$INSTALL_DIR/database_adapters.py" || true
+        fetch "$RAW_URL/runtime_config.py"   "$INSTALL_DIR/runtime_config.py"   || true
+        fetch "$RAW_URL/telegram_store.py"   "$INSTALL_DIR/telegram_store.py"   || true
+        fetch "$RAW_URL/requirements.txt"    "$INSTALL_DIR/requirements.txt"    || true
       }
     }
   fi

@@ -10,7 +10,9 @@ or they can be stored without a redeploy:
   and can additionally select the state backend and configure a deployment KV /
   Redis REST pair;
 * custom Redis REST credentials entered in a private Telegram chat are stored
-  here separately from the deployment-managed pair.
+  here separately from the deployment-managed pair; a custom database of **any**
+  type (SQLite, MySQL/MariaDB, PostgreSQL, MongoDB, Redis over TCP) entered the
+  same way is kept as one connection URI (``P2P_CUSTOM_DB_URL``).
 
 The browser form and terminal wizard write bot settings into this module's
 store, and :func:`apply` copies values not already supplied by the environment
@@ -65,10 +67,14 @@ log = logging.getLogger("p2p-bot.config")
 #: ``CRON_SECRET`` stays environment-only because Vercel Cron reads it there.
 CUSTOM_REDIS_URL = "P2P_CUSTOM_KV_REST_API_URL"
 CUSTOM_REDIS_TOKEN = "P2P_CUSTOM_KV_REST_API_TOKEN"
+#: A custom database of any type (SQLite, MySQL/MariaDB, PostgreSQL, MongoDB,
+#: Redis over TCP) selected in Telegram with /database: one connection URI.
+#: Its password lives inside the URI, so it is a secret like the REST token.
+CUSTOM_DB_URL = "P2P_CUSTOM_DB_URL"
 SUPPORTED = ("BOT_TOKEN", "ADMIN_IDS", "ASSET", "FIAT", "INTERVAL", "P2P_STATE_BACKEND",
-             CUSTOM_REDIS_URL, CUSTOM_REDIS_TOKEN)
+             CUSTOM_REDIS_URL, CUSTOM_REDIS_TOKEN, CUSTOM_DB_URL)
 REQUIRED = ("BOT_TOKEN", "ADMIN_IDS")
-SECRETS = ("BOT_TOKEN", CUSTOM_REDIS_TOKEN)
+SECRETS = ("BOT_TOKEN", CUSTOM_REDIS_TOKEN, CUSTOM_DB_URL)
 
 CONFIG_FILE = "runtime_config.json"
 DEFAULT_CONFIG_KEY = "p2p-price-bot:config"
@@ -455,7 +461,11 @@ def validate(values: dict) -> tuple[dict[str, str], list[str]]:
 
     custom_url = str(values.get(CUSTOM_REDIS_URL) or "").strip()
     custom_token = str(values.get(CUSTOM_REDIS_TOKEN) or "").strip()
-    if bool(custom_url) != bool(custom_token):
+    custom_db = str(values.get(CUSTOM_DB_URL) or "").strip()
+    if custom_db and (custom_url or custom_token):
+        errors.append("Provide either a custom database URI or a Redis REST URL + token, "
+                      "not both — selecting one database replaces the other.")
+    elif bool(custom_url) != bool(custom_token):
         errors.append("The custom Redis REST URL and token must be provided together.")
     elif custom_url and custom_token:
         clean_url, url_error = clean_redis_rest_url(custom_url)
@@ -467,6 +477,13 @@ def validate(values: dict) -> tuple[dict[str, str], list[str]]:
         if not url_error and not token_error:
             cleaned[CUSTOM_REDIS_URL] = clean_url
             cleaned[CUSTOM_REDIS_TOKEN] = clean_token
+    elif custom_db:
+        from database_adapters import parse_database_uri
+        spec, error = parse_database_uri("", custom_db)
+        if error:
+            errors.append(error)
+        else:
+            cleaned[CUSTOM_DB_URL] = spec["uri"]
 
     interval = str(values.get("INTERVAL") or "").strip()
     if interval:

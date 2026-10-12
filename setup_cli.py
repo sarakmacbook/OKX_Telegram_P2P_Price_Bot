@@ -344,12 +344,14 @@ def wizard(args: argparse.Namespace) -> int:
         print(f"\n🌐 Finish the Telegram settings in the browser: {web_ui_url()}")
         print(f"   still missing: {', '.join(still_missing)}")
     elif env("VERCEL", "VERCEL_ENV", "VERCEL_URL", "VERCEL_PROJECT_PRODUCTION_URL") \
-            and not storage.redis_config():
+            and not storage.database_connected():
         print("\n⚠️ The bot starts without a database, but this Vercel deployment cannot")
         print("   remember anything until one is connected: send /database to the bot in")
-        print("   Telegram (it keeps those credentials in a pinned message), or connect a")
-        print("   KV/Redis store through Vercel Storage and redeploy.")
-    elif storage.state_backend() == "redis" and not storage.redis_config():
+        print("   Telegram and pick any database type (it keeps those credentials in a")
+        print("   pinned message), or connect a KV/Redis store through Vercel Storage and")
+        print("   redeploy.")
+    elif storage.state_backend() == "redis" and not storage.redis_config() \
+            and storage.custom_database_spec() is None:
         print("\n⚠️ Redis was selected, but no REST URL/token pair is available.")
         print("   Set the pair in the deployment environment and run this wizard again.")
     else:

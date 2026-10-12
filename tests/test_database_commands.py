@@ -17,7 +17,8 @@ def isolate_custom_database_environment():
     """A Telegram-selected pair from one test must not alter later store tests."""
     import runtime_config
 
-    names = runtime_config.CUSTOM_REDIS_URL, runtime_config.CUSTOM_REDIS_TOKEN
+    names = (runtime_config.CUSTOM_REDIS_URL, runtime_config.CUSTOM_REDIS_TOKEN,
+             runtime_config.CUSTOM_DB_URL)
     previous = {name: os.environ.pop(name, None) for name in names}
     runtime_config.invalidate()
     yield
@@ -41,13 +42,23 @@ def _private_update(bot, message):
 def test_database_menu_offers_custom_database_and_reset(bot, monkeypatch):
     monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_URL", "https://custom.example")
     monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_TOKEN", "hidden-token")
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: True)
 
     callbacks = [button.callback_data for row in bot.database_kb().inline_keyboard for button in row]
 
-    assert callbacks == ["db_custom", "db_reset", "db_check", "panel"]
+    assert callbacks == ["db_types", "db_reset", "db_check", "panel"]
     text = bot.database_text()
     assert "custom Redis-compatible REST database" in text
     assert "hidden-token" not in text
+
+
+def test_database_type_menu_offers_every_database_type(bot):
+    """The /database type chooser lists all supported database types."""
+    callbacks = [button.callback_data for row in bot.database_type_kb().inline_keyboard
+                 for button in row]
+
+    assert callbacks == ["db_type:mysql", "db_type:postgres", "db_type:mongo",
+                         "db_type:redis", "db_type:sqlite", "db_custom", "database"]
 
 
 def test_database_command_and_custom_setup_are_admin_private_only(bot):

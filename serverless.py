@@ -182,6 +182,7 @@ def _store_key() -> str:
     on every request, so the cache is keyed on the configuration instead.
     """
     return "|".join([storage.state_backend(), str(storage.redis_config() or ""),
+                     storage.custom_database_uri() or "",
                      env("P2P_STATE_KEY"), env("P2P_STATE_FILE"), env("P2P_DATA_DIR")])
 
 
@@ -1036,6 +1037,7 @@ def detect_database(force: bool = False) -> dict:
     there rather than a problem to investigate.
     """
     custom_pair = storage.custom_redis_config()
+    custom_db = storage.custom_database_spec()
     pair = custom_pair or storage.environment_redis_config()
     provider = ("custom Redis REST (Telegram)" if custom_pair else
                 next((label for url_name, token_name, label in _REDIS_ENV_PAIRS[1:]
@@ -1043,8 +1045,8 @@ def detect_database(force: bool = False) -> dict:
     token = _vercel_api_token()
     project, team = _vercel_project()
     on_vercel = _looks_like_vercel()
-    key = "|".join([str(pair or ""), provider, str(on_vercel), project, team,
-                    "token" if token else ""])
+    key = "|".join([str(pair or ""), storage.custom_database_uri() or "", provider,
+                    str(on_vercel), project, team, "token" if token else ""])
     now = time.monotonic()
     if not force and _db_detect["key"] == key:
         age = now - float(_db_detect["at"])
@@ -1054,6 +1056,19 @@ def detect_database(force: bool = False) -> dict:
     result: dict[str, Any] = {"found": False, "wired": False, "usable": False, "source": "",
                               "provider": provider, "where": "", "detail": "", "stores": [],
                               "checked": False, "error": "", "skipped": False}
+
+    if custom_db is not None and custom_pair is None:
+        # A custom database of any type selected in Telegram is the store the
+        # bot reads — nothing to look up on Vercel, and the URI (with its
+        # password) is never shown.  The custom REST pair is handled by `pair`.
+        kind = custom_db["kind"]
+        result.update(
+            found=True, wired=True, usable=True, source="telegram-custom",
+            provider=f"custom {kind} database (Telegram)",
+            where="a Telegram-selected custom database",
+            detail=f"A custom {kind} database selected in Telegram is active.")
+        _db_detect.update(at=now, key=key, result=result)
+        return dict(result)
 
     if pair:
         # The configured pair is the answer that counts: it is what the bot
@@ -1265,7 +1280,14 @@ def setup_status() -> dict:
     wants_redis = selected_backend != "file"
     health = store_health() if (on_vercel and redis_ok and wants_redis) else None
     state_broken = bool(health is not None and not health["ok"])
-    if selected_backend == "redis":
+    custom_kind = storage.custom_database_kind()
+    if custom_kind:
+        # Any database type selected in Telegram is a connected store — the
+        # type is reported, the URI (and its password) never is.
+        state_ok = True
+        state_detail = (f"A custom {custom_kind} database selected in Telegram is active; "
+                        "group, merchant and price state lives there.")
+    elif selected_backend == "redis":
         state_ok = redis_ok
         state_detail = (redis_detail if redis_ok else
                         "P2P_STATE_BACKEND=redis is selected, but " + redis_detail)
@@ -1706,6 +1728,7 @@ def save_setup_values(values: dict, verify: bool = True) -> dict:
         "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN",
         "REDIS_REST_URL", "REDIS_REST_TOKEN",
         storage.CUSTOM_REDIS_ENV_PAIR[0], storage.CUSTOM_REDIS_ENV_PAIR[1],
+        storage.CUSTOM_DB_ENV,
     }
     if any(str(values.get(name) or "").strip() for name in database_fields):
         return _save_report(
