@@ -178,7 +178,7 @@ Telegram pushes every update to `/api/webhook` and a **Vercel Cron** calls
 
 1. **Import** this repository into Vercel ([deploy button](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot) or `npx vercel`).
 2. **Add a KV/Redis store** (Vercel → Storage → *Upstash for Redis* → connect to the project) and the **environment variables** `BOT_TOKEN` + `ADMIN_IDS`.
-3. **Deploy**, then open `https://<your-app>.vercel.app/`. The first-start web UI shows a redacted checklist and a form for the Telegram token/admin IDs and optional bot settings; it does **not** expose database controls or credentials. The page reports whether the Vercel store is available and registers the Telegram webhook once setup is ready. Custom database changes are made later in Telegram with `/database`.
+3. **Deploy**, then open `https://<your-app>.vercel.app/`. The first-start web UI shows a redacted checklist and a form for the Telegram token/admin IDs and optional bot settings; it does **not** expose database controls or credentials. The page reports whether the Vercel store is available and registers the Telegram webhook once setup is ready. Custom database changes are made later in Telegram with `/database`. Once running, that same page is the health page: it registers/re-checks the webhook, **knocks on the deployment's own public URL to confirm Telegram can reach it**, and shows **Last cron run** — so "registered but unreachable" (Vercel Deployment Protection answering `401`, a domain answering `404`) can no longer look healthy while the bot stays silent.
 4. Prefer a terminal? `python setup_cli.py` can configure the bot and state backend in the same settings store. Every question can be skipped with **Enter** — and `python setup_cli.py --skip` prints the web UI address, so you can finish the bot settings in the browser later (`--show` prints stored values redacted).
 5. In Telegram: `/start` → **👥 Set group** → paste a merchant URL → **🟢 Auto: ON**.
 
@@ -190,6 +190,8 @@ Telegram pushes every update to `/api/webhook` and a **Vercel Cron** calls
 > fails the deployment. On **Pro** set `"schedule": "* * * * *"` in
 > [`vercel.json`](vercel.json) for live prices, or keep the free plan and let an
 > external scheduler call `/api/tick` (see [VERCEL.md](VERCEL.md#5-the-cron--how-often-prices-are-checked)).
+> The status page and the Telegram panel show when the cron last ran, so a
+> schedule that never fired is visible instead of silent.
 
 Full walkthrough, environment variables, endpoints and troubleshooting:
 **[VERCEL.md](VERCEL.md)**.
@@ -854,6 +856,7 @@ bash install-local.sh --uninstall     # stop + remove autostart (keep data)
 npx vercel logs <deployment-url>            # live logs
 npx vercel --prod                           # redeploy (after changing env vars)
 curl -s https://<your-app>.vercel.app/api/webhook          # status page + (re)register the webhook
+curl -s https://<your-app>.vercel.app/api/health           # is this deployment reachable at all? (static)
 curl -s -H "Authorization: Bearer $CRON_SECRET" \
      https://<your-app>.vercel.app/api/tick                # run the cron job by hand
 ```
@@ -896,8 +899,8 @@ cp ~/p2p-bot-backup-*/config.json ~/p2p-bot-backup-*/data.json <install-dir>/
 | `runtime_config.py` | The settings the setup page / `setup_cli.py` store (KV key or `runtime_config.json`), validated and applied before `bot.py` starts |
 | `setup_cli.py` | Terminal setup wizard — every question skippable (`--skip`, `--show`, `--clear`, `--vercel-env`) |
 | `serverless.py` | Serverless mode: ASGI glue, first-start setup UI + settings form, webhook + cron helpers, one PTB app per warm container |
-| `api/app.py` | Vercel entry point: one ASGI app that routes `/api/webhook`, `/api/setup`, `/api/tick` and `/` |
-| `api/webhook.py` | Telegram updates (`POST`) + status page (`GET /api/webhook`) |
+| `api/app.py` | Vercel entry point: one ASGI app that routes `/api/webhook`, `/api/setup`, `/api/tick`, `/api/health` and `/` |
+| `api/webhook.py` | Telegram updates (`POST`) + status page (`GET /api/webhook`: webhook check, reachability knock, cron heartbeat) |
 | `api/setup.py` | First-start page + the form that stores the required settings (`GET`/`POST /api/setup`) |
 | `api/tick.py` | The cron round that replaces the JobQueue (`/api/tick`) |
 | `vercel.json` | Vercel config: function limits + the `/api/tick` cron schedule |

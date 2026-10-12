@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # repo root (b
 from serverless import (                                          # noqa: E402
     TELEGRAM_SECRET_HEADER, Request, Response, asgi_dispatch, ensure_webhook,
     _local_config_has_credentials, config_error_response, env, get_bot, matches,
-    page, process_update, setup_status, state_status, webhook_secret,
+    page, process_update, setup_status, state_status, tick_note, tick_status,
+    tick_warning, webhook_diagnostics, webhook_reachability, webhook_secret,
     webhook_secret_note,
 )
 from storage import database_link                                 # noqa: E402
@@ -93,6 +94,8 @@ async def _status(request: Request) -> Response:
         # Where the database was detected — the environment, or Vercel's own
         # store list — and whether this deployment can already use it.
         "database": setup.get("database") or {},
+        # When the cron — the only thing that posts prices on Vercel — last ran.
+        "cron": tick_status(bot_module),
     }
     if check_webhook:
         try:
@@ -102,6 +105,14 @@ async def _status(request: Request) -> Response:
             data["webhook"] = {"error": f"{type(exc).__name__}: {exc}"}
     else:
         data["webhook"] = "not checked (?register=0)"
+
+    # Ask the deployment's own public URL whether Telegram can actually reach it.
+    # A registered webhook is not a working one: Deployment Protection answers
+    # 401 to Telegram's POST, a disconnected domain answers 404 — and without
+    # this knock the page would happily report a healthy bot that never replies.
+    data["public"] = await webhook_reachability()
+    data["diagnostics"] = webhook_diagnostics(
+        data["webhook"] if isinstance(data.get("webhook"), dict) else {}, data["public"])
 
     if request.query.get("check") == "1":
         data["prices"] = await _price_check(bot_module)
@@ -129,6 +140,20 @@ async def _price_check(bot_module) -> dict:
             "error": r.get("error"),
         }
     return out
+
+
+def _reachable_label(public: dict) -> str:
+    """One cell that answers "can Telegram's POST reach this deployment?".
+
+    ``None`` (not checked) is said out loud instead of being dressed up as a
+    healthy ✅ — an unchecked deployment is exactly the one that stays silent.
+    """
+    if not isinstance(public, dict) or not public.get("checked"):
+        return f"not checked — {public.get('detail') or 'unknown'}" if isinstance(public, dict) \
+            else "not checked"
+    if public.get("reachable"):
+        return f"yes ✅ — {public.get('url')}"
+    return f"NO ❌ — {public.get('detail')}"
 
 
 # Substrings of exchange errors that mean "this region is blocked, not the merchant".
@@ -175,13 +200,24 @@ def _price_check_presentation(prices: dict, region: str | None) -> tuple[list, l
 def _status_page(data: dict) -> str:
     webhook = data.get("webhook") if isinstance(data.get("webhook"), dict) else {}
     state = data.get("state") or {}
+    public = data.get("public") or {}
+    diagnostics = data.get("diagnostics") or {}
+    cron = data.get("cron") or {}
     warnings = []
     if state.get("warning"):
         warnings.append(str(state["warning"]))
-    if webhook.get("error"):
+    # "The bot is silent" has two causes the page must not confuse: Telegram
+    # never reaches the deployment (protection/domain), or the deployment
+    # answers Telegram with an error. Both are visible here, with the fix.
+    if diagnostics.get("warning"):
+        warnings.append(str(diagnostics["warning"]))
+    elif webhook.get("error"):
         warnings.append(f"webhook not registered: {webhook['error']}")
     elif webhook.get("last_error"):
         warnings.append(f"Telegram's last webhook error: {webhook['last_error']}")
+    tick_warning_text = tick_warning(cron)
+    if tick_warning_text:
+        warnings.append(tick_warning_text)
     if not data.get("group"):
         warnings.append("no group yet — add the bot to your group and tap 👥 Set group.")
     rows: list = [
@@ -191,6 +227,9 @@ def _status_page(data: dict) -> str:
         ("Webhook", webhook.get("url") or (webhook.get("error") or "unknown")),
         ("Pending updates", webhook.get("pending_updates")),
         ("Webhook secret", data.get("webhook_secret")),
+        # Can Telegram's POST actually get in? Only an outside knock can tell.
+        ("Reachable", _reachable_label(public)),
+        ("Last cron run", tick_note(cron)),
         ("State store", f"{state.get('backend')} — "
                         f"{'persistent ✅' if state.get('persistent') else 'NOT persistent ❌'}"),
         ("Database detected", (data.get("database") or {}).get("where")
@@ -206,9 +245,12 @@ def _status_page(data: dict) -> str:
         if not data.get("group") else
         "Add or remove merchants by sending their profile URL to the bot in Telegram.",
         "Prices are posted when /api/tick runs (see \"crons\" in vercel.json): every minute "
-        "on Vercel Pro, once a day on the free Hobby plan.",
+        "on Vercel Pro, once a day on the free Hobby plan — VERCEL.md §5 shows how to get a "
+        "five-minute cadence with a free external scheduler.",
         "Register the webhook again at any time: /api/webhook?register=1",
         "Diagnose empty prices: /api/webhook?check=1 fetches every merchant once and shows errors.",
+        "Bot silent in Telegram? Check the \"Reachable\" row: if Telegram cannot reach the "
+        "deployment, every update is refused — the warning above says how to fix it.",
     ]
     links: list[tuple[str, str]] = []
     if not state.get("persistent"):

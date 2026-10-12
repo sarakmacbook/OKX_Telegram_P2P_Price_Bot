@@ -22,6 +22,8 @@ public URLs are unchanged:
 * ``/api/webhook`` → ``api/webhook.py`` (Telegram updates + the status page)
 * ``/api/tick``    → ``api/tick.py``    (the cron round)
 * ``/api/setup``   → ``api/setup.py``   (first-start page + the settings form)
+* ``/api/health``  → a static ``{"ok": true}`` marker, used to prove from the
+  outside that this deployment is publicly reachable (and cheap to poll)
 * ``/``            → 302 to the status page (``vercel.json`` redirects there as
   well; answering it here too means the page opens even when a request reaches
   the function directly)
@@ -46,7 +48,8 @@ from api import setup as setup_endpoint                  # noqa: E402
 from api import tick as tick_endpoint                   # noqa: E402
 from api import webhook as webhook_endpoint             # noqa: E402
 from serverless import (                                # noqa: E402
-    SETUP_PATH, TICK_PATH, WEBHOOK_PATH, Request, Response, asgi_dispatch,
+    HEALTH_MARKER, HEALTH_PATH, SETUP_PATH, TICK_PATH, WEBHOOK_PATH, Request, Response,
+    asgi_dispatch,
 )
 
 
@@ -64,6 +67,13 @@ async def handle(request: Request) -> Response:
         return await tick_endpoint.handle(request)
     if path == SETUP_PATH:
         return await setup_endpoint.handle(request)
+    if path == HEALTH_PATH:
+        # A static answer with no state, no Telegram call and no side effect: it
+        # is what the status page and the cron use to prove, from the outside,
+        # that Telegram's updates really reach this deployment (Deployment
+        # Protection and wrong domains stop them before the code runs). It is
+        # also a cheap uptime probe for an external scheduler.
+        return Response.json({"ok": True, "app": HEALTH_MARKER, "mode": "webhook (Vercel serverless)"})
     if path == "/":
         return Response("Redirecting to the status page …", 302,
                         content_type="text/plain; charset=utf-8",
