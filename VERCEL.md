@@ -7,11 +7,18 @@ long-running process, so the bot switches to **webhook mode** there:
 |---|---|---|
 | Telegram updates | bot polls Telegram (`getUpdates`) | Telegram **pushes** them to `/api/webhook` |
 | Prices every N seconds | in-process JobQueue | Vercel **Cron** calls `/api/tick` |
-| State (`data.json`) | file next to the bot | **KV / Redis REST** (required — no disk) |
+| State (`data.json`) | file next to the bot | **KV / Redis REST** (no disk — connect it in Telegram, or as an environment pair) |
 | Cost | your server | free tier is usually enough |
 
 Everything else is identical: the same handlers, the same panel, the same
 `data.json`-style state — just stored in a KV store instead of a file.
+
+A database is **not needed to start**. With `BOT_TOKEN` + `ADMIN_IDS` the bot
+comes up, answers in Telegram, and a store is connected whenever you like with
+`/database`; on a diskless host the bot keeps that connection (and the saved
+settings) in a **pinned message of the admin chat**, sealed with the bot token, so
+a recycled instance reconnects by itself. Until a store is connected the group,
+merchants and prices are per-instance — every page and the bot's own panel say so.
 
 ```
 Telegram ──►  https://<your-app>.vercel.app/api/webhook   (every update)
@@ -26,19 +33,20 @@ Vercel Cron ─► https://<your-app>.vercel.app/api/tick      (post prices, cle
 
 * the **bot token** from [@BotFather](https://t.me/BotFather) → `/newbot`
 * your **Telegram ID** from [@userinfobot](https://t.me/userinfobot)
-* a **KV / Redis REST store** (2 minutes, free): Vercel dashboard → your project →
-  **Storage** → *Upstash for Redis* (or the *Vercel KV* integration) → **Connect to
-  project**. Vercel then sets `KV_REST_API_URL` + `KV_REST_API_TOKEN` for you.
-  Just clicking *Create* is enough — the bot only stores one small JSON document.
+* *(recommended, optional)* a **KV / Redis REST store** (2 minutes, free): Vercel
+  dashboard → your project → **Storage** → *Upstash for Redis* (or the *Vercel KV*
+  integration) → **Connect to project**. Vercel then sets `KV_REST_API_URL` +
+  `KV_REST_API_TOKEN` for you. Just clicking *Create* is enough — the bot only
+  stores one small JSON document. Skip it if you would rather connect a database
+  later: send `/database` to the bot and it keeps the credentials in a pinned
+  message of your private chat.
 
-> ⚠️ KV/Redis is required for a Vercel deployment. If `BOT_TOKEN`, `ADMIN_IDS`,
-> or the KV pair is missing, the first-start page shows a redacted checklist and
-> a form for the Telegram credentials and optional bot settings. **Database
-> credentials and backend selection are not editable in the Web UI.** Connect
-> the initial KV/Redis store through Vercel Storage or the deployment
-> environment; Telegram database management becomes available after the bot is
-> running. A local file store is supported on VPS/Docker, but is not persistent
-> on Vercel.
+> ⚠️ Only `BOT_TOKEN` and `ADMIN_IDS` are required. If they are missing, the
+> first-start page shows a redacted checklist and a form for them (plus optional
+> bot settings). **Database credentials and backend selection are not editable in
+> the Web UI** — a store is connected with `/database` in Telegram, or by setting
+> `KV_REST_API_URL` + `KV_REST_API_TOKEN` in the deployment environment. A local
+> file store is supported on VPS/Docker, but is not persistent on Vercel.
 
 ### Three ways to add settings — pick one, or mix
 
@@ -49,8 +57,9 @@ Vercel Cron ─► https://<your-app>.vercel.app/api/tick      (post prices, cle
 | **▲ Dashboard / CLI** | *Settings → Environment Variables*, or `npx vercel env add BOT_TOKEN`; connect the first KV store in *Storage* | **yes** — environment variables apply to new deployments only |
 
 The browser form and the terminal wizard write bot configuration to the same
-place — the connected KV/Redis under `p2p-price-bot:config`, or
-`runtime_config.json` next to the bot's data file when there is no Redis. The
+place — the connected KV/Redis under `p2p-price-bot:config`, the pinned chat
+message on a host without a durable disk (`P2P_TELEGRAM_SETTINGS`), or
+`runtime_config.json` next to the bot's data file. The
 terminal wizard can also select the backend and provide the KV REST pair; use
 `--vercel-env` to save deployment variables to Vercel, then redeploy. Environment
 variables always win over stored values, and `CRON_SECRET` stays
@@ -86,20 +95,21 @@ available if you prefer a fixed secret.
 
 ### Manage a custom database in Telegram
 
-Once the bot is running, send `/database` in a private chat or tap **⚙️ Settings
-→ 🗄 Database**. **➕ Set / change custom database** asks for a Redis-compatible
-REST URL and token, tests the credentials, then migrates the live bot state
-before switching. Credentials are stored separately from deployment-managed
-KV variables. **↩️ Use deployment database** verifies the fallback before
-switching back.
+Send `/database` in a private chat with the bot (or tap **⚙️ Settings → 🗄
+Database**) — this works from the very first start, with no database connected
+anywhere. **➕ Set / change custom database** asks for a Redis-compatible REST URL
+and token, tests the credentials, then migrates the live bot state before
+switching. Credentials are stored separately from deployment-managed KV
+variables. **↩️ Use deployment database** verifies the fallback before switching
+back.
 
-The Vercel first-start database is a bootstrap requirement: connect it through
-**Vercel → Storage** or set the deployment environment variables before Telegram
-can manage a custom store. If a Telegram-selected custom store stops answering
+On a host without a durable disk the connection is kept in a **pinned message of
+that chat**, sealed with the current `BOT_TOKEN`, and read back with `getChat`
+after a restart — so the panel shows `📌 Saved settings …` when the copy is
+readable, and warns when it is not (a deleted pin, or a changed bot token, is the
+only thing that drops it). If a Telegram-selected custom store stops answering
 while the deployment store remains healthy, use **↩️ Use deployment database**;
-the bot verifies the fallback before switching. If the bootstrap store itself
-stops answering, restore its deployment credentials and redeploy so Telegram
-updates can reach the bot again.
+the bot verifies the fallback before switching.
 
 ### Read-only database detection
 
@@ -129,26 +139,30 @@ The Vercel lookup is read-only, cached for five minutes, and best effort:
 * a refused token, offline host or API error is reported in `GET /api/setup`
   JSON (`status.database.error`) — never raised.
 
-> 🔁 A database that no longer answers is shown as **Not responding**. The web
-> UI cannot repair its credentials; restore them in the deployment environment.
-> Use `/database` to switch to a different custom store when the bot is running.
+> 🔁 A database that no longer answers is shown as **Not responding** — the bot
+> keeps running so it can be repaired. The web UI cannot change its credentials;
+> use `/database` in Telegram to switch to a store that answers, or restore the
+> ones in the deployment environment.
 
 ## 2. Deploy
 
 ### Option 1 — the dashboard
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot&env=BOT_TOKEN,ADMIN_IDS&envDescription=BOT_TOKEN%20and%20ADMIN_IDS%20are%20required%3B%20connect%20Upstash%20for%20Redis%20or%20Vercel%20KV%20after%20creating%20the%20project&project-name=p2p-price-bot)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsarakmacbook%2FOKX_Telegram_P2P_Price_Bot&env=BOT_TOKEN,ADMIN_IDS&envDescription=BOT_TOKEN%20and%20ADMIN_IDS%20are%20required%3B%20no%20database%20needed%20to%20start%20%E2%80%94%20connect%20one%20later%20with%20%2Fdatabase%20in%20Telegram%2C%20or%20Upstash%20for%20Redis%20in%20Vercel%20Storage&project-name=p2p-price-bot)
 
 1. **Import** the repository into Vercel.
-2. **Connect storage** — [**Storage**](https://vercel.com/dashboard/stores) →
-   **Upstash for Redis** (or Vercel KV) → **Connect to this project**, then
+2. Set `BOT_TOKEN` and `ADMIN_IDS` in **Settings → Environment Variables** — that
+   is the whole requirement.
+3. *(recommended)* **Connect storage** — [**Storage**](https://vercel.com/dashboard/stores)
+   → **Upstash for Redis** (or Vercel KV) → **Connect to this project**, then
    confirm `KV_REST_API_URL` and `KV_REST_API_TOKEN` exist in the project's
-   environment variables. The web UI only reports whether a database is
-   connected; it has no connect link or credential fields. After the bot starts,
-   custom Redis REST stores can be managed from Telegram with `/database`.
-3. Set `BOT_TOKEN` and `ADMIN_IDS` in **Settings → Environment Variables**.
-4. **Deploy**. If anything is missing, the deployment URL opens the first-start
-   web UI and tells you which redacted checklist item still needs attention.
+   environment variables. Skipping this is allowed: the bot starts without a
+   database and you connect one later with `/database` in Telegram, which keeps
+   the credentials in a pinned message of your chat.
+4. **Deploy**. If something required is missing, the deployment URL opens the
+   first-start web UI and tells you which redacted checklist item still needs
+   attention; a missing database is reported there as a recommendation, not a
+   wall.
 
 ### Option 2 — the Vercel CLI
 
@@ -158,8 +172,8 @@ cd OKX_Telegram_P2P_Price_Bot
 npx vercel                       # link the folder to a Vercel project
 npx vercel env add BOT_TOKEN production
 npx vercel env add ADMIN_IDS production
-npx vercel env add KV_REST_API_URL production        # only if not set by the KV integration
-npx vercel env add KV_REST_API_TOKEN production
+npx vercel env add KV_REST_API_URL production        # optional: the bot also
+npx vercel env add KV_REST_API_TOKEN production      # starts without a database
 npx vercel env add CRON_SECRET production            # recommended: locks down /api/tick
 npx vercel --prod                # deploy with all variables in place
 ```
@@ -266,15 +280,16 @@ in its answer) — anyone who knows the URL could then trigger a post, so set it
 |---|---|---|
 | `BOT_TOKEN` | ✅ | token from @BotFather |
 | `ADMIN_IDS` | ✅ | your Telegram ID(s), comma-separated |
-| `KV_REST_API_URL` + `KV_REST_API_TOKEN` | ✅ | state store (set automatically by the Upstash/KV integration) |
+| `KV_REST_API_URL` + `KV_REST_API_TOKEN` | – (recommended) | state store (set automatically by the Upstash/KV integration). Without it the bot runs but forgets the group, merchants and prices between requests — connect one later with `/database` in Telegram |
 | `UPSTASH_REDIS_REST_URL` + `…_TOKEN`, `REDIS_REST_URL` + `…_TOKEN` | alt. | other Redis-REST providers, same idea |
 | `P2P_STATE_BACKEND` | – (`auto`) | choose `auto`, `redis`, or `file`; use `redis` on Vercel. `file` is intentionally not accepted as persistent Vercel state even when a KV pair exists (`P2P_STORAGE_BACKEND` is an alias) |
 | `P2P_STATE_KEY` | – | key the state lives under (default `p2p-price-bot:state`) |
-| `P2P_DATABASE_LINK` | – (legacy) | destination returned as `connect_database` in JSON status/error responses for scripts. The Web UI and Telegram database panel no longer show an external connect link; use Vercel Storage for the bootstrap store and `/database` for a custom Telegram-managed store. Default `https://vercel.com/dashboard/stores` |
+| `P2P_DATABASE_LINK` | – (legacy) | destination returned as `connect_database` in JSON status/error responses for scripts. The Web UI and Telegram database panel no longer show an external connect link; use `/database` for a custom (or the first) Telegram-managed store, or Vercel Storage for a deployment-managed one. Default `https://vercel.com/dashboard/stores` |
 | `SETUP_SECRET` | – (recommended) | locks the `/api/setup` form: every submission must carry it (form field, `?secret=`, or `Authorization: Bearer`). Without it the form is open while the deployment is unconfigured and closes once it is ready |
 | `VERCEL_TOKEN` (or `P2P_VERCEL_TOKEN`) | – | optional, read-only lookup lets the checklist report which database is connected to the project and whether this deployment has its credentials (needs `VERCEL_PROJECT_ID`, which Vercel exposes when *System Environment Variables* are enabled) |
 | `P2P_VERCEL_PROJECT_ID`, `P2P_VERCEL_TEAM_ID` | – | override the project/team the page asks about (defaults: `VERCEL_PROJECT_ID` / `VERCEL_PROJECT_NAME` and `VERCEL_TEAM_ID`) |
 | `P2P_CONFIG_KEY` | – | key the settings saved by the form / `setup_cli.py` live under (default `p2p-price-bot:config`) |
+| `P2P_TELEGRAM_SETTINGS` | – (`auto`) | where the settings live when no KV pair is configured: `auto` keeps them in a pinned message of the admin chat only on a host without a durable disk, `on` always, `off` never. The pin is sealed with `BOT_TOKEN` and read back with `getChat` |
 | `P2P_RUNTIME_CONFIG_FILE` | – | file those settings live in when there is no Redis (default `runtime_config.json` next to the data file) |
 | `PUBLIC_URL` | – | public URL used to register the webhook; auto-detected from `VERCEL_PROJECT_PRODUCTION_URL`/`VERCEL_URL`, set it for a custom domain or if the page says it cannot tell |
 | `WEBHOOK_SECRET` | – | secret Telegram must send with every update; derived from `BOT_TOKEN` when empty |
@@ -297,7 +312,7 @@ store is selected and persisted through Telegram's private `/database` menu.
 |---|---|---|
 | `/` | `GET` | redirects to `/api/webhook`, so the deployment URL itself opens the status page |
 | `/api/webhook` | `POST` | Telegram updates — verified with `X-Telegram-Bot-Api-Secret-Token` (or `?secret=…`, handy for manual tests); everything else is rejected with 403 |
-| `/api/webhook` | `GET` | first-start setup UI when Telegram settings or the required Vercel KV store are missing; otherwise the health page (JSON for scripts, HTML in a browser) that registers the webhook; `?register=1` forces it, `?register=0` only reports. The page reports database health but has no database credential controls. It also shows **Reachable** (the result of knocking on the public URL — `yes`, `no` with the reason, or `not checked`) and **Last cron run**, and prints the fix for whatever it finds. |
+| `/api/webhook` | `GET` | first-start setup UI when the bot token or an admin id is missing (a database is optional and never blocks it); otherwise the health page (JSON for scripts, HTML in a browser) that registers the webhook; `?register=1` forces it, `?register=0` only reports. The page reports database health but has no database credential controls. It also shows **Reachable** (the result of knocking on the public URL — `yes`, `no` with the reason, or `not checked`) and **Last cron run**, and prints the fix for whatever it finds. |
 | `/api/webhook?check=1` | `GET` | status page + a live price fetch for every merchant — open this when prices are empty to see the per-merchant error |
 | `/api/health` | `GET` | static marker (`{"ok": true, "app": "p2p-price-bot"}`) proving a request reached *this* deployment. It reads no state and calls nothing, so it is the right target for an external uptime check (and the URL the status page knocks on) |
 | `/api/setup` | `GET` | readiness checklist plus a form for Telegram credentials and optional bot settings. Database health is read-only here; database configuration is not editable in the browser. |
@@ -376,7 +391,9 @@ store is selected and persisted through Telegram's private `/database` menu.
 | `vercel build` installs nothing / `ModuleNotFoundError: telegram` | `pyproject.toml` outranks `requirements.txt` on Vercel — the two dependency lists must match (see §8) |
 | Page shows ⚙️ *Setup needed* (or a 500 JSON with a *hint*) | Telegram token/admin settings can be saved in the page form or with `python setup_cli.py`; Vercel KV must be connected through **Storage** or the deployment environment, then redeployed. Database credentials cannot be entered on the page. |
 | `POST /api/setup` answers `403 … the form is locked` | the deployment is configured and healthy → press **🔧 Reconfigure — send me a link** to get a one-time link in Telegram, send `SETUP_SECRET` (set it in the environment first), or change bot settings with `python setup_cli.py` / in the dashboard. Use `/database` in Telegram for custom-store changes. |
-| The bot forgot its group, merchants and prices, but every page says the database is connected | the configured store no longer answers (for example, a deleted/rotated Upstash database or wrong region). `/api/setup` shows **Not responding** but cannot edit database credentials. If a Telegram-selected custom store is down and the deployment store is reachable, use `/database` → **↩️ Use deployment database**. If the bootstrap store is down, restore its Vercel KV/Redis variables in the deployment environment and redeploy. |
+| The bot forgot its group, merchants and prices, but every page says the database is connected | the configured store no longer answers (for example, a deleted/rotated Upstash database or wrong region). `/api/setup` shows **Not responding** but cannot edit database credentials. If a Telegram-selected custom store is down and the deployment store is reachable, use `/database` → **↩️ Use deployment database**; if the deployment store is down, connect a working one with `/database` or restore its Vercel KV/Redis variables and redeploy. |
+| A database connected with `/database` was forgotten after a restart | the pinned chat copy could not be read back: the message was deleted or edited, or `BOT_TOKEN` changed after it was written (the seal is keyed on the token). Connect it again with `/database`, or set `KV_REST_API_URL` + `KV_REST_API_TOKEN` in the deployment environment so it no longer depends on the chat. |
+| The panel says **NOT connected** but I do not have a database yet | that is allowed — the bot runs and cannot remember state until one is connected. Send `/database` → **➕ Set / change custom database** and paste an Upstash/Redis REST URL + token; no redeploy is involved. |
 | 🔧 Reconfigure says *the bot could not reach Telegram* | the token is wrong, revoked, or the admin never pressed *Start* on the bot — so the link cannot be delivered. Fix the token with `python setup_cli.py`, or set `SETUP_SECRET` in the environment and open `/api/setup?secret=…` |
 | The form saved the settings but the next cold start forgot them | they went to the instance's temporary storage because no KV/Redis is connected → connect Upstash/KV, add the pair to the environment and redeploy |
 | Prices are `—`, or `⚠️ …451…` / *restricted* / *forbidden* | the exchange geo-blocks the function's region → keep `"regions": ["fra1"]` in `vercel.json` (EU) and redeploy; diagnose with `/api/webhook?check=1` |

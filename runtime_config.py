@@ -19,16 +19,24 @@ configuration path consistent without exposing database credentials in the Web U
 
 Where the values live follows ``storage.py``:
 
-``redis``  the connected KV/Redis REST store, under the key ``P2P_CONFIG_KEY``
-           (default ``p2p-price-bot:config`` — separate from the bot's state key,
-           so ``python setup_cli.py`` and the setup page never touch groups,
-           merchants or prices).  This is the persistent option on Vercel.
-``file``   ``runtime_config.json`` next to ``data.json`` (override with
-           ``P2P_RUNTIME_CONFIG_FILE``).  It is also used when
-           ``P2P_STATE_BACKEND=file`` explicitly selects the JSON state database.
-           Persistent on a VPS/Docker/local install; **ephemeral** on Vercel,
-           whose filesystem is thrown away with the instance — the setup page
-           says so when it saves there.
+``redis``     the connected KV/Redis REST store, under the key ``P2P_CONFIG_KEY``
+              (default ``p2p-price-bot:config`` — separate from the bot's state
+              key, so ``python setup_cli.py`` and the setup page never touch
+              groups, merchants or prices).  This is the persistent option on
+              Vercel.
+``telegram``  one pinned message in an admin's private chat (``telegram_store``).
+              A serverless host throws its filesystem away with the instance, and
+              an initial KV store used to be a *requirement* before the bot would
+              start at all — so the bot can instead bring itself up, and keep the
+              few settings that make it work (including a database connected
+              later from Telegram with ``/database``) in the chat.  Used when the
+              local file cannot survive and ``P2P_TELEGRAM_SETTINGS`` allows it.
+``file``      ``runtime_config.json`` next to ``data.json`` (override with
+              ``P2P_RUNTIME_CONFIG_FILE``).  It is also used when
+              ``P2P_STATE_BACKEND=file`` explicitly selects the JSON state
+              database.  Persistent on a VPS/Docker/local install; **ephemeral**
+              on Vercel, whose filesystem is thrown away with the instance — that
+              is exactly when the chat copy above takes over.
 
 Nothing here ever raises: an unreadable store logs a warning and yields ``{}``,
 because a deployment that cannot read its settings must still be able to render
@@ -47,6 +55,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import storage
+import telegram_store
 
 log = logging.getLogger("p2p-bot.config")
 
@@ -64,6 +73,14 @@ SECRETS = ("BOT_TOKEN", CUSTOM_REDIS_TOKEN)
 CONFIG_FILE = "runtime_config.json"
 DEFAULT_CONFIG_KEY = "p2p-price-bot:config"
 
+#: Where a deployment can keep the settings while it has no database yet.
+#: ``auto``  only where a local file cannot survive (a serverless function);
+#: ``on``    always use the pinned chat copy when a token and admin id exist;
+#: ``off``   never — keep the settings in the local file, even on Vercel.
+TELEGRAM_SETTINGS_ENV = "P2P_TELEGRAM_SETTINGS"
+_TOKEN_ENV = ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TOKEN")
+_ADMIN_ENV = ("ADMIN_IDS", "ADMINS")
+
 #: How long a warm container reuses the stored values without re-reading them
 #: (one Redis round-trip per request is the alternative; the bot already reads
 #: its state on every request, so this keeps setup off that path).
@@ -71,6 +88,7 @@ CACHE_SECONDS = 30.0
 
 _cache: dict[str, Any] = {"at": 0.0, "values": {}}
 _injected: set[str] = set()          # names apply() wrote into os.environ
+_preferred_chat: dict[str, int | None] = {"id": None}   # the chat the admin is using
 
 
 # ── where the settings are kept ────────────────────────────────────────────
@@ -98,19 +116,107 @@ def config_path(base_dir: str | Path | None = None) -> Path:
     return Path(tempfile.gettempdir()) / CONFIG_FILE      # read-only code dir
 
 
+def _env_value(names: tuple[str, ...]) -> str:
+    """First non-empty value among ``names`` — read from the environment only.
+
+    The chat copy needs a token and an admin id *before* it can read anything, so
+    those two values must come from the deployment environment: taking them from
+    the store would be circular (the settings store cannot authenticate itself).
+    """
+    for name in names:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def telegram_settings_mode() -> str:
+    """``auto`` / ``on`` / ``off`` for the pinned chat copy of the settings."""
+    raw = (os.getenv(TELEGRAM_SETTINGS_ENV) or "").strip().lower()
+    if raw in ("on", "1", "true", "yes", "always"):
+        return "on"
+    if raw in ("off", "0", "false", "no", "never"):
+        return "off"
+    return "auto"
+
+
+def prefer_chat(chat_id) -> None:
+    """Remember the private chat the admin is working in (``None`` clears it).
+
+    The pinned copy lives in a chat, and the chat the admin is *using* is the one
+    that will still be there tomorrow — so the caller (``bot.py``) hands it over
+    whenever a /database flow starts.  Without a hint the first admin id wins.
+    """
+    if chat_id is None:
+        _preferred_chat["id"] = None
+        return
+    try:
+        chat = int(chat_id)
+    except (TypeError, ValueError):
+        return
+    if chat:
+        _preferred_chat["id"] = chat
+
+
+def preferred_chat() -> int | None:
+    """The chat the settings copy should prefer, if the bot knows one yet."""
+    return _preferred_chat["id"]
+
+
+def telegram_config_store(base_dir: str | Path | None = None, timeout: float = 6.0):
+    """The pinned-copy store for this deployment, or ``None`` when it does not apply.
+
+    Applies when the mode allows it, the local settings file cannot survive a
+    restart, and the process has a bot token plus at least one admin id to keep
+    the message in.  Nothing here talks to Telegram: the store is only built, and
+    :meth:`telegram_store.TelegramConfigStore.load` does the (cached) reading.
+    """
+    mode = telegram_settings_mode()
+    if mode == "off":
+        return None
+    if mode == "auto" and not _settings_file_is_ephemeral(base_dir):
+        return None
+    token = _env_value(_TOKEN_ENV)
+    admins: list[int] = []
+    for part in _env_value(_ADMIN_ENV).replace(" ", "").split(","):
+        if part.isdigit():
+            admins.append(int(part))
+    if not token or not admins:
+        return None
+    chat_ids = ([preferred_chat()] if preferred_chat() else []) + \
+               [chat for chat in admins if chat != preferred_chat()]
+    return telegram_store.TelegramConfigStore(token, chat_ids, timeout=timeout)
+
+
+def _settings_file_is_ephemeral(base_dir: str | Path | None = None) -> bool:
+    """Whether the settings file would be thrown away with this instance.
+
+    On a serverless host it always would: Vercel mounts the code read-only and
+    gives ``/tmp`` to a single instance, so ``config_path`` may well be writable
+    while still forgetting everything on the next request.
+    """
+    if storage.serverless_host():
+        return True
+    return not storage.writable(config_path(base_dir))
+
+
 def config_store(base_dir: str | Path | None = None):
     """The bootstrap store for settings, independent of Telegram's custom DB.
 
     A custom state database is selected *from* these settings. Reading this
     configuration from that selected database would create a circular
     dependency on cold starts, so config always uses a deployment-managed KV
-    pair when available, or the local runtime-config file otherwise. The bot's
-    state store still follows ``storage.build_store`` and may be a different DB.
+    pair when available, then the pinned Telegram copy where a local file cannot
+    survive, and otherwise the local runtime-config file. The bot's state store
+    still follows ``storage.build_store`` and may be a different DB.
     """
     choice = storage.state_backend()
     redis = storage.environment_redis_config()
     if choice != "file" and redis:
         return storage.RedisStore(redis[0], redis[1], key=config_key())
+    telegram = telegram_config_store(base_dir)
+    if telegram is not None:
+        return telegram
     return storage.FileStore(config_path(base_dir))
 
 
@@ -175,11 +281,18 @@ def clear(base_dir: str | Path | None = None) -> bool:
 
 
 def describe(base_dir: str | Path | None = None) -> dict:
-    """Public, secret-free description of where the settings would be kept."""
+    """Public, secret-free description of where the settings would be kept.
+
+    ``persistent`` answers "does this survive the next request?" — true for the
+    KV store and for the pinned chat copy, false for a local file on a
+    serverless host that throws its filesystem away.
+    """
     store = config_store(base_dir)
-    return {"store": store.describe(), "backend": store.backend,
+    backend = store.backend
+    return {"store": store.describe(), "backend": backend,
             "state_backend": storage.state_backend(),
-            "persistent": store.backend == "redis"}
+            # The chat copy is not a database, but it does outlive the instance.
+            "persistent": backend in ("redis", "telegram")}
 
 
 # ── into the process environment ───────────────────────────────────────────

@@ -22,6 +22,11 @@ for _var in ("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL", "REDIS_REST_URL",
              "P2P_CUSTOM_KV_REST_API_URL", "P2P_CUSTOM_KV_REST_API_TOKEN"):
     os.environ.pop(_var, None)
 
+# The settings copy that lives in a pinned Telegram message ("auto" on Vercel)
+# would make real API calls from tests that merely set VERCEL=1.  Tests that are
+# *about* that store turn it back on (P2P_TELEGRAM_SETTINGS=on) and fake httpx.
+os.environ["P2P_TELEGRAM_SETTINGS"] = "off"
+
 import pytest  # noqa: E402
 
 

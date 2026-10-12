@@ -153,6 +153,18 @@ def database_link() -> str:
     return DEFAULT_DATABASE_LINK
 
 
+def serverless_host() -> bool:
+    """Whether this process runs on a host that discards its filesystem.
+
+    Vercel sets ``VERCEL=1`` and a handful of related variables; the platform
+    keeps a function's writes only for that one instance.  Used to decide whether
+    a local settings file can be trusted (``runtime_config``) at all, and by the
+    setup checklist to explain what "state database" means here.
+    """
+    return bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV") or os.getenv("VERCEL_URL")
+                or os.getenv("VERCEL_PROJECT_PRODUCTION_URL"))
+
+
 def database_connected(store=None) -> bool:
     """Whether state is kept in a shared Redis-compatible database.
 
@@ -374,12 +386,16 @@ def build_store(base_dir: str | Path, default_name: str = "data.json"):
 
     # ``file`` deliberately reaches this branch even if Redis credentials exist.
     store = _file_store(base_dir, default_name)
-    if store.backend != "redis" and os.getenv("VERCEL"):
-        log.error("Vercel gives every request an ephemeral filesystem %s: the group, the "
-                  "merchants and the prices will not be shared between instances and are lost "
-                  "on the next cold start. Select Redis and connect a KV REST store "
-                  "(KV_REST_API_URL + KV_REST_API_TOKEN — e.g. the Upstash or Vercel KV "
-                  "integration).",
-                  "(/tmp on this deployment)" if store.backend == "file" else "")
+    if store.backend != "redis" and serverless_host():
+        # Not fatal any more: the bot may start without a database and have one
+        # connected later from Telegram (/database).  What must not happen is the
+        # owner believing the state is shared — say what is actually true.
+        log.warning("Vercel gives every request an ephemeral filesystem %s: the group, the "
+                    "merchants and the prices will not be shared between instances and are lost "
+                    "on the next cold start. Connect a Redis-compatible REST store "
+                    "(KV_REST_API_URL + KV_REST_API_TOKEN, e.g. Upstash for Redis) or select a "
+                    "custom one with /database in Telegram — the bot can keep those credentials "
+                    "in a pinned chat message until then.",
+                    "(/tmp on this deployment)" if store.backend == "file" else "")
     log.info("State backend (%s): %s", choice, store.describe())
     return store

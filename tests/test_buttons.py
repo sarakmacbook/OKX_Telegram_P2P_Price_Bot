@@ -298,14 +298,28 @@ def test_database_screen_offers_custom_database_management(bot, monkeypatch):
     assert [b.callback_data for b in buttons] == ["db_custom", "db_check", "panel"]
 
 
+def test_database_screen_never_echoes_the_custom_token(bot, monkeypatch):
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: True)
+    monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_URL", "https://example.upstash.io")
+    monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_TOKEN", "custom-token")
+
+    text = bot.database_text()
+
+    assert "custom-token" not in text
+    assert "example.upstash.io" not in text
+
+
 def test_database_screen_gives_first_start_vercel_steps(bot, monkeypatch):
+    """No database is allowed — so the screen has to say what it costs."""
     monkeypatch.setattr(bot, "db_is_persistent", lambda: False)
     monkeypatch.setenv("VERCEL", "1")
 
     text = bot.database_text()
 
     assert "Vercel" in text and "Storage or environment settings" in text
-    assert "Set custom database" in text
+    assert "Set / change custom database" in text
+    assert "cannot remember" in text                    # the consequence, named
+    assert "pinned message" in text                     # how the choice survives a restart
 
 
 def test_settings_offers_the_database_screen(bot, monkeypatch):

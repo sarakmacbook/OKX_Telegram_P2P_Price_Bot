@@ -18,10 +18,12 @@ The wizard prints the setup-page address when it is done; ``--skip`` skips the
 whole wizard.
 
 The browser and terminal paths write bot settings to the same ``runtime_config``
-store: the connected KV/Redis under ``p2p-price-bot:config``, or
+store: the connected KV/Redis under ``p2p-price-bot:config``, the pinned message
+of an admin chat (on a serverless host, ``P2P_TELEGRAM_SETTINGS`` — the bot keeps
+those values in a chat because a function has no disk), or
 ``runtime_config.json`` next to the bot's data file. The terminal may also set
-backend/REST settings for its deployment. On Vercel, connect an initial persistent
-store in Vercel Storage before Telegram can manage a custom database.
+backend/REST settings for its deployment. No database has to exist first: the bot
+runs without one and ``/database`` in Telegram connects it whenever you like.
 
 ``--vercel-env`` additionally writes the values into the deployment's environment
 variables through the Vercel CLI — the only way to set ``CRON_SECRET``, which
@@ -79,10 +81,10 @@ def skip_message(reason: str = "") -> None:
     print("   Finish Telegram credentials and optional bot settings in the browser;")
     print("   the form does not configure database credentials:\n")
     print(f"     {web_ui_url()}\n")
-    print("   On Vercel, connect the initial KV/Redis store through Storage or the")
-    print("   deployment environment. After the bot starts, use /database in Telegram")
-    print("   for a custom Redis REST store. The terminal can configure backend/pair too;")
-    print("   use --vercel-env to persist those values to the linked Vercel project.\n")
+    print("   No database is needed to start: send /database to the bot in Telegram when")
+    print("   you want one, or connect a KV/Redis store through Vercel Storage. The terminal")
+    print("   can configure backend/pair too; use --vercel-env to persist those values to the")
+    print("   linked Vercel project.\n")
     print("   See stored settings with: python setup_cli.py --show\n")
 
 
@@ -232,8 +234,8 @@ def wizard(args: argparse.Namespace) -> int:
     print("    • here in the terminal (this wizard)")
     print(f"    • later in the browser:  {web_ui_url()}")
     print("  Press Enter to skip bot settings and finish them in the browser later.")
-    print("  Database credentials are not accepted by the browser; use this wizard or")
-    print("  Vercel Storage for the bootstrap store, then Telegram /database for a custom store.\n")
+    print("  Database credentials are not accepted by the browser; connect a store later")
+    print("  with /database in Telegram, or set the pair here / in the deployment env.\n")
     print(f"  settings will be stored in: {info['store']}"
           f"{' (temporary — no KV/Redis connected)' if not info['persistent'] else ''}")
 
@@ -327,7 +329,8 @@ def wizard(args: argparse.Namespace) -> int:
           f"to {runtime_config.describe(ROOT)['store']}")
     if not runtime_config.describe(ROOT)["persistent"]:
         print("   ⚠️ That store is temporary: connect Upstash for Redis (or Vercel KV) to keep")
-        print("      the settings — and the group, merchants and prices — across restarts.")
+        print("      the settings across restarts, or set BOT_TOKEN + ADMIN_IDS in the")
+        print("      deployment environment so the bot can keep them in a pinned chat message.")
 
     if args.vercel_env:
         print("\n☁️ Vercel environment variables:")
@@ -342,9 +345,10 @@ def wizard(args: argparse.Namespace) -> int:
         print(f"   still missing: {', '.join(still_missing)}")
     elif env("VERCEL", "VERCEL_ENV", "VERCEL_URL", "VERCEL_PROJECT_PRODUCTION_URL") \
             and not storage.redis_config():
-        print("\n⚠️ Vercel needs an initial persistent KV/Redis store before the bot can start.")
-        print("   Connect it through Vercel Storage or set the deployment environment variables,")
-        print("   then redeploy. Database credentials are not accepted in the browser form.")
+        print("\n⚠️ The bot starts without a database, but this Vercel deployment cannot")
+        print("   remember anything until one is connected: send /database to the bot in")
+        print("   Telegram (it keeps those credentials in a pinned message), or connect a")
+        print("   KV/Redis store through Vercel Storage and redeploy.")
     elif storage.state_backend() == "redis" and not storage.redis_config():
         print("\n⚠️ Redis was selected, but no REST URL/token pair is available.")
         print("   Set the pair in the deployment environment and run this wizard again.")

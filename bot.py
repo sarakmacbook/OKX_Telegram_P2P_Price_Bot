@@ -2496,6 +2496,63 @@ def _clear_database_edit(u: Update) -> None:
     save()
 
 
+def remember_private_chat(u: Update) -> None:
+    """Tell the settings store which private chat the admin is using.
+
+    On a host that keeps its settings in a pinned message (Vercel without a
+    database yet), the pin belongs in the chat the admin actually works in —
+    that is the one that will still exist after this instance is recycled.
+    Harmless everywhere else: the local file store ignores the hint.
+    """
+    chat = getattr(u, "effective_chat", None)
+    if chat is not None and getattr(chat, "type", "") == "private":
+        try:
+            import runtime_config
+            runtime_config.prefer_chat(getattr(chat, "id", None))
+        except Exception as e:                               # pragma: no cover - defensive
+            log.debug("Could not remember the preferred chat: %s", e)
+
+
+def settings_in_chat() -> bool:
+    """Whether the saved settings live in a pinned message of an admin chat."""
+    try:
+        import runtime_config
+        return runtime_config.describe(BASE_DIR).get("backend") == "telegram"
+    except Exception as e:                                   # pragma: no cover - defensive
+        log.debug("Could not inspect the settings store: %s", e)
+        return False
+
+
+def pinned_copy_note() -> str:
+    """One line about the pinned settings copy, honest about what it is worth.
+
+    The chat copy exists so that a database connected *here* survives a restart
+    of a deployment that has no disk. It is not a database: it holds the few
+    settings values, and it is readable only by this bot token.
+    """
+    return ("📌 The connection details are kept in a pinned message of this chat, so this "
+            "deployment can reconnect by itself after a restart. Deleting that message, or "
+            "changing the bot token, drops the copy — set KV_REST_API_URL + KV_REST_API_TOKEN "
+            "in the deployment environment to make it permanent.")
+
+
+def verify_pinned_settings() -> tuple[bool, str]:
+    """Read the pinned settings copy back; ``(ok, detail)`` — never raises.
+
+    A copy that cannot be read again is worse than none: the admin would believe
+    the database survives, and find out only after a cold start. So the write is
+    verified and the answer is shown in the bot's reply.
+    """
+    try:
+        import runtime_config
+        store = runtime_config.telegram_config_store(BASE_DIR)
+        if store is None:
+            return False, "no admin chat is available for the pinned copy"
+        return probe_store(store, timeout=8.0)
+    except Exception as e:                                   # pragma: no cover - defensive
+        return False, f"{type(e).__name__}: {e}"
+
+
 def set_custom_database(url: str, token: str, update: Update | None = None) -> tuple[bool, str]:
     """Test, persist and select a custom Redis REST database.
 
@@ -2569,8 +2626,10 @@ def use_deployment_database() -> tuple[bool, str]:
             if value is not None:
                 os.environ[name] = value
     if on_vercel() and getattr(fallback, "backend", "none") != "redis":
-        return False, ("There is no deployment-managed Redis database to return to. Keep the "
-                       "custom database selected or connect a Vercel KV/Redis store first.")
+        return False, ("There is no deployment-managed Redis database to go back to, and Vercel "
+                       "cannot keep this state in a local file. Keep the custom database "
+                       "connected, or connect a KV / Redis store for the deployment (Vercel → "
+                       "Storage) and redeploy.")
     if not healthy:
         return False, "The deployment's default store did not answer; the custom database is still active."
 
@@ -2609,13 +2668,18 @@ def database_text():
                "switch to a custom Redis REST endpoint.")
         )
     elif on_vercel():
+        # The bot is *allowed* to run without a database — that is the point of
+        # the button below — but nothing it cannot remember may look healthy.
         state_block = (
-            "⚠️ No shared database is connected: Vercel instances do not share local files, so "
-            "a restart or another instance forgets the state.\n\n"
-            "For the first Vercel start, connect a KV / Redis store through the deployment's "
-            "Storage or environment settings and redeploy. Once the bot is running, use "
-            "<b>Set custom database</b> below to enter a custom Redis REST URL and token here "
-            "in private Telegram."
+            "⚠️ <b>No database connected</b> — the bot runs, but this deployment cannot "
+            "remember: Vercel instances do not share local files, so a restart or another "
+            "instance forgets the group, the merchants and the prices.\n\n"
+            "Use <b>Set / change custom database</b> below to connect a Redis-compatible REST "
+            "database right here: the URL and token are tested, the current group and merchants "
+            "are carried over, and the bot keeps the credentials in a pinned message of this "
+            "chat so it reconnects by itself after a restart. Connecting a KV / Redis store in "
+            "the deployment's Storage or environment settings works too, and is preferred for "
+            "heavy use."
         )
     else:
         state_block = (
@@ -2636,11 +2700,26 @@ def database_text():
     else:
         label = "connected ✅" if persistent else "NOT connected ⚠️"
         outage = ""
+    # Where the *settings* live is a separate question from where the state
+    # lives: on a host without a disk the bot keeps the first in a pinned
+    # message of this chat, which is what lets the second be connected here.
+    settings_note = ""
+    if settings_in_chat():
+        reachable, where = verify_pinned_settings()
+        settings_note = (
+            "\n\n📌 Saved settings (bot token, admin ids, asset) are kept in a pinned message "
+            "of this chat, so this deployment finds them again after a restart — database "
+            "credentials entered here are kept there too."
+            if reachable else
+            f"\n\n⚠️ The pinned settings copy cannot be read back ({html_escape(where)}): this "
+            "deployment may forget its settings when it is recycled. Setting KV_REST_API_URL + "
+            "KV_REST_API_TOKEN (or BOT_TOKEN + ADMIN_IDS) in the deployment environment makes "
+            "them permanent.")
     return (
         f"🗄 <b>Database — state storage</b>\n\n"
         f"Current store: <code>{html_escape(STORE.describe())}</code>\n"
         f"Shared database: <b>{label}</b>\n\n"
-        f"{state_block}{outage}"
+        f"{state_block}{settings_note}{outage}"
     )
 
 def group_label():
@@ -2694,7 +2773,7 @@ def panel_text():
         f"Merchants: {len(state['merchants'])} · Pair: {ASSET}/{FIAT} · every {INTERVAL}s\n"
         f"{cron_line}"
         f"🗄 Database: <b>{'connected ✅' if db_is_persistent() else 'NOT connected ⚠️'}</b>"
-        f"{'' if db_is_persistent() else ' — use /database to configure a custom store'}\n"
+        f"{'' if db_is_persistent() else ' — the bot runs, but cannot remember until one is connected: tap 🗄 Manage database (or /database)'}\n"
         f"💧 Liquidity: <b>{liq}</b> · 🔘 Buttons: <b>{btns}</b> · 🗑 AutoDel: <b>{autodel}</b>\n"
         f"🔄 Btn order: <b>{order_label()}</b> · 🎯 Links: <b>{'EXACT AD' if link_mode() == 'ad' else 'PROFILE'}</b>\n"
         f"🧹 Group cleanup: <b>{html_escape(cleanup)}</b> · 🚪 Join/Left: <b>{joinleft}</b>\n"
@@ -2930,7 +3009,9 @@ async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await notify_admins(c.bot, f"✅ {'Channel' if kind == 'channel' else 'Group'} set to "
                                    f"<b>{html_escape(chat.title or '')}</b>")
         return
-    if is_admin(u): await u.message.reply_html(panel_text(), reply_markup=panel())
+    if is_admin(u):
+        remember_private_chat(u)          # where a pinned settings copy would live
+        await u.message.reply_html(panel_text(), reply_markup=panel())
     else: await u.message.reply_text("⛔ You are not authorized. Ask the bot admin to add your ID.")
 
 async def setgroup(u: Update, c):
@@ -4114,9 +4195,20 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not okay:
             return await u.message.reply_text(
                 f"❌ {html_escape(detail)} Send the token again, or /cancel.")
+        # The copy in this chat is what makes the connection survive a restart
+        # on a host without a disk, so it is said right here — in the message
+        # that reports the new database, not buried in a manual.
+        pin = ""
+        if settings_in_chat():
+            reachable, where = verify_pinned_settings()
+            pin = ("\n\n" + pinned_copy_note() if reachable else
+                   "\n\n⚠️ I could not read the pinned settings copy back (" + where + ") — "
+                   "this deployment may not reconnect by itself after a restart. Keep the URL "
+                   "and token to hand, or set KV_REST_API_URL + KV_REST_API_TOKEN in the "
+                   "deployment environment.")
         return await u.message.reply_html(
             "✅ Custom database connected and selected. Your group, merchants and settings were "
-            "carried over.\n\n" + database_text(),
+            "carried over." + pin + "\n\n" + database_text(),
             reply_markup=database_kb(), disable_web_page_preview=True)
 
     if awaiting in ("banner_url", "banner_gif_url"):
@@ -5022,6 +5114,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if chat is not None and getattr(chat, "type", "") != "private":
             return await q.answer("Manage database settings in a private chat with the bot.",
                                   show_alert=True)
+        remember_private_chat(u)
         await q.answer()
         return await q.edit_message_text(database_text(), parse_mode="HTML",
                                          reply_markup=database_kb(),
@@ -5032,6 +5125,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if chat is not None and getattr(chat, "type", "") != "private":
             return await q.answer("Open the bot in a private chat before sending database credentials.",
                                   show_alert=True)
+        remember_private_chat(u)          # a pinned settings copy belongs in this chat
         edits = edits_of(u)
         edits.pop("db_custom_url", None)
         edit_set(u, "awaiting_custom", "database_url")
@@ -5057,6 +5151,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if chat is not None and getattr(chat, "type", "") != "private":
             return await q.answer("Manage database settings in a private chat with the bot.",
                                   show_alert=True)
+        remember_private_chat(u)
         okay, detail = use_deployment_database()
         await q.answer("Deployment database selected" if okay else "Could not switch database",
                        show_alert=not okay)
@@ -5474,6 +5569,7 @@ async def database_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat = getattr(u, "effective_chat", None)
     if chat is not None and getattr(chat, "type", "") != "private":
         return await u.message.reply_text("Open a private chat with the bot to manage database settings.")
+    remember_private_chat(u)              # a pinned settings copy belongs in this chat
     await u.message.reply_html(database_text(), reply_markup=database_kb(),
                                disable_web_page_preview=True)
 

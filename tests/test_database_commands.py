@@ -282,3 +282,111 @@ def test_unreachable_custom_database_leaves_current_store_untouched(bot, monkeyp
     assert bot.state["group"] == -100123456
     assert bot.storage.custom_redis_config() is None
     runtime_config.invalidate()
+
+
+# ── starting with no database at all (the pinned chat copy) ────────────────
+def test_a_database_is_connected_in_telegram_without_any_deployment_store(
+        bot, monkeypatch, tmp_path):
+    """The flow this feature exists for.
+
+    Vercel, no KV pair, no custom pair, no file that survives a request: the bot
+    still runs, and /database connects a store.  What is written in the chat is
+    the *sealed* settings copy, so the next instance finds the database again
+    instead of asking the admin to type the token a second time.
+    """
+    import runtime_config
+    import storage
+    import telegram_store
+    from test_telegram_store import FakeTelegram          # sibling test module
+
+    class FakeRedisStore:
+        backend = "redis"
+        stores = {}
+
+        def __init__(self, url, token, key="p2p-price-bot:state", timeout=6.0):
+            self.url, self.token, self.key = url, token, key
+
+        def probe(self, timeout=None):
+            return True, "the database answered"
+
+        def load(self):
+            value = self.stores.get((self.url, self.key))
+            return deepcopy(value) if value is not None else None
+
+        def save(self, data):
+            self.stores[(self.url, self.key)] = deepcopy(data)
+
+        def describe(self):
+            return f"redis ({self.url.split('//', 1)[-1]}, key {self.key})"
+
+    api = FakeTelegram()
+    import httpx
+    monkeypatch.setattr(httpx, "post", api.post)
+    telegram_store.reset_cache()
+    runtime_config.invalidate()
+    runtime_config.prefer_chat(ADMIN)
+
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.delenv("P2P_TELEGRAM_SETTINGS", raising=False)     # auto: Vercel, no disk
+    monkeypatch.setenv("BOT_TOKEN", "123456:TOKEN")
+    monkeypatch.setenv("ADMIN_IDS", str(ADMIN))
+    monkeypatch.setenv("P2P_STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.delenv("KV_REST_API_URL", raising=False)
+    monkeypatch.delenv("KV_REST_API_TOKEN", raising=False)
+    monkeypatch.delenv("P2P_CUSTOM_KV_REST_API_URL", raising=False)
+    monkeypatch.delenv("P2P_CUSTOM_KV_REST_API_TOKEN", raising=False)
+    monkeypatch.setattr(bot.storage, "RedisStore", FakeRedisStore)
+    monkeypatch.setattr(bot, "STORE", bot.STORE)
+    monkeypatch.setattr(bot, "_STORE_CONFIG_SIGNATURE", bot._STORE_CONFIG_SIGNATURE)
+
+    # The bot is running with nothing but its token and admin id.
+    assert runtime_config.describe()["backend"] == "telegram"
+    assert bot.db_is_persistent() is False
+
+    okay, detail = bot.set_custom_database("https://custom.example", "custom-secret")
+
+    assert okay and detail == "Custom database connected and selected."
+    assert bot.STORE.backend == "redis"
+    pinned = api.pinned_text(ADMIN)
+    assert pinned.startswith(telegram_store.MARKER)
+    assert "custom-secret" not in pinned, "the chat never shows the token"
+    assert telegram_store.open_sealed(telegram_store.payload_of(pinned), "123456:TOKEN")[
+        runtime_config.CUSTOM_REDIS_TOKEN] == "custom-secret"
+    assert bot.verify_pinned_settings()[0] is True
+    assert "pinned message" in bot.pinned_copy_note()
+
+    # A recycled instance: environment empty, only the chat left.
+    for name in storage.CUSTOM_REDIS_ENV_PAIR:
+        os.environ.pop(name, None)
+    telegram_store.reset_cache()
+    runtime_config.invalidate()
+
+    runtime_config.apply(force=True)
+
+    assert storage.custom_redis_config() == ("https://custom.example", "custom-secret")
+    assert storage.state_backend() == "redis"
+    for name in storage.CUSTOM_REDIS_ENV_PAIR:
+        os.environ.pop(name, None)
+    telegram_store.reset_cache()
+    runtime_config.invalidate()
+
+
+def test_the_database_claim_is_not_made_when_the_copy_cannot_be_read(
+        bot, monkeypatch):
+    """A pin nobody can read back must not be presented as durable storage."""
+    import telegram_store
+    from test_telegram_store import FakeTelegram
+
+    api = FakeTelegram()
+    api.fail = "getChat"
+    import httpx
+    monkeypatch.setattr(httpx, "post", api.post)
+    monkeypatch.setenv("P2P_TELEGRAM_SETTINGS", "on")
+    monkeypatch.setenv("BOT_TOKEN", "123456:TOKEN")
+    monkeypatch.setenv("ADMIN_IDS", str(ADMIN))
+    telegram_store.reset_cache()
+
+    okay, detail = bot.verify_pinned_settings()
+
+    assert okay is False
+    assert "connection refused" in detail

@@ -741,3 +741,40 @@ def test_status_json_carries_the_database_link_too(serverless, webhook, monkeypa
 
     assert status == 200
     assert data["connect_database"] == "https://vercel.com/dashboard/stores"
+
+
+def test_a_vercel_deployment_without_a_database_still_serves_the_status_page(
+        serverless, webhook, monkeypatch):
+    """The requested behaviour: no database, no wall.
+
+    Before this, a Vercel deployment with no KV store answered every request with
+    the setup page and refused to import the bot at all.  Now it starts, and the
+    status page names what is missing (the state is not remembered) and where to
+    fix it (``/database`` in Telegram, or the environment pair).
+    """
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("BOT_TOKEN", "123456:TEST-TOKEN")
+    monkeypatch.setenv("ADMIN_IDS", "424242")
+    for name in ("KV_REST_API_URL", "KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_URL",
+                 "UPSTASH_REDIS_REST_TOKEN", "REDIS_REST_URL", "REDIS_REST_TOKEN",
+                 "P2P_CUSTOM_KV_REST_API_URL", "P2P_CUSTOM_KV_REST_API_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(webhook, "ensure_webhook",
+                        Recorder(result={"url": "https://bot.vercel.app/api/webhook",
+                                         "pending_updates": 0}))
+    serverless.reset_store_probe()
+    serverless.reset_database_detection()
+
+    status, data = asgi_json(webhook.app, method="GET", params={"register": "0"})
+
+    assert status == 200, "the bot runs — this is not a configuration error"
+    assert data["state"]["persistent"] is False
+    assert "no persistent store" in data["state"]["warning"]
+    assert "/database" in data["state"]["warning"]
+
+    setup = serverless.setup_status()
+
+    assert setup["ready"] is True
+    database_check = {item["name"]: item for item in setup["checks"]}["state_store"]
+    assert database_check["required"] is False and database_check["ok"] is False
+    assert "No database yet" in database_check["detail"]

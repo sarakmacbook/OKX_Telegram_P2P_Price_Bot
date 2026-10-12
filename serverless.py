@@ -19,6 +19,13 @@ request is a separate Python invocation, so this module supplies what
                         what is missing (``runtime_config``) without a redeploy —
                         the browser twin of ``python setup_cli.py``.
 
+A database is **not** a startup requirement here.  The bot brings itself up with
+``BOT_TOKEN`` + ``ADMIN_IDS`` alone and connects its store later from Telegram
+(``/database``), whose credentials it keeps in a pinned message of the admin chat
+(``telegram_store``) so a recycled instance finds them again.  Without a store
+the group, the merchants and the prices are not shared between instances, and
+every page and the bot's own menu say so.
+
 It also keeps one initialized PTB ``Application`` per warm container and re-reads
 the shared state store before every request, because Vercel may run several
 instances of the same deployment at once.
@@ -84,8 +91,9 @@ _bot: Any = None
 def get_bot():
     """Import ``bot.py`` (once) and turn a broken configuration into a readable error.
 
-    The preflight also stops a Vercel cron/webhook request from silently using an
-    ephemeral file store when the owner forgot to connect KV/Redis.  Local
+    The preflight only blocks what the bot cannot work without at all: a bot token
+    and an admin id.  A missing database is *not* one of those — the bot starts,
+    says so in Telegram, and gets its store later from ``/database``.  Local
     ``config.json`` installs remain supported by the exception below.
     """
     global _bot
@@ -110,9 +118,9 @@ def get_bot():
         detail = "" if exc.code in (None, 0, 1) else f": {exc.code}"
         raise ConfigError(
             f"bot.py refused to start{detail} — set BOT_TOKEN and ADMIN_IDS in the "
-            "deployment's environment variables (see .env.example) and redeploy. "
-            "A KV/Redis store is required too: without it Vercel forgets the group, "
-            "the merchants and the prices between requests."
+            "deployment's environment variables (see .env.example) and redeploy, or "
+            f"save them on {SETUP_PATH}. A database is not required to start: connect "
+            "one later with /database in Telegram."
         ) from None
     except Exception as exc:                      # pragma: no cover - defensive
         raise ConfigError(f"bot.py could not be imported: {exc!r}") from exc
@@ -135,11 +143,15 @@ def state_status(store: Any = None) -> dict:
         detail = store.describe()
     status = {"backend": backend, "detail": detail, "persistent": persistent}
     if not persistent:
+        # Allowed — the bot starts without a database on purpose — but the state
+        # it cannot keep has to be named, and where to get a database without a
+        # redeploy has to be one sentence away.
         status["warning"] = (
             "no persistent store: Vercel has no writable disk, so the group, the "
             "merchants and the prices are forgotten as soon as this instance is "
-            "recycled. Connect a Redis/KV REST store (KV_REST_API_URL + "
-            "KV_REST_API_TOKEN — e.g. the Upstash or Vercel KV integration)."
+            "recycled. Connect one with /database in a private Telegram chat (the "
+            "bot keeps those credentials in a pinned message, so they survive), or "
+            "set KV_REST_API_URL + KV_REST_API_TOKEN in the deployment environment."
         )
     return status
 
@@ -834,9 +846,9 @@ async def _lifespan(receive, send) -> None:
             return
 
 
-CONFIG_HINT = ("Set BOT_TOKEN, ADMIN_IDS and a KV/Redis store "
-               "(KV_REST_API_URL + KV_REST_API_TOKEN) in the project's environment "
-               "variables, then redeploy.")
+CONFIG_HINT = ("Set BOT_TOKEN and ADMIN_IDS in the project's environment variables, then "
+               "redeploy. A database is not required to start: connect one later with "
+               "/database in Telegram, or set KV_REST_API_URL + KV_REST_API_TOKEN here.")
 
 # Keep these checks in the serverless layer instead of importing bot.py first.  A
 # missing environment variable makes bot.py intentionally call sys.exit() (that
@@ -1101,10 +1113,25 @@ def detect_database(force: bool = False) -> dict:
                 f"Detected on {result['where']} — this deployment has no "
                 "KV_REST_API_URL + KV_REST_API_TOKEN yet, so it cannot use it yet. "
                 "No new database is needed: press Connect to this project again in "
-                "Vercel → Storage (that is what writes the two variables) and redeploy.")
+                "Vercel → Storage (that is what writes the two variables) and redeploy. "
+                "The bot starts either way — a database can also be connected later with "
+                "/database in Telegram.")
 
     _db_detect.update(at=now, key=key, result=result)
     return dict(result)
+
+
+#: The checklist line for a Vercel deployment that has no database yet.  The bot
+#: runs — this is a choice the owner is allowed to make — but nothing that is
+#: supposed to be remembered will be, so the wording has to say what is lost and
+#: how to fix it later without a redeploy.
+NO_DATABASE_DETAIL = (
+    "No database yet — the bot runs, but this deployment cannot remember: the group, the "
+    "merchants and the prices are forgotten between requests. Connect one whenever you like "
+    "with /database in a private Telegram chat (the bot keeps those credentials in a pinned "
+    "message, so they survive a restart), or set KV_REST_API_URL + KV_REST_API_TOKEN in the "
+    "deployment environment."
+)
 
 
 def _local_config_has_credentials() -> bool:
@@ -1161,8 +1188,13 @@ def setup_status() -> dict:
 
     The returned object deliberately contains no token, admin id, Redis URL, or
     other secret.  It is safe to include in the JSON diagnostics response and in
-    the browser UI.  KV is a hard requirement only when the code is actually
-    running on Vercel; file state remains the correct default for VPS/Docker.
+    the browser UI.
+
+    Only a bot token and an admin id block startup.  The state database is
+    reported but never required: the bot runs without one and has it connected
+    later from Telegram (``/database``), whose credentials it keeps in a pinned
+    message of the admin chat so they survive a recycled instance.  File state
+    remains the correct default for VPS/Docker.
     """
     stored = runtime_config.load(ROOT)
     runtime_config.apply(ROOT)                  # environment variables still win
@@ -1246,27 +1278,33 @@ def setup_status() -> dict:
     else:
         state_ok = redis_ok if on_vercel else True
         state_detail = (redis_detail if (redis_ok or detected_elsewhere) else
-                        ("Auto mode will use data.json on this host. Set "
+                        (NO_DATABASE_DETAIL if on_vercel else
+                         "Auto mode will use data.json on this host. Set "
                          "P2P_STATE_BACKEND=redis and connect a KV store to share state."))
 
     if state_broken:
         # Credentials that are present but dead are the failure you never see:
         # every page reports a healthy database while the bot has already
-        # forgotten its group, merchants and prices.  Say so — and keep the
-        # deployment "not ready" so the form that repairs it stays open.
+        # forgotten its group, merchants and prices.  The deployment still runs
+        # — /database in Telegram can switch to a store that answers — but the
+        # item is marked broken so it cannot be mistaken for "never set up".
         state_ok = False
         state_detail = (f"The database credentials are set, but the store does not answer "
                         f"({health['detail']}). The bot forgets its group, merchants and "
-                        "prices until it is reachable again. Restore the database credentials "
-                        "through the deployment environment; database credentials are not "
-                        "accepted on this web page.")
+                        "prices until it is reachable again. Restore them in the deployment "
+                        "environment, or connect another database with /database in Telegram — "
+                        "database credentials are not accepted on this web page.")
 
     checks = [
         _setup_check("bot_token", "Telegram bot token", True, token_ok,
                      token_detail, ("BOT_TOKEN",), source("BOT_TOKEN")),
         _setup_check("admin_ids", "Telegram admin ID", True, admins_ok,
                      admins_detail, ("ADMIN_IDS",), source("ADMIN_IDS")),
-        _setup_check("state_store", "State database", on_vercel, state_ok,
+        # Not required: the bot starts without a database and one can be
+        # connected later from Telegram.  It is still the thing that decides
+        # whether state survives a request, so it stays on the checklist with a
+        # warning badge rather than disappearing.
+        _setup_check("state_store", "State database", False, state_ok,
                      state_detail, ("KV_REST_API_URL", "KV_REST_API_TOKEN", "P2P_STATE_BACKEND"),
                      broken=state_broken,
                      detected=database["where"] if database["found"] else ""),
@@ -1274,34 +1312,11 @@ def setup_status() -> dict:
     blocking = [check for check in checks if check["required"] and not check["ok"]]
     if blocking:
         names = ", ".join(check["variables"][0] for check in blocking)
-        if any(check["name"] in ("bot_token", "admin_ids") for check in blocking):
-            message = ("bot.py refused to start — BOT_TOKEN and ADMIN_IDS are missing. Add them "
-                       f"in the form on {SETUP_PATH}, or run  python setup_cli.py  in a terminal, "
-                       "or set them in the deployment's environment variables and redeploy. "
-                       "A KV/Redis store is required too: without it Vercel forgets the group, "
-                       "the merchants and the prices between requests.")
-        elif state_broken:
-            names = "a reachable KV/Redis database"
-            message = ("The bot cannot work until its database answers again: the credentials "
-                       "are set, but the store does not respond, so the group, the merchants "
-                       "and the prices are being forgotten. Restore the KV / Redis credentials "
-                       "in the deployment environment and redeploy. Database credentials are "
-                       "not accepted on this web page; /database in Telegram manages a custom "
-                       "store after the bot is running.")
-        elif detected_elsewhere:
-            names = "KV_REST_API_URL, KV_REST_API_TOKEN"
-            message = (f"This project already has a database — detected on {database['where']} "
-                       "— but this deployment cannot see its credentials yet. No new database "
-                       "is needed: press Connect to this project again in Vercel → Storage "
-                       "(that is what writes KV_REST_API_URL + KV_REST_API_TOKEN into the "
-                       "environment) and redeploy. Opening this page again then registers the "
-                       "Telegram webhook by itself.")
-        else:
-            message = ("The deployment is missing a persistent KV/Redis store — connect Upstash "
-                       "for Redis or Vercel KV through the hosting provider's Storage / "
-                       "environment settings and redeploy. The Web UI does not accept database "
-                       "credentials; once the bot is running, /database in Telegram can select "
-                       "a custom REST database.")
+        message = ("bot.py refused to start — BOT_TOKEN and ADMIN_IDS are missing. Add them "
+                   f"in the form on {SETUP_PATH}, or run  python setup_cli.py  in a terminal, "
+                   "or set them in the deployment's environment variables and redeploy. "
+                   "A database is not required to start: the bot can run without one and have "
+                   "it connected later from Telegram with /database.")
     else:
         names = ""
         message = ""
@@ -1355,10 +1370,12 @@ SETUP_STEPS = [
     f"1. Add BOT_TOKEN (from @BotFather) and ADMIN_IDS (your Telegram id, from @userinfobot) — "
     f"in the form on {SETUP_PATH}, with  python setup_cli.py  in a terminal, or in the Vercel "
     "dashboard (Settings → Environment Variables).",
-    "2. For Vercel's initial persistent store, connect Upstash for Redis or Vercel KV in "
-    "Vercel → Storage, or set the Redis REST pair in the deployment environment and redeploy. "
-    "The Web UI does not accept database credentials. After the bot starts, use /database in "
-    "a private Telegram chat to add or switch a custom Redis REST database.",
+    "2. Nothing else is required to start: no database has to exist yet. Send /database to the "
+    "bot in a private Telegram chat whenever you want one — that is where a connection is "
+    "added, replaced or removed, and the bot keeps those credentials in a pinned message so "
+    "they survive a restart. Connecting Upstash for Redis or Vercel KV in Vercel → Storage (or "
+    "setting KV_REST_API_URL + KV_REST_API_TOKEN and redeploying) still works and is preferred "
+    "for heavy use.",
     "3. Redeploy (Deployments → ⋯ → Redeploy — changed *environment variables* only apply to new "
     f"deploys), then reopen this page: it registers the Telegram webhook by itself. Settings saved "
     f"on {SETUP_PATH} are applied immediately, no redeploy needed.",
@@ -1377,9 +1394,9 @@ def setup_steps(status: dict | None = None) -> list[str]:
                         "switch a custom Redis REST database.")
         else:
             steps[1] = (f"2. Database detected on {where}, but this deployment does not have "
-                        "its credentials yet. Connect the existing store to the project in "
-                        "Vercel → Storage and redeploy; the Web UI cannot enter credentials. "
-                        "After startup, use /database in Telegram to manage a custom store.")
+                        "its credentials yet. Either connect the existing store to the project "
+                        "in Vercel → Storage and redeploy, or ignore it and connect a database "
+                        "later with /database in Telegram — the bot starts without one.")
     return steps
 
 
@@ -1664,8 +1681,11 @@ def _next_steps(status: dict) -> list[str]:
                 f"(python setup_cli.py), then reopen {WEBHOOK_PATH}."]
     steps = [f"Open {WEBHOOK_PATH} — it registers the Telegram webhook and shows the status page."]
     if not status["runtime"]["persistent"] and status["serverless"]:
-        steps.append("Connect Upstash for Redis (or Vercel KV) and redeploy, or everything — "
-                     "including these settings — is forgotten with this instance.")
+        steps.append("These settings are in temporary storage and are lost on a cold start. "
+                     "Add KV_REST_API_URL + KV_REST_API_TOKEN in the deployment environment "
+                     "and redeploy, or check the bot token and admin id: with both of those in "
+                     "the environment, the bot keeps its settings in a pinned message of your "
+                     "private chat instead (P2P_TELEGRAM_SETTINGS=auto).")
     steps.append("In Telegram: /start → 👥 Set group → paste a merchant URL → 🟢 Auto: ON.")
     return steps
 
@@ -1740,8 +1760,10 @@ def save_setup_values(values: dict, verify: bool = True) -> dict:
         warnings.append(f"{name} is also set in the deployment environment — other instances keep "
                         f"using that value until you change or remove it there.")
     if _looks_like_vercel() and not runtime_config.describe(ROOT)["persistent"]:
-        warnings.append("These settings are in temporary storage and will be lost on a cold start. "
-                        "Connect a KV/Redis store in the deployment environment and redeploy.")
+        warnings.append("These settings are in temporary storage and will be lost on a cold "
+                        "start. Set BOT_TOKEN and ADMIN_IDS in the deployment environment so "
+                        "the bot can keep them in a pinned message of your chat, connect a "
+                        "KV/Redis store, and redeploy.")
 
     status = setup_status()
     return _save_report(True, errors=[], warnings=warnings, notes=notes,
@@ -1809,10 +1831,11 @@ def _select_field(name: str, label: str, hint: str, options: tuple[tuple[str, st
 def _setup_form(status: dict, values: dict | None = None) -> str:
     """The browser half of the setup: add the required settings, no redeploy.
 
-    The values go to ``POST /api/setup``, which stores them where ``storage.py``
-    can keep them (the connected KV/Redis, or ``runtime_config.json``) and applies
-    them to this instance immediately.  ``SETUP_SECRET`` locks the form; without
-    it the form closes as soon as the deployment is ready.
+    The values go to ``POST /api/setup``, which stores them where
+    ``runtime_config`` can keep them (the connected KV/Redis, the pinned message
+    of an admin chat, or ``runtime_config.json``) and applies them to this
+    instance immediately.  ``SETUP_SECRET`` locks the form; without it the form
+    closes as soon as the deployment is ready.
     """
     values = values or {}
     runtime = status.get("runtime") or {}
@@ -1881,10 +1904,16 @@ def _setup_form(status: dict, values: dict | None = None) -> str:
 
     store = runtime.get("store") or "the connected store"
     persistent = runtime.get("persistent")
-    where = ("Stored in the connected KV/Redis — it survives restarts and redeploys."
-             if persistent else
-             "Stored next to the bot's state file. On Vercel that is temporary storage: "
-             "connect a KV/Redis store to keep it across restarts.")
+    if runtime.get("backend") == "telegram":
+        where = ("Stored in a pinned message of your private chat with the bot — that is how "
+                 "they survive restarts while no KV/Redis store is connected. Deleting that "
+                 "message (or changing the bot token) drops the saved copy.")
+    elif persistent:
+        where = "Stored in the connected KV/Redis — it survives restarts and redeploys."
+    else:
+        where = ("Stored next to the bot's state file. On Vercel that is temporary storage: "
+                 "set BOT_TOKEN + ADMIN_IDS in the environment so the bot can keep the "
+                 "settings in your chat, or connect a KV/Redis store.")
     return f"""
     <section class="panel" aria-labelledby="form-title">
       <div class="panel-heading">
@@ -1986,19 +2015,22 @@ def _setup_page(message: str, status: dict, banner: tuple[str, str] | None = Non
                          "deployment.")
     elif detection.get("found"):
         database_step = ("A KV / Redis store was detected, but its credentials are not in this "
-                         "deployment yet. Connect it through Vercel Storage and redeploy.")
+                         "deployment yet. Connect it through Vercel Storage and redeploy — or "
+                         "ignore this and connect a database later in Telegram.")
     else:
-        database_step = ("Before the bot can start on Vercel, connect a KV / Redis store through "
-                         "Vercel Storage or add its REST URL and token to the deployment "
-                         "environment, then redeploy.")
+        database_step = ("Nothing to do here: the bot starts without a database. It cannot "
+                         "remember the group, the merchants or the prices until one is "
+                         "connected — connect it any time in Telegram.")
     storage_step_markup = (
         '<article class="step"><span class="number">2</span><div>'
-        '<h3>Provide persistent storage</h3><p>' + html.escape(database_step) + ' '
-        'This web UI does not accept database credentials. Once the bot is running, use '
-        '<code>/database</code> in a private Telegram chat to add or switch a custom Redis '
-        'REST database.</p></div></article>')
+        '<h3>Connect a database (optional at first)</h3><p>' + html.escape(database_step) + ' '
+        'This web UI does not accept database credentials. Use <code>/database</code> in a '
+        'private Telegram chat to add or switch a Redis REST database; the bot keeps those '
+        'credentials in a pinned message of that chat, so they survive a restart of this '
+        'deployment.</p></div></article>')
     deployment_note = (
-        "This deployment is running on Vercel, so persistent storage is required."
+        "This deployment is running on Vercel: start without a database, connect one later "
+        "in Telegram, and its state becomes durable."
         if status.get("serverless") else
         "The checklist also works locally; file storage is supported outside Vercel."
     )

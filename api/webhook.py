@@ -2,10 +2,13 @@
 
 Telegram delivers every update here, and the payload is handed to the same
 handlers the polling bot uses (``bot.register_handlers``).  ``GET`` is the
-first-start setup UI when the deployment is missing its credentials or KV store
+first-start setup UI when the deployment is missing its bot token or admin id
 (the same page ``/api/setup`` serves, form included); once configured it becomes
-the status page you open after deploying. It registers the webhook when it is
-missing and shows what the bot knows — state store, group, merchants, cron note.
+the status page you open after deploying.  No database has to exist first: the
+bot starts without one and is given its store later in Telegram (``/database``),
+which keeps those credentials in a pinned message of the admin chat.  The page
+registers the webhook when it is missing and shows what the bot knows — state
+store, group, merchants, cron note.
 ``GET ?check=1`` additionally fetches every merchant once, so empty or broken
 prices can be diagnosed (geo-blocked regions, stale merchant links).
 
@@ -233,7 +236,8 @@ def _status_page(data: dict) -> str:
         ("State store", f"{state.get('backend')} — "
                         f"{'persistent ✅' if state.get('persistent') else 'NOT persistent ❌'}"),
         ("Database detected", (data.get("database") or {}).get("where")
-                              or "none found — connect a KV/Redis store"),
+                              or "none found — connect one with /database in Telegram, "
+                                 "or in the deployment environment"),
         ("Group", data.get("group_title") or data.get("group") or "not set"),
         ("↪️ Forward to group", f"{data.get('forward_from')} — "
                                 f"{'ON' if data.get('forwarding') else 'OFF'}"),
@@ -254,10 +258,12 @@ def _status_page(data: dict) -> str:
     ]
     links: list[tuple[str, str]] = []
     if not state.get("persistent"):
-        notes.append("Make the bot remember anything: connect a KV/Redis store through Vercel "
-                     "Storage or the deployment environment, then redeploy. The Web UI does not "
-                     "accept database credentials; use /database in Telegram to switch a custom "
-                     "REST database after the bot is running.")
+        notes.append("Make the bot remember anything: send /database to the bot in a private "
+                     "Telegram chat — that is where a Redis REST database is connected, and the "
+                     "bot keeps its credentials in a pinned message so they survive a restart. "
+                     "Connecting Upstash for Redis or Vercel KV in Vercel → Storage (then "
+                     "redeploying) works too; the Web UI itself accepts no database "
+                     "credentials.")
     # Change non-database bot settings without a redeploy; database changes are
     # managed in the private Telegram /database menu.
     links.append(("⚙️ Reconfigure setup", "/api/setup"))
