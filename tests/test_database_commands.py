@@ -78,7 +78,8 @@ def test_database_command_and_custom_setup_are_admin_private_only(bot):
 def test_custom_database_conversation_never_repeats_the_token(bot, monkeypatch):
     admin_id = next(iter(bot.ADMINS))
     bot.state.setdefault("edits", {})[str(admin_id)] = {"awaiting_custom": "database_url"}
-    url_message = SimpleNamespace(text="https://redis.example", reply_text=AsyncMock())
+    url_message = SimpleNamespace(text="https://redis.example", reply_text=AsyncMock(),
+                                  reply_html=AsyncMock())
     url_update = _private_update(bot, url_message)
 
     asyncio.run(bot.on_text(url_update, SimpleNamespace()))
@@ -86,6 +87,9 @@ def test_custom_database_conversation_never_repeats_the_token(bot, monkeypatch):
     edit = bot.state["edits"][str(admin_id)]
     assert edit["awaiting_custom"] == "database_token"
     assert edit["db_custom_url"] == "https://redis.example"
+    # …and the ask says the two provider lines can be pasted together
+    asked = (url_message.reply_html.await_args or url_message.reply_text.await_args).args[0]
+    assert "UPSTASH_REDIS_REST_TOKEN" in asked
 
     selected = Mock(return_value=(True, "Custom database connected and selected."))
     monkeypatch.setattr(bot, "set_custom_database", selected)

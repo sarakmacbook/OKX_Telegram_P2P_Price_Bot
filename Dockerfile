@@ -13,7 +13,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py exchanges.py adlinks.py storage.py ./
+# Every module the bot imports at runtime — not just the ones it imports first:
+# storage.py loads database_adapters.py when a database was selected, and
+# runtime_config.py + telegram_store.py hold the settings (and the /database
+# credentials) that let a container reconnect after a restart.  Missing one
+# here is what makes /database fail inside the image with "No module named …".
+COPY bot.py exchanges.py adlinks.py storage.py database_adapters.py \
+     runtime_config.py telegram_store.py setup_cli.py ./
 
 # config & data are mounted as volumes; bot creates them if missing.
 # For non-interactive docker, pass env vars: BOT_TOKEN, ADMIN_IDS, ASSET, FIAT, INTERVAL

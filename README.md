@@ -91,7 +91,18 @@ P2P_DATA_DIR=/var/lib/p2p-bot
 P2P_STATE_BACKEND=redis
 KV_REST_API_URL=https://your-store.upstash.io
 KV_REST_API_TOKEN=your-token
+
+# Upstash's own names work too (copy the two lines the dashboard shows)
+UPSTASH_REDIS_REST_URL=https://superb-xxxxx.upstash.io
+UPSTASH_REDIS_REST_TOKEN=gQAA…
 ```
+
+With `auto` (the default) either pair is picked up with no other setting, and the
+same two lines can be pasted in a private Telegram chat instead of a redeploy —
+see [Add or switch a custom database in Telegram](#add-or-switch-a-custom-database-in-telegram).
+In Docker the pair goes in `.env` next to the compose file
+(`docker compose` reads it); the container image ships every module `/database`
+needs.
 
 The setup page intentionally has **no database selector or credential fields**.
 Use `P2P_STATE_BACKEND` in the deployment environment or
@@ -152,11 +163,27 @@ database types are supported**:
    | 🍃 MongoDB | `mongodb://user:password@db-host:27017/p2p` (or `mongodb+srv://…`) |
    | 🔴 Redis | `redis://user:password@db-host:6379/0` (or `rediss://…`) |
    | 🗃 SQLite | `sqlite:///home/user/p2p-bot.db` (or the plain file path) |
-   | ⚡ Redis REST | `https://…` REST URL **and** its token (Upstash / Vercel KV — two messages) |
+   | ⚡ Redis REST | `https://…` REST URL **and** its token (Upstash / Vercel KV) |
 
 3. The bot tests the connection before switching and copies the live group,
    merchants and settings to the new store. Passwords and tokens are never
    repeated in the bot's reply.
+
+**No need to tap a button first.** A connection pasted into the private chat is
+recognized on its own — the URI names its own type — and so is the two-line
+snippet every Redis-REST provider hands out:
+
+```
+UPSTASH_REDIS_REST_URL="https://superb-xxxxx.upstash.io"
+UPSTASH_REDIS_REST_TOKEN="gQAA…"
+```
+
+Paste both lines in one message (or just the URL, then the token) and the bot
+tests and switches. `KV_REST_API_URL` + `KV_REST_API_TOKEN` (Vercel KV) and
+`REDIS_REST_URL` + `REDIS_REST_TOKEN` are recognized the same way, quotes and a
+leading `export` included. `/database <uri>` works for a single-line URI too.
+This also means the type chooser cannot be broken by a host that recycles the
+instance between the button tap and the URI (Vercel): the URI alone is enough.
 
 The custom database overrides the deployment's normal store without changing
 those environment variables (it is remembered as `P2P_CUSTOM_DB_URL` in the
@@ -875,6 +902,33 @@ readable). For a permanent connection that does not depend on a chat message, se
 `KV_REST_API_URL` + `KV_REST_API_TOKEN` in the deployment environment, or
 `BOT_TOKEN` + `ADMIN_IDS` (which is what allows the copy to be written at all).
 
+### I picked a database type, sent the connection, and nothing happened
+
+The prompt answers a question the bot asked in an earlier update, and on a
+serverless host (Vercel) that update may have been handled by an instance that is
+already gone — so a remembered draft cannot be relied on. Nothing is lost: send
+the connection again. A URI is recognized on its own (`mysql://…`, `postgres://…`,
+`mongodb://…`, `redis://…`, `sqlite://…` or a `.db` file path), the two provider
+lines can be pasted together in one message, and `/database <uri>` connects from
+the command itself. If the bot answers *“Not a supported merchant URL”*, the
+message was not recognized as a database at all — check for a typo in the variable
+name (`UPSTASH_REDIS_REST_URL`, `KV_REST_API_URL`, `REDIS_REST_URL`) or send the
+plain URI instead.
+
+### Docker: `/database` fails with `No module named 'runtime_config'`
+
+Fixed in the image itself (the Dockerfile copies every module the bot imports,
+including the database adapters and the settings store). Rebuild so the image
+matches the code:
+
+```bash
+docker compose build --no-cache && docker compose up -d
+```
+
+Until then the container starts with `${P2P_CUSTOM_DB_URL}` set but refuses to
+boot (`No module named 'database_adapters'`), and connecting a database from
+Telegram cannot be saved.
+
 ---
 
 ## 🧪 Tests
@@ -968,7 +1022,8 @@ cp ~/p2p-bot-backup-*/config.json ~/p2p-bot-backup-*/data.json <install-dir>/
 | `bot.py` | Telegram bot (panel, buttons, auto-poster) |
 | `exchanges.py` | Binance / Bybit / OKX / Bitget adapters + URL parser |
 | `adlinks.py` | Exact-ad deep-link templates (Binance / Bybit / OKX / Bitget) |
-| `storage.py` | State backends: `data.json` file, optional Upstash/Redis REST, read-only fallback |
+| `storage.py` | State backends: `data.json` file, Upstash/Vercel-KV/Redis REST, read-only fallback |
+| `database_adapters.py` | The database types `/database` can connect (SQLite, MySQL/MariaDB, PostgreSQL, MongoDB, Redis) + recognition of pasted URIs and provider env lines |
 | `runtime_config.py` | The settings the setup page / `setup_cli.py` store (KV key, pinned chat message, or `runtime_config.json`), validated and applied before `bot.py` starts |
 | `telegram_store.py` | The settings copy in a pinned admin-chat message (sealed with the bot token) that lets a diskless deployment reconnect its database after a restart |
 | `setup_cli.py` | Terminal setup wizard — every question skippable (`--skip`, `--show`, `--clear`, `--vercel-env`) |
