@@ -2157,7 +2157,11 @@ def database_uri_prompt(kind: str) -> str:
         f"{title}\n\n{ask}\n\n"
         f"I test the connection first, then carry your group, merchants and settings over. {secrecy}"
         " — the details stay in this private chat (sealed in the pinned settings copy on "
-        "deployments without a disk). Send /cancel to stop."
+        "deployments without a disk). Send /cancel to stop.\n\n"
+        "💡 A type does not have to be picked first: a URI pasted here is recognized on its own, "
+        "and the two lines a provider hands out for a Redis REST database "
+        "(<code>UPSTASH_REDIS_REST_URL</code> + <code>UPSTASH_REDIS_REST_TOKEN</code>, or the "
+        "Vercel KV pair) can be pasted together in one message."
         f"{warning}"
     )
 
@@ -2884,7 +2888,12 @@ def database_text():
         f"🗄 <b>Database — state storage</b>\n\n"
         f"Current store: <code>{html_escape(STORE.describe())}</code>\n"
         f"Shared database: <b>{label}</b>\n\n"
-        f"{state_block}{settings_note}{outage}"
+        f"{state_block}{settings_note}{outage}\n\n"
+        "💡 Connect any database by pasting it into this chat: a connection URI "
+        "(<code>mysql://…</code>, <code>postgres://…</code>, <code>mongodb://…</code>, "
+        "<code>redis://…</code>, <code>sqlite://…</code>), a .db file path, or the whole "
+        "two-line pair a provider hands out — <code>UPSTASH_REDIS_REST_URL=\"…\"</code> and "
+        "<code>UPSTASH_REDIS_REST_TOKEN=\"…\"</code> — tested before anything is switched."
     )
 
 def group_label():
@@ -4327,33 +4336,156 @@ async def on_sticker(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 # ── add merchant by pasting URL / handle custom msg input ──
+#: The ``awaiting_custom`` values that belong to the database conversation.
+DATABASE_AWAITING = ("database_uri", "database_url", "database_token")
+
+
+def database_example(kind: str) -> str:
+    """The one example URI ``database_adapters`` shows for ``kind``."""
+    try:
+        from database_adapters import EXAMPLES
+    except Exception as e:                                   # pragma: no cover - defensive
+        log.debug("Database examples unavailable: %s", e)
+        return "postgres://user:password@db-host:5432/p2p" if kind == "postgres" else "sqlite:///path.db"
+    return EXAMPLES.get(kind, "")
+
+
+def database_paste(text: str) -> dict | None:
+    """The database a pasted message holds, or ``None`` when it holds none.
+
+    ``database_adapters`` knows the shapes (a connection URI, a SQLite file
+    name, the ``UPSTASH_REDIS_REST_URL`` + ``…_TOKEN`` lines a provider
+    dashboard offers, a bare REST endpoint).  Imported lazily like the other
+    adapter call sites, so a deployment missing the module simply never
+    recognizes a paste instead of failing every message.
+    """
+    try:
+        from database_adapters import parse_database_paste
+    except Exception as e:                               # pragma: no cover - defensive
+        log.debug("Database paste detection unavailable: %s", e)
+        return None
+    paste = parse_database_paste(text)
+    return paste if paste.get("action", "none") != "none" else None
+
+
+async def reply_database_selected(u: Update) -> None:
+    """The reply that reports a store switch — including the pinned-copy status.
+
+    The copy in the chat is what makes the connection survive a restart on a
+    host without a disk, so it is said right here — in the message that reports
+    the new database, not buried in a manual.
+    """
+    pin = ""
+    if settings_in_chat():
+        reachable, where = verify_pinned_settings()
+        pin = ("\n\n" + pinned_copy_note() if reachable else
+               "\n\n⚠️ I could not read the pinned settings copy back (" + html_escape(where) + ") — "
+               "this deployment may not reconnect by itself after a restart. Keep the "
+               "connection details to hand, or set KV_REST_API_URL + KV_REST_API_TOKEN in "
+               "the deployment environment.")
+    await u.message.reply_html(
+        "✅ Custom database connected and selected. Your group, merchants and settings were "
+        "carried over." + pin + "\n\n" + database_text(),
+        reply_markup=database_kb(), disable_web_page_preview=True)
+
+
+async def handle_database_paste(u: Update, txt: str, awaiting=None) -> bool:
+    """Connect the database a message holds — ``True`` when it was one.
+
+    Called for every private admin message that is not mid-way through another
+    editor, so a database can be connected by pasting it: the connection URI,
+    a SQLite file name, or the provider's two environment lines at once.  That
+    is also what makes the button flow work on a host that recycles instances
+    between two updates (Vercel): the URI no longer needs a remembered draft,
+    because the URI itself names its type.
+    """
+    paste = database_paste(txt)
+    if paste is None:
+        return False
+    action = paste["action"]
+
+    if action == "rest_pair":
+        okay, detail = set_custom_database(paste["url"], paste["token"], update=u)
+        if not okay:
+            await u.message.reply_text(f"❌ {html_escape(detail)} Send /cancel to stop.")
+            return True
+        await reply_database_selected(u)
+        return True
+
+    if action == "rest_url":
+        import runtime_config
+        clean_url, error = runtime_config.clean_redis_rest_url(paste["url"])
+        if error:
+            await u.message.reply_text(f"❌ {error} Send /cancel to stop.")
+            return True
+        edits = edits_of(u)
+        edits["db_custom_url"] = clean_url
+        edit_set(u, "awaiting_custom", "database_token")
+        provider = paste.get("provider") or "Redis REST"
+        await u.message.reply_html(
+            f"🔑 <b>{html_escape(provider)}</b> — now send the <b>REST token</b> for that "
+            "database. I will test the connection without repeating the token in my reply. "
+            "You can also paste both lines at once:\n"
+            "<code>UPSTASH_REDIS_REST_URL=\"https://…\"</code>\n"
+            "<code>UPSTASH_REDIS_REST_TOKEN=\"…\"</code>\n\n"
+            "Keep them in this private chat; send /cancel to stop.",
+            reply_markup=KB([[B("❌ Cancel", callback_data="db_cancel")]]))
+        return True
+
+    if action == "rest_token":
+        url = edit_get(u, "db_custom_url", "")
+        if not url:
+            await u.message.reply_html(
+                "🔑 That is a REST token — I also need its <b>URL</b>. Paste the two lines "
+                "together, for example:\n"
+                "<code>UPSTASH_REDIS_REST_URL=\"https://…upstash.io\"</code>\n"
+                "<code>UPSTASH_REDIS_REST_TOKEN=\"…\"</code>\n\n"
+                "…or open /database to pick a database type.",
+                disable_web_page_preview=True)
+            return True
+        okay, detail = set_custom_database(url, paste["token"], update=u)
+        if not okay:
+            await u.message.reply_text(f"❌ {html_escape(detail)} Send the token again, or /cancel.")
+            return True
+        await reply_database_selected(u)
+        return True
+
+    # A connection URI (or a SQLite file name).  A type already chosen in the
+    # menu is enforced, so a mismatched URI still gets its explanation; without
+    # a draft the URI's own scheme decides.
+    kind = edit_get(u, "db_kind", "") if awaiting in DATABASE_AWAITING else ""
+    okay, detail = set_custom_database_uri(kind or "", paste["uri"], update=u)
+    if not okay:
+        await u.message.reply_text(
+            f"❌ {html_escape(detail)} Send another connection URI, or /cancel to stop.")
+        return True
+    await reply_database_selected(u)
+    return True
+
+
 async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u) or u.effective_chat.type != "private": return
     txt = u.message.text.strip()
 
     awaiting = edit_get(u, "awaiting_custom")
 
+    # Anything that *is* a database connection is acted on immediately — even
+    # with no pending question — so connecting one never depends on a draft
+    # that another instance may have kept (see ``handle_database_paste``).
+    # Mid-way through an unrelated editor the message stays with that editor.
+    if not awaiting or awaiting in DATABASE_AWAITING:
+        if await handle_database_paste(u, txt, awaiting):
+            return
+
     if awaiting == "database_uri":
+        # Reachable only for text the paste detector did not recognize: the
+        # chosen type still gets to explain what it expected.
         kind = edit_get(u, "db_kind", "")
         okay, detail = set_custom_database_uri(kind, txt, update=u)
         if not okay:
             return await u.message.reply_text(
                 f"❌ {html_escape(detail)} Send another connection URI, or /cancel to stop.")
-        # The copy in this chat is what makes the connection survive a restart
-        # on a host without a disk, so it is said right here — in the message
-        # that reports the new database, not buried in a manual.
-        pin = ""
-        if settings_in_chat():
-            reachable, where = verify_pinned_settings()
-            pin = ("\n\n" + pinned_copy_note() if reachable else
-                   "\n\n⚠️ I could not read the pinned settings copy back (" + where + ") — "
-                   "this deployment may not reconnect by itself after a restart. Keep the "
-                   "connection details to hand, or set KV_REST_API_URL + KV_REST_API_TOKEN in "
-                   "the deployment environment.")
-        return await u.message.reply_html(
-            "✅ Custom database connected and selected. Your group, merchants and settings were "
-            "carried over." + pin + "\n\n" + database_text(),
-            reply_markup=database_kb(), disable_web_page_preview=True)
+        return await reply_database_selected(u)
 
     if awaiting == "database_url":
         import runtime_config
@@ -4362,8 +4494,7 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return await u.message.reply_text(f"❌ {error} Send /cancel to stop.")
         edits = edits_of(u)
         edits["db_custom_url"] = clean_url
-        edits["awaiting_custom"] = "database_token"
-        save()
+        edit_set(u, "awaiting_custom", "database_token")
         return await u.message.reply_text(
             "🔑 Now send the <b>REST token</b> for that database. I will test the connection "
             "without repeating the token in my reply. Keep it in this private chat; send /cancel "
@@ -4379,27 +4510,14 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not url:
             _clear_database_edit(u)
             return await u.message.reply_text(
-                "❌ The database URL draft expired. Open /database and start again.",
+                "❌ The database URL draft expired. Open /database and start again "
+                "(or paste the URL and the token together — the bot accepts both lines at once).",
                 reply_markup=database_kb())
         okay, detail = set_custom_database(url, clean_token, update=u)
         if not okay:
             return await u.message.reply_text(
                 f"❌ {html_escape(detail)} Send the token again, or /cancel.")
-        # The copy in this chat is what makes the connection survive a restart
-        # on a host without a disk, so it is said right here — in the message
-        # that reports the new database, not buried in a manual.
-        pin = ""
-        if settings_in_chat():
-            reachable, where = verify_pinned_settings()
-            pin = ("\n\n" + pinned_copy_note() if reachable else
-                   "\n\n⚠️ I could not read the pinned settings copy back (" + where + ") — "
-                   "this deployment may not reconnect by itself after a restart. Keep the URL "
-                   "and token to hand, or set KV_REST_API_URL + KV_REST_API_TOKEN in the "
-                   "deployment environment.")
-        return await u.message.reply_html(
-            "✅ Custom database connected and selected. Your group, merchants and settings were "
-            "carried over." + pin + "\n\n" + database_text(),
-            reply_markup=database_kb(), disable_web_page_preview=True)
+        return await reply_database_selected(u)
 
     if awaiting in ("banner_url", "banner_gif_url"):
         if txt.lower() == "/cancel":
@@ -4605,7 +4723,10 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
         return await u.message.reply_text(
             "❌ Not a supported merchant URL (Binance / Bybit / OKX / Bitget).   /start\n"
-            "📤 Turn on auto-forward in ⚙️ Settings to repost messages like this one instead.")
+            "📤 Turn on auto-forward in ⚙️ Settings to repost messages like this one instead.\n"
+            "🗄 For a database: send /database, or paste the connection URI "
+            "(mysql://…, postgres://…, redis://…) or the UPSTASH_REDIS_REST_URL + "
+            "UPSTASH_REDIS_REST_TOKEN lines straight into this chat.")
     msg = await u.message.reply_text("⏳ Checking merchant…")
     async with httpx.AsyncClient(headers=HEADERS, timeout=15) as cl:
         r = await fetch(cl, m)
@@ -5321,6 +5442,11 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await q.edit_message_text(
             "🗄 <b>Add / change database</b> — every database type is supported. Pick one; "
             "you then send its connection URI and I test it before switching.\n\n"
+            "💡 Picking a type is only a shortcut: a pasted URI is recognized on its own "
+            "(<code>mysql://…</code>, <code>postgres://…</code>, <code>mongodb://…</code>, "
+            "<code>redis://…</code>, <code>sqlite://…</code> or a .db file path), and the "
+            "<code>UPSTASH_REDIS_REST_URL</code> + <code>UPSTASH_REDIS_REST_TOKEN</code> lines "
+            "(or Vercel KV's pair) can be pasted together in one message.\n\n"
             "A custom database replaces the current store — your group, merchants and settings "
             "are carried over.",
             parse_mode="HTML", reply_markup=database_type_kb(),
@@ -5376,7 +5502,13 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "Send the Redis-compatible <b>REST URL</b> for your database. It must be an "
             "<code>https://</code> endpoint (or <code>http://</code> for a private/self-hosted "
             "service). The bot tests it before switching and carries your current state over.\n\n"
-            "Keep both the URL and token in this private chat — never send them to a group. "
+            "⚡ <b>Fastest:</b> paste the two lines your provider shows — for example:\n"
+            "<code>UPSTASH_REDIS_REST_URL=\"https://…upstash.io\"</code>\n"
+            "<code>UPSTASH_REDIS_REST_TOKEN=\"…\"</code>\n"
+            "Both lines in one message is enough; the URL alone also works and I ask for the "
+            "token next. (Vercel KV's <code>KV_REST_API_URL</code> + "
+            "<code>KV_REST_API_TOKEN</code> pair is recognized just the same.)\n\n"
+            "Keep the URL and token in this private chat — never send them to a group. "
             "Send /cancel to stop.",
             parse_mode="HTML", reply_markup=KB([[B("❌ Cancel", callback_data="db_cancel")]]))
 
@@ -5805,12 +5937,27 @@ async def cancel_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("Nothing to cancel.", reply_markup=panel())
 
 async def database_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """/database — check, connect or switch the bot's state database."""
+    """/database — check, connect or switch the bot's state database.
+
+    A connection right in the command works too:
+    ``/database postgres://user:password@host:5432/p2p`` (or a SQLite file
+    name, or a REST endpoint — the plain-text command cannot carry a two-line
+    pair, but pasting those lines as a message works at any time).
+    """
     if not is_admin(u): return
     chat = getattr(u, "effective_chat", None)
     if chat is not None and getattr(chat, "type", "") != "private":
         return await u.message.reply_text("Open a private chat with the bot to manage database settings.")
     remember_private_chat(u)              # a pinned settings copy belongs in this chat
+    text = " ".join(str(part) for part in (getattr(c, "args", None) or [])).strip()
+    if text:
+        if await handle_database_paste(u, text, edit_get(u, "awaiting_custom")):
+            return
+        return await u.message.reply_html(
+            f"❌ That is not a database connection I recognize. Send a connection URI "
+            f"(<code>{html_escape(database_example('postgres'))}</code>), a SQLite file name, "
+            "or the two REST lines as a message.\n\n" + database_text(),
+            reply_markup=database_kb(), disable_web_page_preview=True)
     await u.message.reply_html(database_text(), reply_markup=database_kb(),
                                disable_web_page_preview=True)
 

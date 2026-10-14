@@ -235,3 +235,54 @@ def test_guard_download_rejects_web_pages(tmp_path):
     proc = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
     assert proc.returncode == 0, f"guard_download misjudged a payload:\n{proc.stdout}\n{proc.stderr}"
     assert "web page, not a file" in proc.stderr, "guard must explain what went wrong"
+
+
+# ── the Docker image gets every module the bot imports ────────────────────
+def _dockerfile_copied_python_files() -> set[str]:
+    """The ``.py`` files the Dockerfile COPYs (line continuations joined)."""
+    text = (ROOT / "Dockerfile").read_text(encoding="utf-8").replace("\\\n", " ")
+    copied: set[str] = set()
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if parts and parts[0].upper() == "COPY":
+            copied.update(part.rsplit("/", 1)[-1] for part in parts[1:]
+                          if part.endswith(".py"))
+    return copied
+
+
+def _local_imports(name: str) -> set[str]:
+    """Local modules one file imports — at module level or lazily in a function."""
+    text = (ROOT / f"{name}.py").read_text(encoding="utf-8")
+    names = {match.group(1) for match in
+             re.finditer(r"(?m)^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", text)}
+    return {imported for imported in names if (ROOT / f"{imported}.py").exists()}
+
+
+def _runtime_modules(entry: str = "bot.py") -> set[str]:
+    """Everything the bot may import while running, following local imports."""
+    seen, queue = set(), [entry]
+    while queue:
+        name = queue.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        queue.extend(_local_imports(name[:-3]) if name.endswith(".py") else [])
+    return seen
+
+
+def test_the_docker_image_copies_every_module_the_bot_imports():
+    """A missing COPY is a runtime ``ModuleNotFoundError`` inside the container.
+
+    ``runtime_config`` / ``database_adapters`` / ``telegram_store`` are imported
+    lazily — the bot starts without them and only fails when an admin opens
+    /database or a database was selected in the environment, which is exactly
+    the kind of breakage that ships unnoticed.
+    """
+    needed = {name[:-3] if name.endswith(".py") else name for name in _runtime_modules("bot.py")}
+    copied = {name[:-3] if name.endswith(".py") else name
+              for name in _dockerfile_copied_python_files()}
+    missing = sorted(needed - copied)
+
+    assert not missing, (
+        "Dockerfile does not COPY " + ", ".join(missing) +
+        " — the image then fails with \"No module named …\" at runtime")

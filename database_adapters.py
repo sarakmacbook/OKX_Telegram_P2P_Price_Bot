@@ -40,6 +40,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import re
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -111,6 +112,53 @@ UNSUPPORTED_URI_ERROR = (
     + " (or a plain file path for SQLite)."
 )
 
+# ── pasted connections ─────────────────────────────────────────────────────
+# Every Redis-REST provider documents itself as a pair of environment
+# variables, and that snippet is what an owner has on their clipboard:
+#
+#     UPSTASH_REDIS_REST_URL="https://superb-xxxxx.upstash.io"
+#     UPSTASH_REDIS_REST_TOKEN="gQAA…"
+#
+# A single environment-variable *name* is what makes a pasted pair
+# unambiguous (a lone URL could be a merchant page), so only the names below
+# are recognized.  Order decides which pair wins when a paste holds several.
+
+#: ``NAME`` → ``(role, provider)`` for the REST pairs a database is published as.
+REST_ENV_VARS = {
+    "UPSTASH_REDIS_REST_URL": ("url", "Upstash Redis"),
+    "UPSTASH_REDIS_REST_TOKEN": ("token", "Upstash Redis"),
+    "KV_REST_API_URL": ("url", "Vercel KV / Upstash"),
+    "KV_REST_API_TOKEN": ("token", "Vercel KV / Upstash"),
+    "REDIS_REST_URL": ("url", "Redis REST"),
+    "REDIS_REST_TOKEN": ("token", "Redis REST"),
+    "P2P_CUSTOM_KV_REST_API_URL": ("url", "custom Redis REST"),
+    "P2P_CUSTOM_KV_REST_API_TOKEN": ("token", "custom Redis REST"),
+}
+
+#: Preference order for the providers above.
+REST_PROVIDERS = ("Upstash Redis", "Vercel KV / Upstash", "Redis REST", "custom Redis REST")
+
+#: Variables that hold a ``redis://`` TCP URI instead of a REST half.
+REDIS_URI_VARS = ("KV_URL", "UPSTASH_REDIS_URL", "REDIS_URL", "REDIS_TLS_URL")
+
+#: Variables that hold a whole connection URI (copied out of a ``.env`` file).
+DATABASE_URI_VARS = ("P2P_CUSTOM_DB_URL", "DATABASE_URL", "DATABASE_URI", "POSTGRES_URL",
+                     "MYSQL_URL", "MONGODB_URI", "MONGO_URL")
+
+#: One ``NAME=value`` assignment per match — quotes optional, ``export`` allowed,
+#: and several assignments may share a line.  Values stop at unquoted blanks.
+_ASSIGNMENT = re.compile(
+    r"""(?:^|[\s;,])?(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"""
+    r"""(?:"([^"\n]*)"|'([^'\n]*)'|`([^`\n]*)`|([^\s;,\n]+))""",
+    re.MULTILINE)
+
+#: A pasted SQLite file name — the one path shape that is safe to act on
+#: without any prompt, because no merchant link ever looks like this.
+_SQLITE_FILE = re.compile(r"^(?:[~/.]?[\w .~/-]*/)?[\w .~-]+\.(?:db|sqlite|sqlite3)$", re.IGNORECASE)
+
+#: Hosts that are a database endpoint rather than a website.
+_REST_HOST_WORDS = ("upstash", "redis", "valkey", "redislabs", "keydb", "dragonfly")
+
 
 class DriverMissing(RuntimeError):
     """The driver for one database type is not importable here."""
@@ -130,6 +178,115 @@ def kind_from_uri(text: str) -> str | None:
     if not scheme:                                   # a plain file path
         return "sqlite"
     return SCHEME_TO_KIND.get(scheme)
+
+
+def looks_like_rest_endpoint(text: str) -> bool:
+    """Whether a pasted ``https://…`` URL is a database REST endpoint.
+
+    Only hosts that name a database product qualify, so a merchant page an
+    admin pastes is never mistaken for a database.
+    """
+    raw = str(text or "").strip().rstrip("/")
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port                      # a malformed port raises here
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return False
+    if port is not None and not 1 <= port <= 65535:          # ``host:0`` is not a service
+        return False
+    if parsed.path not in ("", "/"):
+        return False
+    host = (parsed.hostname or "").lower()
+    return any(word in host for word in _REST_HOST_WORDS)
+
+
+def parse_rest_env_block(text: str) -> dict:
+    """The Redis-REST pair found in pasted ``NAME=value`` lines.
+
+    Understands what a provider dashboard hands out — one or two lines, quotes
+    single or double, a leading ``export``, ``;``/``,`` separators, both halves
+    on one line and in either order — and ignores everything it does not know
+    (a read-only token, unrelated variables, surrounding prose)::
+
+        {"url": …, "token": …, "provider": …, "uri": …}
+
+    ``uri`` carries a ``KV_URL``-style ``redis://`` value when the paste has one
+    instead of a REST pair.  An empty result means the text held no recognized
+    variable at all.
+    """
+    urls: dict[str, str] = {}
+    tokens: dict[str, str] = {}
+    uri = ""
+    for match in _ASSIGNMENT.finditer(str(text or "")):
+        name = match.group(1).upper()
+        value = next((part for part in match.groups()[1:] if part is not None), "").strip()
+        value = value.rstrip(";,").strip()
+        if not value:
+            continue
+        entry = REST_ENV_VARS.get(name)
+        if entry is not None:
+            role, provider = entry
+            target = urls if role == "url" else tokens
+            target.setdefault(provider, value)
+            continue
+        if name in REDIS_URI_VARS and value.lower().startswith(("redis://", "rediss://")):
+            uri = uri or value
+        elif name in DATABASE_URI_VARS and "://" in value and kind_from_uri(value):
+            uri = uri or value
+    for provider in REST_PROVIDERS:
+        if provider in urls or provider in tokens:
+            return {"url": urls.get(provider, ""), "token": tokens.get(provider, ""),
+                    "provider": provider, "uri": uri}
+    return {"url": "", "token": "", "provider": "", "uri": uri}
+
+
+def parse_database_paste(text: str) -> dict:
+    """What a message sent to the bot is: a database connection, or nothing.
+
+    A private admin chat is the one place where a bare phrase must never be
+    guessed at (the same message may be a merchant URL, a caption or prose), so
+    this only answers for text that names itself:
+
+    ``rest_pair``   one or two ``UPSTASH_REDIS_REST_URL`` / ``…_TOKEN`` lines
+                    (or the Vercel KV / Redis-REST equivalents) — the snippet a
+                    provider dashboard offers to copy;
+    ``rest_url``    the URL half alone — a token is still needed;
+    ``rest_token``  the token half alone — the URL is still needed;
+    ``uri``         a connection URI with an explicit scheme (``mysql://…``,
+                    ``postgres://…``, ``mongodb://…``, ``redis://…``,
+                    ``sqlite://…``) or a pasted SQLite file name;
+    ``none``        everything else.
+
+    Never raises: an unusable paste is simply ``none``.
+    """
+    raw = str(text or "").strip()
+    if not raw or len(raw) > 8192:
+        return {"action": "none"}
+    block = parse_rest_env_block(raw)
+    if block["url"] and block["token"]:
+        return {"action": "rest_pair", "url": block["url"], "token": block["token"],
+                "provider": block["provider"]}
+    if block["url"]:
+        return {"action": "rest_url", "url": block["url"], "provider": block["provider"]}
+    if block["token"]:
+        return {"action": "rest_token", "token": block["token"], "provider": block["provider"]}
+    if block["uri"]:
+        return {"action": "uri", "kind": kind_from_uri(block["uri"]) or "",
+                "uri": block["uri"]}
+    if "\n" not in raw and len(raw) <= 2048:        # one line only: never guess from prose
+        if "://" in raw:
+            kind = kind_from_uri(raw)
+            if kind:
+                return {"action": "uri", "kind": kind, "uri": raw}
+        elif _SQLITE_FILE.match(raw):
+            return {"action": "uri", "kind": "sqlite", "uri": raw}
+        if looks_like_rest_endpoint(raw):
+            return {"action": "rest_url", "url": raw, "provider": "Redis REST"}
+    return {"action": "none"}
 
 
 def driver_hint(kind: str) -> str | None:

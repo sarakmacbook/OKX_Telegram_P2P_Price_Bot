@@ -108,6 +108,14 @@ switching. Credentials are stored separately from deployment-managed KV
 variables. **↩️ Use deployment database** verifies the fallback before switching
 back.
 
+Buttons are optional: a connection pasted into that private chat is recognized
+on its own, and the two lines Upstash (or Vercel KV) shows can be pasted
+together in one message — `UPSTASH_REDIS_REST_URL="https://…upstash.io"` plus
+`UPSTASH_REDIS_REST_TOKEN="…"` (`KV_REST_API_URL` + `KV_REST_API_TOKEN` work the
+same). That matters on Vercel as much as anywhere: two updates can land in two
+different instances, so the URI's own scheme — not a remembered button tap —
+decides the type.
+
 On a host without a durable disk the connection is kept in a **pinned message of
 that chat**, sealed with the current `BOT_TOKEN`, and read back with `getChat`
 after a restart — so the panel shows `📌 Saved settings …` when the copy is
@@ -398,7 +406,8 @@ store is selected and persisted through Telegram's private `/database` menu.
 | `POST /api/setup` answers `403 … the form is locked` | the deployment is configured and healthy → press **🔧 Reconfigure — send me a link** to get a one-time link in Telegram, send `SETUP_SECRET` (set it in the environment first), or change bot settings with `python setup_cli.py` / in the dashboard. Use `/database` in Telegram for custom-store changes. |
 | The bot forgot its group, merchants and prices, but every page says the database is connected | the configured store no longer answers (for example, a deleted/rotated Upstash database or wrong region). `/api/setup` shows **Not responding** but cannot edit database credentials. If a Telegram-selected custom store is down and the deployment store is reachable, use `/database` → **↩️ Use deployment database**; if the deployment store is down, connect a working one with `/database` or restore its Vercel KV/Redis variables and redeploy. |
 | A database connected with `/database` was forgotten after a restart | the pinned chat copy could not be read back: the message was deleted or edited, or `BOT_TOKEN` changed after it was written (the seal is keyed on the token). Connect it again with `/database`, or set `KV_REST_API_URL` + `KV_REST_API_TOKEN` in the deployment environment so it no longer depends on the chat. |
-| The panel says **NOT connected** but I do not have a database yet | that is allowed — the bot runs and cannot remember state until one is connected. Send `/database` → **➕ Add / change database** and pick any database type (MySQL / MariaDB, PostgreSQL, MongoDB, Redis, SQLite — one connection URI — or an Upstash/Redis REST URL + token); no redeploy is involved. |
+| The panel says **NOT connected** but I do not have a database yet | that is allowed — the bot runs and cannot remember state until one is connected. Send `/database` → **➕ Add / change database** and pick any database type (MySQL / MariaDB, PostgreSQL, MongoDB, Redis, SQLite — one connection URI — or an Upstash/Redis REST URL + token); no redeploy is involved. Pasting the `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` lines straight into the chat works just as well, without tapping anything. |
+| I picked a database type, sent the URI, and nothing happened | the instance that asked may not be the one that received the URI (Vercel recycles functions between updates, so a remembered draft can be gone). Nothing is lost: send the URI again — it is recognized by itself — or paste the two provider lines together. Every database type can also be connected from the command: `/database postgres://user:password@host:5432/p2p`. |
 | 🔧 Reconfigure says *the bot could not reach Telegram* | the token is wrong, revoked, or the admin never pressed *Start* on the bot — so the link cannot be delivered. Fix the token with `python setup_cli.py`, or set `SETUP_SECRET` in the environment and open `/api/setup?secret=…` |
 | The form saved the settings but the next cold start forgot them | they went to the instance's temporary storage because no KV/Redis is connected → connect Upstash/KV, add the pair to the environment and redeploy |
 | Prices are `—`, or `⚠️ …451…` / *restricted* / *forbidden* | the exchange geo-blocks the function's region → keep `"regions": ["fra1"]` in `vercel.json` (EU) and redeploy; diagnose with `/api/webhook?check=1` |
