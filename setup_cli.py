@@ -119,6 +119,20 @@ class Prompts:
                 return False
             print("  ❌ Answer y or n.")
 
+    def text(self, label: str, default: str = "", *, secret: bool = False) -> str:
+        """A question whose Enter means \"the suggested value\" (not \"skip\")."""
+        shown = "" if secret or not default else f" [{default}]"
+        value = self._read(f"  {label}{shown}: ", secret=secret)
+        return value or default
+
+    def choose(self, label: str, count: int, default: int = 0) -> int:
+        """A numbered menu answer from ``0`` to ``count`` (``0`` = skip)."""
+        while True:
+            value = self._read(f"  {label} [{default}]: ").strip() or str(default)
+            if value.isdigit() and int(value) <= count:
+                return int(value)
+            print(f"  ❌ Answer a number from 0 to {count}.")
+
     def ask(self, label: str, variable: str, *, current: str = "", secret: bool = False,
             check=None, hint: str = "") -> str:
         """One optional question: Enter keeps/skips, a wrong answer is asked again."""
@@ -268,13 +282,19 @@ def wizard(args: argparse.Namespace) -> int:
                                           current=env("INTERVAL", default="60"),
                                           check=interval_check)
 
+    custom_db = ""
+    if not args.yes and not args.kv_url and not args.kv_token:
+        custom_db = ask_database(prompts)
+    if custom_db:
+        answers[runtime_config.CUSTOM_DB_URL] = custom_db
+
     # The terminal can set the deployment backend explicitly. The browser form
     # has no database selector or credential fields.
     if args.state_backend:
         answers["P2P_STATE_BACKEND"] = args.state_backend
 
     kv_url, kv_token = args.kv_url, args.kv_token
-    if not storage.redis_config() and not args.yes:
+    if not storage.redis_config() and not args.yes and not custom_db:
         print("\n  State store — needed on Vercel, optional on a VPS/Docker install.")
         print("  (Upstash for Redis → REST API → endpoint + token.)")
         kv_url = kv_url or prompts.ask("KV/Redis REST URL", "KV_REST_API_URL",
@@ -358,6 +378,79 @@ def wizard(args: argparse.Namespace) -> int:
         print("\n✅ Nothing else is required — open the status page to register the webhook.")
     print()
     return 0
+
+
+#: The database types the terminal can connect, in menu order.
+DATABASE_MENU = (
+    ("sqlite", "SQLite (a local file)"),
+    ("mysql", "MySQL / MariaDB"),
+    ("postgres", "PostgreSQL"),
+    ("mongo", "MongoDB"),
+    ("redis", "Redis (TCP)"),
+)
+
+
+def ask_database(prompts: Prompts) -> str:
+    """Optional: connect a database now, one question at a time.
+
+    Returns the connection URI when the test succeeded, or ``""`` (skipped or
+    not reachable). Nothing is typed as a URI; the password is read without
+    echo on a terminal.
+    """
+    from database_adapters import (KIND_LABELS, FIELD_LABELS, FIELD_STEPS,
+                                   build_store, default_sqlite_path, describe_spec, driver_hint,
+                                   field_default, parse_database_uri, uri_from_fields,
+                                   validate_field)
+
+    print("\n  Database (optional) — where the group, merchants and prices are kept.")
+    print("  Skip it to finish in the browser; /database in Telegram works too.")
+    for number, (_kind, label) in enumerate(DATABASE_MENU, 1):
+        print(f"    {number}) {label}")
+    choice = prompts.choose("Choose a database, 0 to skip", len(DATABASE_MENU))
+    if not choice:
+        return ""
+    kind = DATABASE_MENU[choice - 1][0]
+    label = KIND_LABELS.get(kind, kind)
+    hint = driver_hint(kind)
+    if hint:
+        print(f"  ❌ {hint.replace('<code>', '').replace('</code>', '')}")
+        return ""
+
+    if kind == "sqlite":
+        uri_text = prompts.text("SQLite file path", default_sqlite_path())
+        spec, error = parse_database_uri("sqlite", uri_text)
+        if error:
+            print(f"  ❌ {error}")
+            return ""
+    else:
+        answers: dict[str, str] = {}
+        for field in FIELD_STEPS:
+            while True:
+                value = prompts.text(FIELD_LABELS[field] + (" (Enter = none)" if field == "password"
+                                                            else ""),
+                                     field_default(kind, field), secret=field == "password")
+                clean, error = validate_field(kind, field, value)
+                if not error:
+                    answers[field] = clean
+                    break
+                print(f"  ❌ {error.replace('<code>', '').replace('</code>', '')}")
+        uri_text, error = uri_from_fields(kind, answers)
+        if error:
+            print(f"  ❌ {error}")
+            return ""
+        spec, error = parse_database_uri(kind, uri_text)
+
+    print(f"  … testing {describe_spec(spec)}")
+    state_key = (os.getenv("P2P_STATE_KEY") or storage.DEFAULT_KEY).strip() or storage.DEFAULT_KEY
+    reachable, detail = storage.probe_store(build_store(spec, key=state_key), timeout=6.0)
+    if not reachable:
+        password = spec.get("password") or ""
+        detail = detail.replace(password, "•••") if password else detail
+        print(f"  ❌ The {label} database did not answer — {detail}.")
+        print("     The database was not saved (the other answers were). Run this wizard again to fix it.")
+        return ""
+    print(f"  ✓ {label} answered")
+    return spec["uri"]
 
 
 def _probe(url: str, token: str) -> tuple[bool, str]:

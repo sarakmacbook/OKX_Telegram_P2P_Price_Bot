@@ -106,7 +106,10 @@ needs.
 
 The setup page intentionally has **no database selector or credential fields**.
 Use `P2P_STATE_BACKEND` in the deployment environment or
-`python setup_cli.py --state-backend file|redis` to choose a backend. Keep the
+`python setup_cli.py --state-backend file|redis` to choose a backend.
+`python setup_cli.py` also asks, after the bot settings, which database to connect —
+SQLite, MySQL / MariaDB, PostgreSQL, MongoDB or Redis — one question at a time, and
+tests it before saving. Press **0** to skip it and connect one later in Telegram. Keep the
 Redis REST pair in `.env` / deployment environment; for Vercel, the terminal
 wizard can push provided values with `--vercel-env` (then redeploy). The
 `P2P_STORAGE_BACKEND` alias is accepted.
@@ -168,6 +171,18 @@ database types are supported**:
 3. The bot tests the connection before switching and copies the live group,
    merchants and settings to the new store. Passwords and tokens are never
    repeated in the bot's reply.
+
+**No URI to write? Use the step-by-step form.** Tap **🧩 Enter details step by step**
+instead of pasting a URI (MySQL / MariaDB, PostgreSQL, MongoDB or Redis). The bot asks
+one question at a time — server address, port (suggested), database name, user, password —
+and builds the connection itself, so a password with `@`, `/`, `#` or `%` needs no
+escaping. Tap **⏭ Use suggested** (or **⏭ Skip**) to keep a suggested value, `/cancel` to stop.
+The password is never kept in the bot's draft. A failed test starts again at the first question
+with your answers kept as suggestions.
+
+For a single-machine install, **🗃 SQLite → ✅ Use default file** connects a local database
+in one tap, at `p2p-bot.db` next to the bot's data (or in `P2P_DATA_DIR`). It is not offered on
+Vercel, which discards local files.
 
 **Hosted providers work as they publish themselves.** The TLS options a
 provider puts on the connection string are read and honoured instead of

@@ -2151,10 +2151,12 @@ def database_uri_prompt(kind: str) -> str:
                f"<code>{EXAMPLES[kind]}</code>")
     hint = driver_hint(kind)
     warning = f"\n\n⚠️ {hint}" if hint else ""
+    tip = ("\n\n🧩 Prefer not to write a URI? Tap <b>Enter details step by step</b> — I ask the server, "
+           "port, database, user and password one at a time." if kind != "sqlite" else "")
     secrecy = ("The password is never shown back" if kind != "sqlite"
                else "Nothing but this bot ever sees the path")
     return (
-        f"{title}\n\n{ask}\n\n"
+        f"{title}\n\n{ask}{tip}\n\n"
         f"I test the connection first, then carry your group, merchants and settings over. {secrecy}"
         " — the details stay in this private chat (sealed in the pinned settings copy on "
         "deployments without a disk). Send /cancel to stop.\n\n"
@@ -2164,6 +2166,115 @@ def database_uri_prompt(kind: str) -> str:
         "Vercel KV pair) can be pasted together in one message."
         f"{warning}"
     )
+
+def database_uri_kb(kind: str) -> KB:
+    """Buttons under the "send the URI" prompt: step by step, or one-tap SQLite."""
+    rows = []
+    if kind != "sqlite":
+        rows.append([B("🧩 Enter details step by step", callback_data=f"db_fields:{kind}")])
+    elif not storage.serverless_host():
+        rows.append([B("✅ Use default file", callback_data="db_sqlite_default")])
+    rows.append([B("❌ Cancel", callback_data="db_cancel")])
+    return KB(rows)
+
+
+def _reply_to(message):
+    """A ``reply(text, **kwargs)`` that answers in the message's chat."""
+    async def reply(text, **kwargs):
+        return await message.reply_html(text, **kwargs)
+    return reply
+
+
+def _field_current(edits: dict, kind: str, field: str) -> str:
+    """The value a step-by-step question suggests: the earlier answer, else the default.
+
+    The password is never suggested: it is not kept in the draft at all.
+    """
+    from database_adapters import field_default
+    if field == "password":
+        return ""
+    drafts = edits.get("db_fields") or {}
+    return str(drafts.get(field, field_default(kind, field)))
+
+
+def database_field_prompt(u: Update, kind: str, step: int) -> tuple[str, KB]:
+    """The question for one step of the step-by-step connection."""
+    from database_adapters import FIELD_LABELS, FIELD_STEPS, KIND_LABELS
+    field = FIELD_STEPS[step]
+    current = _field_current(edits_of(u), kind, field)
+    hints = {
+        "host": "The address of the database server: <code>localhost</code> when it runs on this "
+                "machine, otherwise its host name or IP address.",
+        "port": "The port the server listens on.",
+        "database": "The database that holds the bot's data. It must already exist on the server.",
+        "user": "The user the bot logs in as. Leave it empty if the server needs no login.",
+        "password": "Sent only here: it is never shown back and never kept in the bot's draft.",
+    }
+    if field == "password":
+        answer = "Send the password, or tap <b>⏭ Skip</b> if the server has none."
+    elif current:
+        answer = f"Send it, or tap <b>⏭ Use suggested</b> to keep <code>{html_escape(current)}</code>."
+    else:
+        answer = "Send it, or tap <b>⏭ Skip</b> if it is not needed."
+    text = (f"🧩 <b>{KIND_LABELS.get(kind, kind)}</b> — question {step + 1} of {len(FIELD_STEPS)}\n\n"
+            f"<b>{FIELD_LABELS[field]}</b>\n{hints[field]}\n\n{answer}\n\n"
+            "Send /cancel to stop.")
+    skip = B("⏭ Use suggested" if current else "⏭ Skip", callback_data="db_field_default")
+    return text, KB([[skip], [B("❌ Cancel", callback_data="db_cancel")]])
+
+
+async def database_field_answer(u: Update, value, reply) -> None:
+    """One answer of a step-by-step connection; the last answer connects.
+
+    ``value`` is ``None`` for "use the suggested value" (the button, or ``-``).
+    Only the non-secret answers are written to the draft; the password exists
+    just for this call and is handed straight to the connection test.
+    """
+    from database_adapters import FIELD_STEPS, KIND_LABELS, uri_from_fields, validate_field
+    edits = edits_of(u)
+    kind = edits.get("db_kind", "")
+    step = edits.get("db_field_step", 0)
+    if kind not in KIND_LABELS or not isinstance(step, int) or not 0 <= step < len(FIELD_STEPS):
+        _clear_database_edit(u)
+        return await reply("❌ That database draft has expired. Open /database and start again.",
+                           reply_markup=database_kb())
+    field = FIELD_STEPS[step]
+    if value is None:
+        value = _field_current(edits, kind, field)
+    clean, error = validate_field(kind, field, value)
+    if error:
+        text, markup = database_field_prompt(u, kind, step)
+        return await reply(f"❌ {html_escape(error)}\n\n{text}", reply_markup=markup,
+                           disable_web_page_preview=True)
+
+    drafts = edits.setdefault("db_fields", {})
+    if field != "password":
+        drafts[field] = clean
+        edits["db_field_step"] = step + 1
+        save()
+    if step + 1 < len(FIELD_STEPS):
+        text, markup = database_field_prompt(u, kind, step + 1)
+        return await reply(text, reply_markup=markup, disable_web_page_preview=True)
+
+    uri, error = uri_from_fields(kind, dict(drafts, password=clean))
+    if error:
+        edits["db_field_step"] = 0
+        save()
+        text, markup = database_field_prompt(u, kind, 0)
+        return await reply(f"❌ {html_escape(error)}\n\n{text}", reply_markup=markup,
+                           disable_web_page_preview=True)
+    okay, detail = set_custom_database_uri(kind, uri, update=u)
+    if not okay:
+        # Keep the non-secret answers as the suggestions and start again at the top.
+        edits["db_field_step"] = 0
+        save()
+        text, markup = database_field_prompt(u, kind, 0)
+        return await reply(f"❌ {html_escape(detail)}\n\nNothing was changed. The answers so far are "
+                           f"kept as suggestions — send the password again.\n\n{text}",
+                           reply_markup=markup, disable_web_page_preview=True)
+    _clear_database_edit(u)              # connected: the draft is no longer needed
+    await reply_database_selected(u, reply=reply)
+
 
 async def offer_database_setup(u: Update) -> None:
     """First start with no database: ask the admin to add one (all types offered).
@@ -2580,6 +2691,8 @@ def _clear_database_edit(u: Update) -> None:
     edits = edits_of(u)
     edits.pop("db_custom_url", None)
     edits.pop("db_kind", None)
+    edits.pop("db_fields", None)
+    edits.pop("db_field_step", None)
     edits.pop("awaiting_custom", None)
     save()
 
@@ -2728,6 +2841,8 @@ def set_custom_database(url: str, token: str, update: Update | None = None) -> t
         edits = edits_of(update)
         edits.pop("db_custom_url", None)
         edits.pop("db_kind", None)
+        edits.pop("db_fields", None)
+        edits.pop("db_field_step", None)
         edits.pop("awaiting_custom", None)
         save()
 
@@ -2789,6 +2904,8 @@ def set_custom_database_uri(kind: str, uri: str, update: Update | None = None) -
         edits = edits_of(update)
         edits.pop("db_custom_url", None)
         edits.pop("db_kind", None)
+        edits.pop("db_fields", None)
+        edits.pop("db_field_step", None)
         edits.pop("awaiting_custom", None)
         save()
 
@@ -4412,7 +4529,7 @@ def database_paste(text: str) -> dict | None:
     return paste if paste.get("action", "none") != "none" else None
 
 
-async def reply_database_selected(u: Update) -> None:
+async def reply_database_selected(u: Update, reply=None) -> None:
     """The reply that reports a store switch — including the pinned-copy status.
 
     The copy in the chat is what makes the connection survive a restart on a
@@ -4427,7 +4544,8 @@ async def reply_database_selected(u: Update) -> None:
                "this deployment may not reconnect by itself after a restart. Keep the "
                "connection details to hand, or set KV_REST_API_URL + KV_REST_API_TOKEN in "
                "the deployment environment.")
-    await u.message.reply_html(
+    send = reply or u.message.reply_html
+    await send(
         "✅ Custom database connected and selected. Your group, merchants and settings were "
         "carried over." + pin + "\n\n" + database_text(),
         reply_markup=database_kb(), disable_web_page_preview=True)
@@ -4520,6 +4638,12 @@ async def on_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not awaiting or awaiting in DATABASE_AWAITING:
         if await handle_database_paste(u, txt, awaiting):
             return
+
+    if awaiting == "database_field":
+        # A full connection URI sent mid-way is connected as it is.
+        if "://" in txt and await handle_database_paste(u, txt, "database_uri"):
+            return
+        return await database_field_answer(u, None if txt == "-" else txt, reply=u.message.reply_html)
 
     if awaiting == "database_uri":
         # Reachable only for text the paste detector did not recognize: the
@@ -5485,7 +5609,9 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return await q.edit_message_text(
             "🗄 <b>Add / change database</b> — every database type is supported. Pick one; "
-            "you then send its connection URI and I test it before switching.\n\n"
+            "then either send its connection URI or tap <b>🧩 Enter details step by step</b> "
+            "and I ask the server, port, database, user and password one at a time. "
+            "I test the connection before switching.\n\n"
             "💡 Picking a type is only a shortcut: a pasted URI is recognized on its own "
             "(<code>mysql://…</code>, <code>postgres://…</code>, <code>mongodb://…</code>, "
             "<code>redis://…</code>, <code>sqlite://…</code> or a .db file path), and the "
@@ -5513,8 +5639,55 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return await q.edit_message_text(
             database_uri_prompt(kind), parse_mode="HTML",
-            reply_markup=KB([[B("❌ Cancel", callback_data="db_cancel")]]),
+            reply_markup=database_uri_kb(kind),
             disable_web_page_preview=True)
+
+    elif d.startswith("db_fields:"):
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Open a private chat with the bot to set up a database.",
+                                  show_alert=True)
+        from database_adapters import field_steps, normalize_kind
+        kind = normalize_kind(d.split(":", 1)[1])
+        if not kind or not field_steps(kind):
+            return await q.answer("Step by step is not available for that database type.",
+                                  show_alert=True)
+        remember_private_chat(u)
+        edits = edits_of(u)
+        edits.pop("db_custom_url", None)
+        edits["db_kind"] = kind
+        edits["db_fields"] = {}
+        edits["db_field_step"] = 0
+        edit_set(u, "awaiting_custom", "database_field")
+        await q.answer()
+        text, markup = database_field_prompt(u, kind, 0)
+        return await q.edit_message_text(
+            "🧩 No connection URI to write: I ask one question at a time, and the bot tests the "
+            "connection when the last answer is in.\n\n" + text,
+            parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+
+    elif d == "db_field_default":
+        if edit_get(u, "awaiting_custom") != "database_field":
+            return await q.answer("That question has already been answered.", show_alert=True)
+        await q.answer()
+        return await database_field_answer(u, None, reply=_reply_to(q.message))
+
+    elif d == "db_sqlite_default":
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Open a private chat with the bot to set up a database.",
+                                  show_alert=True)
+        if storage.serverless_host():
+            return await q.answer("A serverless host cannot keep a local file — connect a remote "
+                                  "database instead.", show_alert=True)
+        from database_adapters import default_sqlite_path
+        remember_private_chat(u)
+        await q.answer()
+        okay, detail = set_custom_database_uri("sqlite", default_sqlite_path(), update=u)
+        if not okay:
+            return await q.message.reply_html(f"❌ {html_escape(detail)}",
+                                              reply_markup=database_type_kb())
+        return await reply_database_selected(u, reply=_reply_to(q.message))
 
     elif d == "db_skip":
         state["db_setup_offered"] = True
@@ -5974,7 +6147,7 @@ async def cancel_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_admin(u): return
     awaiting = edit_get(u, "awaiting_custom")
     if awaiting:
-        if awaiting in ("database_url", "database_token", "database_uri"):
+        if awaiting in ("database_url", "database_token", "database_uri", "database_field"):
             _clear_database_edit(u)
             await u.message.reply_html("❌ Database setup cancelled.\n\n" + database_text(),
                                        reply_markup=database_kb())
