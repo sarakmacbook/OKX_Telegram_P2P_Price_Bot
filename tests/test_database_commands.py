@@ -258,7 +258,8 @@ def test_unhealthy_deployment_fallback_cannot_replace_custom_database(bot, monke
 
     assert okay is False
     assert "did not answer" in detail
-    assert "private connection detail" not in detail
+    assert "private connection detail" in detail       # the *reason* is shown now …
+    assert "custom-token" not in detail                # … but never a credential
     assert bot.storage.custom_redis_config() == ("https://custom.example", "custom-token")
     assert runtime_config.CUSTOM_REDIS_TOKEN in runtime_config.load()
 
@@ -292,7 +293,8 @@ def test_unreachable_custom_database_leaves_current_store_untouched(bot, monkeyp
 
     assert okay is False
     assert "did not answer" in detail
-    assert "secret-token" not in detail and "private error detail" not in detail
+    assert "private error detail" in detail            # the probe's reason is surfaced …
+    assert "secret-token" not in detail                # … but the token never is
     assert bot.STORE is original_store
     assert bot.state["group"] == -100123456
     assert bot.storage.custom_redis_config() is None
@@ -405,3 +407,23 @@ def test_the_database_claim_is_not_made_when_the_copy_cannot_be_read(
 
     assert okay is False
     assert "connection refused" in detail
+
+
+def test_a_failed_connection_now_says_why_and_never_shows_the_password(bot):
+    """"Did not answer" without a reason sends the owner to check the wrong thing."""
+    okay, detail = bot.set_custom_database_uri("", "mysql://root:s3cr3t-pass@127.0.0.1:1/p2p")
+
+    assert okay is False
+    assert "did not answer" in detail
+    reason = detail.split("did not answer — ", 1)[1].rsplit(". Check the connection details", 1)[0]
+    assert reason and reason != "no detail"            # the driver's own words …
+    assert "s3cr3t-pass" not in detail                 # … with the password removed
+
+
+def test_brief_detail_keeps_credentials_out_of_replies(bot, monkeypatch):
+    monkeypatch.setenv("P2P_CUSTOM_KV_REST_API_TOKEN", "super-secret-token-42")
+
+    line = bot._brief_detail("HTTPStatusError: 401 for Bearer super-secret-token-42 at the edge")
+
+    assert "super-secret-token-42" not in line and "•••" in line
+    assert "401" in line                               # the reason itself survives

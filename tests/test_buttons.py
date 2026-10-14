@@ -398,3 +398,23 @@ def test_database_screen_stays_quiet_when_the_store_answers(bot, monkeypatch):
 
     assert "connected ✅" in text
     assert "NOT answering" not in text
+
+
+def test_check_connection_reports_the_reason_when_the_store_is_down(bot, monkeypatch):
+    """A failing probe answers with the driver's reason, not a bare shrug."""
+    import runtime_config
+
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: True)
+    monkeypatch.setattr(bot, "db_health", lambda force=False: (False, "ConnectError: refused"))
+    monkeypatch.setattr(bot, "rebuild_store", lambda: bot.STORE.describe())
+    monkeypatch.setattr(bot, "refresh_state", lambda: bot.state)
+    monkeypatch.setattr(runtime_config, "apply", lambda *a, **k: {})
+
+    query = SimpleNamespace(data="db_check", answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=next(iter(bot.ADMINS))),
+                             callback_query=query)
+    asyncio.run(bot.on_button(update, SimpleNamespace()))
+
+    answer = query.answer.await_args.args[0]
+    assert "not connected" in answer
+    assert "ConnectError: refused" in answer
