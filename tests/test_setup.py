@@ -506,7 +506,7 @@ def test_pressing_enter_skips_every_question(monkeypatch, capsys):
 
 def test_the_wizard_asks_again_after_a_wrong_answer(monkeypatch, capsys):
     answers = iter(["y", "not-a-token", "123456:ABCdef", "424242",
-                    "", "", "", "", ""])           # asset, fiat, interval, KV url, KV token
+                    "", "", "", "", "", ""])       # asset, fiat, interval, database menu, KV url, KV token
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
     assert setup_cli.main([]) == 0
     assert runtime_config.load()["BOT_TOKEN"] == "123456:ABCdef"

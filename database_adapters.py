@@ -46,9 +46,10 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import os
 import re
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 log = logging.getLogger("p2p-bot.db-adapters")
 
@@ -306,6 +307,134 @@ def parse_database_paste(text: str) -> dict:
     return {"action": "none"}
 
 
+# ── step by step: the same connection, one question at a time ──────────────
+#: The questions a step-by-step connection asks, in order (Telegram and the
+#: terminal wizard). SQLite needs only a file path, so it has no steps.
+FIELD_STEPS = ("host", "port", "database", "user", "password")
+
+#: What each question is called on screen.
+FIELD_LABELS = {
+    "host": "Server address (host name or IP)",
+    "port": "Port",
+    "database": "Database name",
+    "user": "User name",
+    "password": "Password",
+}
+
+#: The database name a new setup suggests (the same one the examples use).
+DEFAULT_DATABASE_NAME = "p2p"
+
+#: Characters a host name / database name may not contain: they would change
+#: the meaning of the URI, so they are refused instead of being escaped.
+_HOST_FORBIDDEN = set("/@?#%\\ \t\r\n")
+_NAME_ALLOWED = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def field_steps(kind: str) -> tuple[str, ...]:
+    """The questions for ``kind`` — none for SQLite (a file path is one answer)."""
+    kind = normalize_kind(kind) or ""
+    return FIELD_STEPS if kind in KIND_PORTS else ()
+
+
+def field_default(kind: str, field: str) -> str:
+    """The value a question suggests when the admin just presses Enter."""
+    kind = normalize_kind(kind) or ""
+    if field == "host":
+        return "localhost"
+    if field == "port":
+        return str(KIND_PORTS.get(kind, ""))
+    if field == "database":
+        return "0" if kind == "redis" else DEFAULT_DATABASE_NAME
+    return ""                                   # user and password: none unless typed
+
+
+def validate_field(kind: str, field: str, value) -> tuple[str, str]:
+    """``(clean value, "")`` for an answer — or ``("", problem)`` to ask again."""
+    kind = normalize_kind(kind) or ""
+    text = str(value if value is not None else "").strip()
+    if field == "port":
+        if not text.isdigit() or not 1 <= int(text) <= 65535:
+            return "", ("The port is a number from 1 to 65535 — "
+                        f"{KIND_LABELS.get(kind, kind)} usually uses {field_default(kind, 'port')}.")
+        return str(int(text)), ""
+    if field == "host":
+        if not text or any(ch in _HOST_FORBIDDEN for ch in text) or len(text) > 253:
+            return "", ("Send the server's host name or IP address, for example "
+                        "localhost or db.example.com.")
+        return text, ""
+    if field == "database":
+        if kind == "redis":
+            if not text.isdigit() or int(text) > 15:
+                return "", "Redis uses a database number from 0 to 15 — send 0 if unsure."
+            return str(int(text)), ""
+        if not _NAME_ALLOWED.match(text) or len(text) > 64:
+            return "", ("The database name may use letters, digits, '_', '-' and '.' only — "
+                        f"for example {DEFAULT_DATABASE_NAME}.")
+        return text, ""
+    # user and password are escaped in the URI, so any text is fine.
+    return text if field == "user" else str(value or ""), ""
+
+
+def build_uri(kind: str, *, host: str, port: str = "", database: str = "",
+              user: str = "", password: str = "") -> str:
+    """One connection URI assembled from its parts (the reverse of the parsers).
+
+    User and password are percent-encoded, so ``p@ss/word#1`` survives the trip.
+    Use :func:`uri_from_fields` for answers that still need checking.
+    """
+    kind = normalize_kind(kind) or ""
+    if kind not in KIND_PORTS:
+        raise ValueError(f"no connection URI for {kind!r}")
+    scheme = {"mysql": "mysql", "postgres": "postgres", "mongo": "mongodb", "redis": "redis"}[kind]
+    host = str(host or "").strip()
+    if ":" in host and not host.startswith("["):   # an IPv6 literal needs brackets
+        host = f"[{host}]"
+    auth = ""
+    if user or password:
+        auth = quote(str(user or ""), safe="")
+        if password:
+            auth += ":" + quote(str(password), safe="")
+        auth += "@"
+    port_part = f":{port}" if port else ""
+    name = str(database or "") or ("0" if kind == "redis" else DEFAULT_DATABASE_NAME)
+    return f"{scheme}://{auth}{host}{port_part}/{name}"
+
+
+def uri_from_fields(kind: str, values: dict) -> tuple[str, str]:
+    """``(uri, "")`` built from step-by-step answers — or ``("", problem)``.
+
+    Missing answers take their defaults. The result is parsed again with
+    :func:`parse_database_uri`, so a URI that could not connect is refused here,
+    before any connection is attempted.
+    """
+    kind = normalize_kind(kind) or ""
+    if not field_steps(kind):
+        return "", "Step-by-step setup is for MySQL, PostgreSQL, MongoDB and Redis; SQLite takes a file path."
+    clean: dict[str, str] = {}
+    for field in FIELD_STEPS:
+        raw = values.get(field, field_default(kind, field))
+        value, error = validate_field(kind, field, raw)
+        if error:
+            return "", error
+        clean[field] = value
+    uri = build_uri(kind, host=clean["host"], port=clean["port"], database=clean["database"],
+                    user=clean["user"], password=clean["password"])
+    spec, error = parse_database_uri(kind, uri)
+    if error or spec is None:
+        return "", error or "That connection could not be assembled — start again."
+    return uri, ""
+
+
+def default_sqlite_path() -> str:
+    """Where a one-tap local SQLite database lives: next to the bot's data.
+
+    ``P2P_DATA_DIR`` when it is set (Docker, systemd), else the bot's own folder.
+    """
+    data_dir = (os.getenv("P2P_DATA_DIR") or "").strip()
+    base = Path(data_dir).expanduser() if data_dir else Path(__file__).resolve().parent
+    return str(base / "p2p-bot.db")
+
+
 def driver_hint(kind: str) -> str | None:
     """``None`` when this deployment can connect ``kind``, else one install line."""
     kind = normalize_kind(kind) or ""
@@ -316,7 +445,7 @@ def driver_hint(kind: str) -> str | None:
     if _driver_module(kind) is None:
         package = DRIVER_PACKAGES[kind]
         return (f"this deployment has no {KIND_LABELS.get(kind, kind)} driver yet — "
-                f"run <code>pip install {package}</code> (then restart the bot) and try again")
+                f"run pip install {package} (then restart the bot) and try again")
     return None
 
 
