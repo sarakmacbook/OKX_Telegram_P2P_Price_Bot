@@ -5,7 +5,7 @@ from __future__ import annotations
 import os, sys, json, asyncio, logging, argparse, signal, time, re, secrets
 from copy import deepcopy
 from dataclasses import asdict
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from pathlib import Path
 import httpx
 from telegram import (Update, ChatPermissions, BotCommand, BotCommandScopeAllPrivateChats,
@@ -2641,6 +2641,46 @@ def verify_pinned_settings() -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 
+def _db_secret_values(*extra: str) -> list[str]:
+    """Credentials that must never reach a reply, a log line or the panel."""
+    values: list[str] = []
+    for value in extra:
+        value = str(value or "").strip()
+        if value:
+            values.append(value)
+    try:
+        raw = storage.custom_database_uri() or ""
+        if raw:
+            password = urlsplit(raw).password              # may raise on a bad port
+            if password:
+                values.append(unquote(password))
+    except Exception:                                       # pragma: no cover - defensive
+        pass
+    for var in ("P2P_CUSTOM_KV_REST_API_TOKEN", "KV_REST_API_TOKEN",
+                "UPSTASH_REDIS_REST_TOKEN", "REDIS_REST_TOKEN"):
+        value = (os.getenv(var) or "").strip()
+        if value:
+            values.append(value)
+    # Short fragments would mangle the message instead of redacting anything.
+    return [value for value in dict.fromkeys(values) if len(value) >= 6]
+
+
+def _brief_detail(detail, *secrets, limit: int = 240) -> str:
+    """One printable line of *why* a probe failed, with credentials removed.
+
+    "Did not answer" without a reason sends an owner to check the wrong thing;
+    every driver error the probes produce is secret-free already (the password
+    never reaches an exception message), and the known credentials are stripped
+    on top of that before the line is shown.
+    """
+    text = " ".join(str(detail or "").split())
+    for secret in _db_secret_values(*secrets):
+        text = text.replace(secret, "•••")
+    if len(text) > limit:
+        text = text[:limit - 1].rstrip() + "…"
+    return text or "no detail"
+
+
 def set_custom_database(url: str, token: str, update: Update | None = None) -> tuple[bool, str]:
     """Test, persist and select a custom Redis REST database.
 
@@ -2659,9 +2699,11 @@ def set_custom_database(url: str, token: str, update: Update | None = None) -> t
     clean_token = values[runtime_config.CUSTOM_REDIS_TOKEN]
     state_key = (os.getenv("P2P_STATE_KEY") or storage.DEFAULT_KEY).strip() or storage.DEFAULT_KEY
     target = storage.RedisStore(clean_url, clean_token, key=state_key)
-    reachable, _detail = probe_store(target, timeout=6.0)
+    reachable, detail = probe_store(target, timeout=6.0)
     if not reachable:
-        return False, "The Redis REST service did not answer. Check the URL and token, then try again."
+        return False, ("The Redis REST service did not answer — "
+                       f"{_brief_detail(detail, clean_token)}. "
+                       "Check the URL and token, then try again.")
 
     # A custom database selection is exclusive: the REST pair replaces any
     # custom URI database chosen earlier (and vice versa in
@@ -2724,9 +2766,10 @@ def set_custom_database_uri(kind: str, uri: str, update: Update | None = None) -
 
     state_key = (os.getenv("P2P_STATE_KEY") or storage.DEFAULT_KEY).strip() or storage.DEFAULT_KEY
     target = build_database(spec, key=state_key)
-    reachable, _detail = probe_store(target, timeout=6.0)
+    reachable, detail = probe_store(target, timeout=6.0)
     if not reachable:
-        return (False, f"The {KIND_LABELS[spec['kind']]} database did not answer. Check the "
+        return (False, f"The {KIND_LABELS[spec['kind']]} database did not answer — "
+                       f"{_brief_detail(detail, spec.get('password'))}. Check the "
                        "connection details, then try again.")
 
     # Exclusive selection: this database replaces any previous custom one.
@@ -2776,7 +2819,7 @@ def use_deployment_database() -> tuple[bool, str]:
     previous = {name: os.environ.pop(name, None) for name in names}
     try:
         fallback = storage.build_store(BASE_DIR)
-        healthy, _detail = probe_store(fallback, timeout=6.0)
+        healthy, detail = probe_store(fallback, timeout=6.0)
     finally:
         for name, value in previous.items():
             if value is not None:
@@ -2787,7 +2830,8 @@ def use_deployment_database() -> tuple[bool, str]:
                        "connected, or connect a KV / Redis store for the deployment (Vercel → "
                        "Storage) and redeploy.")
     if not healthy:
-        return False, "The deployment's default store did not answer; the custom database is still active."
+        return False, ("The deployment's default store did not answer — "
+                       f"{_brief_detail(detail)}; the custom database is still active.")
 
     removed = runtime_config.remove(names=names, base_dir=BASE_DIR)
     if not removed:
@@ -2862,7 +2906,7 @@ def database_text():
     answers, detail = db_health(force=True) if persistent else (True, "")
     if persistent and not answers:
         label = "NOT answering ⚠️"
-        outage = (f"\n\n🚨 <b>Configured, but not answering</b> — {html_escape(detail)}\n"
+        outage = (f"\n\n🚨 <b>Configured, but not answering</b> — {html_escape(_brief_detail(detail))}\n"
                   "The bot may forget state until the store responds. Use the buttons below to "
                   "switch to another database. On Vercel, a broken bootstrap store must first "
                   "be restored in the deployment environment so Telegram updates can reach the bot.")
@@ -5543,8 +5587,12 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
             log.warning("Stored settings unavailable: %s", e)
         rebuild_store()
         refresh_state()
-        healthy, _detail = db_health(force=True) if db_is_persistent() else (False, "")
-        await q.answer(f"State store: {'connected ✅' if healthy else 'not connected ⚠️'}")
+        healthy, detail = db_health(force=True) if db_is_persistent() else (False, "")
+        if db_is_persistent() and not healthy:
+            answer = f"State store: not connected ⚠️ — {_brief_detail(detail)}"
+        else:
+            answer = f"State store: {'connected ✅' if healthy else 'not connected ⚠️'}"
+        await q.answer(answer)
         return await q.edit_message_text(database_text(), parse_mode="HTML",
                                          reply_markup=database_kb(),
                                          disable_web_page_preview=True)

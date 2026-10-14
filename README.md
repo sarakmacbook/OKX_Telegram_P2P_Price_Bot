@@ -169,6 +169,19 @@ database types are supported**:
    merchants and settings to the new store. Passwords and tokens are never
    repeated in the bot's reply.
 
+**Hosted providers work as they publish themselves.** The TLS options a
+provider puts on the connection string are read and honoured instead of
+making the URI unusable: `?sslmode=require` (Neon, Supabase, RDS),
+`?ssl=true` / `sslmode=required` (PlanetScale and friends), `?sslmode=verify-full`
++ `?sslrootcert=…` to check the server's certificate, `?sslmode=disabled` to
+force the plain connection. A PostgreSQL URI without any option follows libpq's
+own default and **tries TLS first**, falling back to a plaintext connection only
+when the server says it has none; MongoDB keeps working with `mongodb+srv://…`
+(TLS implied) or an explicit `?tls=true`. When a connection fails, the bot's
+reply now carries the driver's actual reason — so *"did not answer"* comes with
+`password authentication failed`, `Connection refused` or `Server refuses SSL`
+attached instead of a shrug, and never with the password.
+
 **No need to tap a button first.** A connection pasted into the private chat is
 recognized on its own — the URI names its own type — and so is the two-line
 snippet every Redis-REST provider hands out:
@@ -901,6 +914,24 @@ It forgets the credentials if:
 readable). For a permanent connection that does not depend on a chat message, set
 `KV_REST_API_URL` + `KV_REST_API_TOKEN` in the deployment environment, or
 `BOT_TOKEN` + `ADMIN_IDS` (which is what allows the copy to be written at all).
+
+### The bot answers “The … database did not answer — …”
+
+The reply now ends with the driver's own reason — read it first, it usually
+names the fix:
+
+| Reason in the reply | What is wrong |
+|---|---|
+| `password authentication failed` / `Access denied` | wrong user or password in the URI |
+| `Connection refused` / `Can't connect to …` | no server on that host/port — is the database running, and is the host reachable from the bot? (in Docker: use the service name, e.g. `mysql://user:pass@db:3306/p2p`, not `localhost`) |
+| `Server refuses SSL` (PostgreSQL) | the URI asked for `sslmode=require`/`verify-*` but that server has no TLS — use `?sslmode=prefer` or `?sslmode=disable` |
+| `requires TLS` (MongoDB) | Atlas needs TLS: append `?tls=true`, or use the `mongodb+srv://…` form |
+| `no … driver yet — run pip install …` | install that one package in the bot's environment and restart |
+| `unable to open database file` (SQLite) | the path is not writable by the bot — pick a directory the bot owns |
+
+SQLite needs no server at all (`/database` → **🗃 SQLite** with a file path) and
+the bot creates the parent directory itself, so it is also the quickest way to
+confirm the database flow end to end.
 
 ### I picked a database type, sent the connection, and nothing happened
 

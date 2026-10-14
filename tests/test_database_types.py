@@ -91,15 +91,55 @@ def test_uri_parsing_rejects_mistakes():
         ("", "ftp://db-host/p2p"),                 # unknown scheme
         ("mysql", "postgres://user:secret@h:5432/db"),  # wrong type for the chosen menu
         ("", "mysql://user:secret@db-host"),        # no database name
-        ("", "mysql://user:secret@db-host/p2p?ssl=1"),  # query strings are dropped by drivers
         ("", "mongodb://user:secret@db-host"),      # no database name
         ("", "redis://user:secret@db-host/notanumber"),
+        ("", "postgres://user:secret@db-host/db?sslmode=maybe"),  # unknown sslmode
+        ("", "mysql://user:secret@db-host/db?ssl=perhaps"),       # unknown ssl value
         ("sqlite", ":memory:"),                    # a real file is required
         ("", ""),                                  # nothing at all
     ]
     for kind, uri in problems:
         spec, error = database_adapters.parse_database_uri(kind, uri)
         assert spec is None and error, (kind, uri)
+
+
+def test_provider_tls_options_are_accepted_and_applied():
+    """Hosted databases hand out URIs that *name* their TLS requirement.
+
+    Neon/Supabase/RDS append ``?sslmode=require``, PlanetScale ``?ssl=true`` —
+    the bot has to honour those instead of rejecting the whole connection.
+    """
+    spec, error = database_adapters.parse_database_uri(
+        "", "postgres://user:secret@ep-abc.us-west-2.aws.neon.tech/neondb?sslmode=require")
+    assert error == "" and spec["sslmode"] == "require" and spec["host"].startswith("ep-abc")
+    assert spec["password"] == "secret"
+
+    # libpq's default when the provider says nothing: try TLS first.
+    spec, error = database_adapters.parse_database_uri(
+        "", "postgres://user:secret@db-host:5432/p2p")
+    assert error == "" and spec["sslmode"] == "prefer"
+
+    spec, error = database_adapters.parse_database_uri(
+        "", "postgres://u:s@h/db?sslmode=verify_full&sslrootcert=/etc/ca.pem")
+    assert error == "" and spec["sslmode"] == "verify-full"
+    assert spec["sslrootcert"] == "/etc/ca.pem"
+
+    spec, error = database_adapters.parse_database_uri("", "mysql://u:s@h/db?ssl=1")
+    assert error == "" and spec["tls"] == "require"
+    spec, error = database_adapters.parse_database_uri("", "mysql://u:s@h/db?sslmode=disabled")
+    assert error == "" and "tls" not in spec
+    spec, error = database_adapters.parse_database_uri("", "mysql://u:s@h/db?sslmode=preferred")
+    assert error == "" and spec["tls"] == "prefer"
+
+    # Options the bot does not act on are ignored, not rejected: drivers drop
+    # them anyway, and every provider adds its own (channel_binding, …).
+    spec, error = database_adapters.parse_database_uri(
+        "", "postgres://u:s@h/db?sslmode=require&channel_binding=require&application_name=p2p")
+    assert error == "" and spec["sslmode"] == "require"
+
+    # …and the stored URI still round-trips through the parser.
+    again, _ = database_adapters.parse_database_uri("", spec["uri"])
+    assert again == spec
 
 
 def test_describe_never_shows_the_password():
@@ -374,6 +414,143 @@ def _button_update(data):
     return SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
                            effective_chat=SimpleNamespace(type="private", id=ADMIN),
                            callback_query=query), query
+
+
+# ── TLS wiring (what a real server would enforce) ──────────────────────────
+def test_sqlite_creates_a_missing_parent_directory(tmp_path):
+    """/var/lib/p2p-bot/state.db must connect — the bot creates the directory."""
+    path = tmp_path / "nested" / "deeper" / "state.db"
+    store = database_adapters.build_store(
+        {"kind": "sqlite", "uri": f"sqlite://{path}", "path": str(path)})
+
+    assert store.probe() == (True, "the database answered")
+    store.save({"group": 1})
+    assert store.load() == {"group": 1}
+
+
+def test_postgres_connect_offers_tls_and_falls_back_when_the_server_has_none(monkeypatch):
+    """libpq's default sslmode=prefer: TLS first, plaintext when refused."""
+    calls = []
+    conn = SimpleNamespace(autocommit=False)
+
+    def connect(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("ssl_context") is not None:
+            raise Exception("Server refuses SSL")
+        return conn
+
+    fake = SimpleNamespace(__name__="pg8000.dbapi", connect=connect)
+    monkeypatch.setattr(database_adapters, "_driver_module", lambda kind: fake)
+
+    got = database_adapters._postgres_connect(dict(POSTGRES_SPEC), 5.0)
+
+    assert got is conn and conn.autocommit is True
+    assert [call.get("ssl_context") is not None for call in calls] == [True, False]
+
+
+def test_postgres_require_never_downgrades_to_plaintext(monkeypatch):
+    calls = []
+
+    def connect(**kwargs):
+        calls.append(kwargs)
+        raise Exception("Server refuses SSL")
+
+    fake = SimpleNamespace(__name__="pg8000.dbapi", connect=connect)
+    monkeypatch.setattr(database_adapters, "_driver_module", lambda kind: fake)
+
+    with pytest.raises(Exception, match="refuses SSL"):
+        database_adapters._postgres_connect(dict(POSTGRES_SPEC, sslmode="require"), 5.0)
+    assert len(calls) == 1 and calls[0]["ssl_context"] is not None
+
+
+def test_postgres_authentication_errors_are_not_retried_in_the_clear(monkeypatch):
+    calls = []
+
+    def connect(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("ssl_context") is not None:
+            raise Exception('password authentication failed for user "u"')
+        raise AssertionError("prefer must not retry after a completed handshake")
+
+    fake = SimpleNamespace(__name__="pg8000.dbapi", connect=connect)
+    monkeypatch.setattr(database_adapters, "_driver_module", lambda kind: fake)
+
+    with pytest.raises(Exception, match="password authentication"):
+        database_adapters._postgres_connect(dict(POSTGRES_SPEC), 5.0)
+    assert len(calls) == 1
+
+
+def test_postgres_passes_sslmode_to_psycopg(monkeypatch):
+    calls = []
+
+    def connect(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace()
+
+    fake = SimpleNamespace(__name__="psycopg", connect=connect)
+    monkeypatch.setattr(database_adapters, "_driver_module", lambda kind: fake)
+
+    database_adapters._postgres_connect(
+        dict(POSTGRES_SPEC, sslmode="verify-full", sslrootcert="/etc/ca.pem"), 5.0)
+
+    assert calls[0]["sslmode"] == "verify-full"
+    assert calls[0]["sslrootcert"] == "/etc/ca.pem"
+    assert calls[0]["dbname"] == POSTGRES_SPEC["database"]
+
+
+def test_mysql_ssl_option_reaches_the_driver(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(__name__="pymysql",
+                           connect=lambda **kw: calls.append(kw) or "conn")
+    monkeypatch.setattr(database_adapters, "_driver_module", lambda kind: fake)
+
+    assert database_adapters._mysql_connect(dict(MYSQL_SPEC, tls="require"), 5.0) == "conn"
+    assert calls[0]["ssl"] == {"verify_mode": False}   # encrypt, don't verify (REQUIRE)
+
+    assert database_adapters._mysql_connect(dict(MYSQL_SPEC), 5.0) == "conn"
+    assert "ssl" not in calls[1]                       # no option → plaintext, as before
+
+
+def test_mysql_prefer_tries_tls_then_continues_in_plaintext(monkeypatch):
+    calls = []
+
+    def connect(**kwargs):
+        calls.append(kwargs)
+        if "ssl" in kwargs:
+            raise Exception("Lost connection to MySQL server during query")
+        return "conn"
+
+    fake = SimpleNamespace(__name__="pymysql", connect=connect)
+    monkeypatch.setattr(database_adapters, "_driver_module", lambda kind: fake)
+
+    assert database_adapters._mysql_connect(dict(MYSQL_SPEC, tls="prefer"), 5.0) == "conn"
+    assert "ssl" in calls[0] and "ssl" not in calls[1]
+
+
+def test_mysql_require_and_authentication_errors_surface(monkeypatch):
+    lost = []
+
+    def lost_connection(**kwargs):
+        lost.append(kwargs)
+        raise Exception("Lost connection to MySQL server during query")
+
+    monkeypatch.setattr(database_adapters, "_driver_module",
+                        lambda kind: SimpleNamespace(__name__="pymysql", connect=lost_connection))
+    with pytest.raises(Exception, match="Lost connection"):
+        database_adapters._mysql_connect(dict(MYSQL_SPEC, tls="require"), 5.0)
+    assert len(lost) == 1                              # no plaintext retry
+
+    denied = []
+
+    def access_denied(**kwargs):
+        denied.append(kwargs)
+        raise Exception("Access denied for user 'root'@'localhost' (using password: YES)")
+
+    monkeypatch.setattr(database_adapters, "_driver_module",
+                        lambda kind: SimpleNamespace(__name__="pymysql", connect=access_denied))
+    with pytest.raises(Exception, match="Access denied"):
+        database_adapters._mysql_connect(dict(MYSQL_SPEC, tls="prefer"), 5.0)
+    assert len(denied) == 1                            # never retried in the clear
 
 
 def test_first_start_offers_database_support_with_all_types(bot):

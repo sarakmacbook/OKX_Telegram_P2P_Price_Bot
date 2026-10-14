@@ -27,6 +27,12 @@ Rules of the house (same as ``storage.py``):
   empty one and is logged, so a broken connection can never crash a chat
   handler.  ``probe`` is the honest check that tells "nothing saved yet" and
   "the database went away" apart.
+* TLS follows what the connection string says — ``?sslmode=require`` (Neon,
+  Supabase, RDS), ``?ssl=true`` (PlanetScale), ``?sslmode=verify-full`` +
+  ``sslrootcert`` — and a PostgreSQL URI with no option keeps libpq's own
+  default of trying TLS first and falling back only when the server has none.
+  Providers' extra query options are ignored rather than making the URI
+  unusable.
 * :func:`describe` and every error message are secret-free: the password never
   appears in a reply, a log line, or the panel — only the saved URI (which the
   settings store keeps sealed) ever holds it.
@@ -42,7 +48,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 log = logging.getLogger("p2p-bot.db-adapters")
 
@@ -84,6 +90,17 @@ KIND_SCHEMES = {
 
 #: Default TCP port per kind (``sqlite`` and ``mongo+srv`` have none).
 KIND_PORTS = {"mysql": 3306, "postgres": 5432, "mongo": 27017, "redis": 6379}
+
+#: What a ``?sslmode=`` option may say (libpq's values, ``_`` also accepted).
+POSTGRES_SSLMODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+
+#: ``?ssl=`` / ``?sslmode=`` values for MySQL → how TLS is requested:
+#: ``require`` encrypts and fails without TLS, ``prefer`` tries TLS first and
+#: falls back to plaintext the way mysql clients do, an empty value counts as on.
+_MYSQL_TLS_STRICT = {"1", "true", "yes", "on", "require", "required",
+                     "verify-ca", "verify-full", ""}
+_MYSQL_TLS_TRY = {"prefer", "preferred", "if-available"}
+_MYSQL_TLS_OFF = {"0", "false", "no", "off", "disable", "disabled"}
 
 #: Shown on the buttons and in the help text.
 KIND_LABELS = {
@@ -332,14 +349,80 @@ def _mysql_connect(spec: dict, timeout: float):
         raise DriverMissing(driver_hint("mysql") or "no MySQL driver")
     kwargs = dict(host=spec["host"], port=spec["port"], user=spec["user"],
                   autocommit=True, connect_timeout=max(1, int(timeout)))
+    # ``tls`` comes from the URI: ``require`` encrypts and must not silently
+    # degrade, ``prefer`` (mysql clients' default) tries TLS first and falls
+    # back to a plaintext connection when the server does not offer it.
+    tls = str(spec.get("tls") or "")
+    rootcert = str(spec.get("sslrootcert") or "")
     name = getattr(mod, "__name__", "")
     if name == "MySQLdb":                           # mysqlclient uses db=/passwd=
+        if tls:
+            kwargs["ssl"] = {"ca": rootcert} if rootcert else {"cipher": "HIGH:!aNULL"}
         return mod.connect(db=spec["database"], passwd=spec["password"] or "", **kwargs)
     if name == "mysql.connector":
         kwargs["connection_timeout"] = kwargs.pop("connect_timeout")
+        if tls:                                     # TLS-preferred is this driver's default
+            kwargs["ssl_disabled"] = False
+            if rootcert:
+                kwargs["ssl_ca"] = rootcert
+                kwargs["ssl_verify_cert"] = True
         return mod.connect(password=spec["password"], database=spec["database"], **kwargs)
-    return mod.connect(password=spec["password"], database=spec["database"],
-                       charset="utf8mb4", **kwargs)
+    if tls:                                         # pymysql
+        kwargs["ssl"] = ({"ca": rootcert, "check_hostname": False, "verify_mode": True}
+                         if rootcert else {"verify_mode": False})
+
+    def open_connection():
+        return mod.connect(password=spec["password"], database=spec["database"],
+                           charset="utf8mb4", **kwargs)
+
+    try:
+        return open_connection()
+    except Exception as exc:
+        if tls == "prefer" and _tls_attempt_failed(exc):
+            kwargs.pop("ssl", None)                 # server has no TLS — continue plaintext
+            return open_connection()
+        raise
+
+
+def _pg_ssl_context(sslmode: str, rootcert: str = ""):
+    """The TLS context one libpq ``sslmode`` needs — ``None`` means plaintext.
+
+    ``require`` / ``prefer`` / ``allow`` encrypt without checking the server's
+    certificate, exactly what libpq does for those modes (a self-signed VPS
+    certificate must not stop a bot from connecting); ``verify-ca`` /
+    ``verify-full`` validate the chain against the system CAs (or ``sslrootcert``).
+    """
+    import ssl
+    if sslmode == "disable":
+        return None
+    if sslmode in ("verify-ca", "verify-full"):
+        ctx = ssl.create_default_context(cafile=rootcert or None)
+        if sslmode == "verify-ca":
+            ctx.check_hostname = False
+        return ctx
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _tls_attempt_failed(exc: Exception) -> bool:
+    """Whether an error means *the TLS attempt itself* failed, not the login.
+
+    Used by the ``prefer`` modes: a server answering "I don't do TLS" (or a
+    port answering something that is not a handshake) falls back to a
+    plaintext connection the way libpq/mysql clients do.  A genuine
+    authentication failure after a successful handshake — wrong password,
+    unknown database — is never retried in the clear, so the real error
+    always reaches the admin.
+    """
+    text = str(exc).lower()
+    markers = ("ssl", "lost connection", "gone away", "bad handshake",
+               "connection reset", "connection refused", "timed out", "timeout",
+               "unexpected eof", "wrong version", "protocol", "packets out of order")
+    if any(marker in text for marker in markers):
+        return True
+    return isinstance(exc, (ConnectionError, TimeoutError))
 
 
 def _postgres_connect(spec: dict, timeout: float):
@@ -347,18 +430,34 @@ def _postgres_connect(spec: dict, timeout: float):
     if mod is None:
         raise DriverMissing(driver_hint("postgres") or "no PostgreSQL driver")
     name = getattr(mod, "__name__", "")
+    sslmode = str(spec.get("sslmode") or "prefer").lower().replace("_", "-")
+    rootcert = str(spec.get("sslrootcert") or "")
+    connect_kwargs = dict(user=spec["user"], host=spec["host"], port=spec["port"],
+                          database=spec["database"], password=spec["password"])
     if name.startswith("pg8000"):
-        conn = mod.connect(user=spec["user"], host=spec["host"], port=spec["port"],
-                           database=spec["database"], password=spec["password"],
-                           timeout=max(1.0, float(timeout)))
-        conn.autocommit = True
-        return conn
+        def open_connection(context):
+            conn = mod.connect(timeout=max(1.0, float(timeout)), ssl_context=context,
+                               **connect_kwargs)
+            conn.autocommit = True
+            return conn
+        context = _pg_ssl_context(sslmode, rootcert)
+        try:
+            return open_connection(context)
+        except Exception as exc:
+            if sslmode in ("prefer", "allow") and context is not None \
+                    and _tls_attempt_failed(exc):
+                return open_connection(None)      # server said "no TLS" — libpq prefers on
+            raise
     if name == "psycopg":                           # psycopg 3
         return mod.connect(host=spec["host"], port=spec["port"], user=spec["user"],
                            password=spec["password"], dbname=spec["database"],
+                           sslmode=sslmode,
+                           **({"sslrootcert": rootcert} if rootcert else {}),
                            connect_timeout=max(1, int(timeout)), autocommit=True)
     conn = mod.connect(host=spec["host"], port=spec["port"], user=spec["user"],
                        password=spec["password"], dbname=spec["database"],
+                       sslmode=sslmode,
+                       **({"sslrootcert": rootcert} if rootcert else {}),
                        connect_timeout=max(1, int(timeout)))
     conn.autocommit = True
     return conn
@@ -479,6 +578,46 @@ def _parse_sqlite(raw: str) -> tuple[dict | None, str]:
     return {"kind": "sqlite", "uri": f"sqlite://{path}", "path": path}, ""
 
 
+def _sql_tls_options(kind: str, query: str) -> tuple[dict, str]:
+    """``(tls fields, "")`` from a connection URI's ``?query`` — or an error.
+
+    Provider dashboards hand out URIs that *name* their TLS requirements —
+    ``?sslmode=require`` (Neon, Supabase, RDS), ``?ssl=true`` (PlanetScale) —
+    so those options are read and honoured instead of making the whole URI
+    unusable.  Options the bot does not act on (``channel_binding``,
+    ``connect_timeout``, …) are ignored: drivers would drop them anyway.
+    """
+    options = {key.lower(): value for key, value in parse_qsl(query, keep_blank_values=True)}
+    if kind == "postgres":
+        mode = (options.get("sslmode") or "prefer").lower().replace("_", "-")
+        if mode not in POSTGRES_SSLMODES:
+            return {}, ("sslmode must be one of " + ", ".join(POSTGRES_SSLMODES)
+                        + " — send a URI like " + EXAMPLES["postgres"])
+        fields = {"sslmode": mode}
+        rootcert = (options.get("sslrootcert") or "").strip()
+        if rootcert:
+            fields["sslrootcert"] = rootcert
+        return fields, ""
+    # MySQL / MariaDB: ssl=… or sslmode=… both name the TLS requirement.
+    raw_mode = options.get("sslmode", options.get("ssl"))
+    if raw_mode is None:
+        return {}, ""                                   # no option: plaintext, as before
+    value = raw_mode.lower().replace("_", "-")
+    if value in _MYSQL_TLS_TRY:
+        return {"tls": "prefer"}, ""
+    if value in _MYSQL_TLS_STRICT:
+        fields = {"tls": "require"}
+        rootcert = (options.get("sslrootcert") or options.get("ssl-ca")
+                    or options.get("ssl_ca") or "").strip()
+        if rootcert:
+            fields["sslrootcert"] = rootcert
+        return fields, ""
+    if value in _MYSQL_TLS_OFF:
+        return {}, ""
+    return {}, ("ssl must be true/false, or sslmode one of require, verify-ca, "
+                "verify-full, prefer, disabled — send a URI like " + EXAMPLES["mysql"])
+
+
 def _parse_sql(raw: str, kind: str) -> tuple[dict | None, str]:
     label, example = KIND_LABELS[kind], EXAMPLES[kind]
     try:
@@ -490,18 +629,18 @@ def _parse_sql(raw: str, kind: str) -> tuple[dict | None, str]:
         return None, f"That does not look like a {label} URI — send one like {example}"
     if not parsed.hostname:
         return None, f"The {label} URI needs a host — send one like {example}"
-    if parsed.query or parsed.fragment:
-        return None, ("Omit any ?query or #fragment in the URI — send the plain connection "
-                      f"URI, like {example}")
     database = parsed.path.lstrip("/")
     if not database or "/" in database:
         return None, f"Include the database name — send one like {example}"
+    tls_fields, error = _sql_tls_options(kind, parsed.query)
+    if error:
+        return None, error
     if port is None:
         port = KIND_PORTS[kind]
     return {"kind": kind, "uri": raw, "host": parsed.hostname, "port": port,
             "user": unquote(parsed.username or ""),
             "password": unquote(parsed.password) if parsed.password else "",
-            "database": database}, ""
+            "database": database, **tls_fields}, ""
 
 
 def _parse_mongo(raw: str) -> tuple[dict | None, str]:
@@ -563,6 +702,13 @@ class SQLiteStore:
 
     def _connect(self):
         import sqlite3
+        # A path like /var/lib/p2p-bot/state.db names a directory the bot has
+        # never written to; creating it is the difference between "connected"
+        # and "did not answer" for the one database that needs no server.
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass                                    # the connect below reports it
         conn = sqlite3.connect(str(self.path), timeout=self.timeout)
         _prepare(conn, f"CREATE TABLE IF NOT EXISTS {TABLE} "
                        f"(k TEXT PRIMARY KEY, v TEXT NOT NULL)")
