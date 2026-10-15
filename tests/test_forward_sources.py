@@ -528,8 +528,9 @@ def test_a_link_asks_before_anything_is_relayed(manager):
     text = update.message.reply_html.await_args.args[0]
     assert "Forward from this channel?" in text and "News" in text
     buttons = update.message.reply_html.await_args.kwargs["reply_markup"]
+    # a channel a link names can be used two ways: relay from it, or post prices into it
     assert [b.callback_data for row in buttons.inline_keyboard for b in row] == \
-        ["fwd_src_offer_add", "fwd_src_offer_post", "fwd_src_offer_no"]
+        ["fwd_src_offer_add", "fwd_src_offer_channel", "fwd_src_offer_post", "fwd_src_offer_no"]
 
 
 def test_the_offer_is_sent_for_a_normalized_handle(manager):
@@ -671,14 +672,35 @@ def test_a_chat_that_is_already_relayed_says_so(manager):
 
     text = update.message.reply_html.await_args.args[0]
     assert "Already forwarding from" in text
-    assert update.message.reply_html.await_args.kwargs["reply_markup"] is not None
+    buttons = update.message.reply_html.await_args.kwargs["reply_markup"]
+    # ➕ is gone (it is relayed already) but the channel can still be picked
+    assert [b.callback_data for row in buttons.inline_keyboard for b in row] == \
+        ["fwd_src_offer_channel", "fwd_src_offer_post", "fwd_src_offer_no"]
 
 
-def test_without_a_group_first_a_link_says_what_is_missing(manager):
+def test_without_a_group_a_channel_link_still_offers_the_price_channel(manager):
+    """No destination group yet — the relay is impossible, the channel is not."""
     manager.state["group"] = None
     update = _private_text("https://t.me/newsroom")
 
     asyncio.run(manager.on_text(update, SimpleNamespace(bot=_bot())))
+
+    text = update.message.reply_html.await_args.args[0]
+    assert "Set the destination group first" in text and "Post prices here" in text
+    buttons = update.message.reply_html.await_args.kwargs["reply_markup"]
+    assert [b.callback_data for row in buttons.inline_keyboard for b in row] == \
+        ["fwd_src_offer_channel", "fwd_src_offer_no"]
+    assert manager.forward_sources() == {}
+    assert manager.source_offer(ADMIN)["chat_id"] == NEWS_CHANNEL
+
+
+def test_without_a_group_first_a_group_link_says_what_is_missing(manager):
+    manager.state["group"] = None
+    fake = _bot()
+    fake.get_chat = AsyncMock(return_value=_chat(SIGNALS_GROUP, "supergroup", "Signals"))
+
+    update = _private_text("https://t.me/signals")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
 
     assert "Set the destination group first" in update.message.reply_html.await_args.args[0]
     assert manager.source_offer(ADMIN) is None
@@ -688,12 +710,29 @@ def test_a_full_picker_says_the_limit_is_reached(manager):
     manager.state["group"] = GROUP
     for index in range(manager.MAX_FORWARD_SOURCES):
         manager.add_forward_source(-200000 - index, f"Chat {index}", "channel")
+    fake = _bot()
+    fake.get_chat = AsyncMock(return_value=_chat(SIGNALS_GROUP, "supergroup", "Signals"))
+
+    update = _private_text("https://t.me/signals")
+    asyncio.run(manager.on_text(update, SimpleNamespace(bot=fake)))
+
+    assert "limit of" in update.message.reply_html.await_args.args[0]
+    assert manager.source_offer(ADMIN) is None
+
+
+def test_a_full_picker_still_offers_a_channel_as_the_price_channel(manager):
+    manager.state["group"] = GROUP
+    for index in range(manager.MAX_FORWARD_SOURCES):
+        manager.add_forward_source(-200000 - index, f"Chat {index}", "channel")
 
     update = _private_text("https://t.me/newsroom")
     asyncio.run(manager.on_text(update, SimpleNamespace(bot=_bot())))
 
-    assert "limit of" in update.message.reply_html.await_args.args[0]
-    assert manager.source_offer(ADMIN) is None
+    text = update.message.reply_html.await_args.args[0]
+    assert "limit of" in text and "Post prices here" in text
+    buttons = update.message.reply_html.await_args.kwargs["reply_markup"]
+    assert [b.callback_data for row in buttons.inline_keyboard for b in row] == \
+        ["fwd_src_offer_channel", "fwd_src_offer_post", "fwd_src_offer_no"]
 
 
 def test_the_offer_warns_when_the_bot_is_not_an_admin(manager):
@@ -878,7 +917,7 @@ def test_the_offer_has_no_post_button_when_auto_forward_is_off(manager):
 
     buttons = update.message.reply_html.await_args.kwargs["reply_markup"]
     assert [b.callback_data for row in buttons.inline_keyboard for b in row] == \
-        ["fwd_src_offer_add", "fwd_src_offer_no"]
+        ["fwd_src_offer_add", "fwd_src_offer_channel", "fwd_src_offer_no"]
 
 
 def test_nothing_means_neither_added_nor_posted(manager):

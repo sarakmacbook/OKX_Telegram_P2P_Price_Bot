@@ -352,6 +352,68 @@ def test_the_startchannel_deep_link_registers_the_channel(router):
     assert router.bot.state["channel"] == CHANNEL
 
 
+def _private_command(text):
+    """A command an admin sends in the private chat, arguments included."""
+    return {"update_id": 8, "message": {
+        "message_id": 16, "date": 0, "text": text,
+        "chat": {"id": ADMIN, "type": "private"},
+        "from": {"id": ADMIN, "is_bot": False, "first_name": "Admin"},
+        "entities": [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]}}
+
+
+def _admin_channel(router, chat_id, title="News", username=""):
+    """Telegram's answers for a channel the bot is an admin of."""
+    router.calls["get_chat"].return_value = SimpleNamespace(id=chat_id, type="channel",
+                                                            title=title, username=username)
+    router.calls["get_chat_member"].return_value = SimpleNamespace(status="administrator",
+                                                                   can_post_messages=True)
+
+
+def test_setchannel_with_a_link_registers_the_channel(router):
+    """/setchannel t.me/name — a public channel named by its link, from the private chat."""
+    _admin_channel(router, NEWS, "News", "newsroom")
+
+    calls = router.send(_private_command("/setchannel t.me/newsroom"))
+
+    assert router.bot.state["channel"] == NEWS
+    assert router.bot.state["channel_title"] == "News"
+    calls["get_chat"].assert_awaited_once_with("@newsroom")
+    assert "is the channel the price post goes to" in calls["send_message"].await_args.kwargs["text"]
+
+
+def test_a_private_channel_link_registers_its_chat_id(router):
+    """``t.me/c/<id>/<message>`` is the only link a private channel has."""
+    _admin_channel(router, -1001234567890, "VIP signals")
+
+    router.send(_private_command("/setchannel https://t.me/c/1234567890/15"))
+
+    router.calls["get_chat"].assert_awaited_once_with(-1001234567890)
+    assert router.bot.state["channel"] == -1001234567890
+
+
+def test_the_channel_picker_registers_a_joined_channel(router):
+    """📢 Set channel lists the chats the bot was added to — one tap registers one."""
+    _admin_channel(router, NEWS, "News", "newsroom")
+    router.bot.remember_chat(NEWS, "News", "channel", "newsroom")
+
+    router.send(_callback("channel_menu"))
+    router.send(_callback(f"pick_channel:{NEWS}"))
+
+    assert router.bot.state["channel"] == NEWS
+    assert router.bot.state["channel_title"] == "News"
+
+
+def test_a_channel_link_can_be_tapped_into_the_price_channel(router):
+    """The ➕ offer a link produces answers 📢 too — without touching the relay."""
+    _admin_channel(router, NEWS, "News", "newsroom")
+    router.send(_private("https://t.me/newsroom"))
+
+    router.send(_callback("fwd_src_offer_channel"))
+
+    assert router.bot.state["channel"] == NEWS
+    assert router.bot.forward_sources() == {}
+
+
 # ── ↪️ forwarding from a chat the admin picked ──────────────────────────────
 NEWS, SIGNALS = -100555, -100777
 
