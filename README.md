@@ -376,12 +376,14 @@ docker compose up -d --build
    - `https://www.okx.com/p2p/ads-merchant?publicUserId=…`
    - `https://www.bitget.com/p2p/merchant/…`
 4. Tap **🟢 Auto: ON** — prices are posted whenever they change.
-5. Optional: **📢 Set channel** to post into a channel too. New posts from that
-   channel are also auto-forwarded into the configured group by default; toggle
-   this with **⚙️ Settings → ↪️ Channel → group**, and pick *which* channels or
-   groups to forward from in **⚙️ Settings → ↪️ Forward from** — add one by
-   sending the bot its **link** (`t.me/name`, `@name`) or by **forwarding a post**
-   from it (the way for a private channel), then tap **➕**. Check **🛡 Anti-scam** so
+5. Optional: **📢 Set channel** to post into a channel too — pick one of the
+   channels the bot has joined, send its **link** (`t.me/name`, `@name`, a private
+   `t.me/c/…` link or its `-100…` id), or let **📲** add the bot for you. New posts
+   from that channel are also auto-forwarded into the configured group by default;
+   toggle this with **⚙️ Settings → ↪️ Channel → group**, and pick *which* channels
+   or groups to forward from in **⚙️ Settings → ↪️ Forward from** — tap one of the
+   chats the bot has joined (**🗂**), send its **link**, or **forward a post** from
+   it (the way for a private channel), then tap **➕**. Check **🛡 Anti-scam** so
    newcomers have to type a random word before they can post.
 
 ### Panel buttons
@@ -392,7 +394,7 @@ docker compose up -d --build
 | 🟢/🔴 **Auto** | Toggle automatic posting on price change |
 | 📋 **Merchants** | List merchants — tap one to remove |
 | 👥 **Set group** | One click: choose the group that receives updates |
-| 📢 **Set channel** | One click: add the bot to a channel and post the prices there too |
+| 📢 **Set channel** | The price channel: **pick one the bot has joined** (public or private), **add one by link** (`t.me/name`, `@name`, `t.me/+hash`, a private `t.me/c/…` link or a `-100…` id), or use **📲** to let Telegram add the bot with the rights it needs — see [📢 Post to a channel](#-post-to-a-channel-in-addition-to-the-group) |
 | 🛡 **Anti-scam** | Mute newcomers until they type a random word — see [🛡 Anti-scam verification](#-anti-scam-verification) |
 | ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **🧹 group cleanup** (join notices + the useless messages), **📤 private-message forwarding**, **↪️ forwarding into the group + which chats to forward from** (by deep link, by pasting a link, or by forwarding a post — private channels included), **🖼 button icons & post banner** |
 | 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
@@ -687,18 +689,25 @@ private. The 🧹 screen also counts what it removed and shows the last reason.
 The same price post can go to a **channel** as well as to your group — handy when
 you want a public rate channel and a discussion group.
 
-1. Open your bot → `/start` → **📢 Set channel** and pick your channel. Telegram adds
-   the bot with the rights it needs (post / edit / delete messages).
-   *Prefer the terminal?* Add the bot to the channel as an admin yourself, then send
-   `/setchannel` inside the channel.
-2. That is it: from now on **every price post goes to both** chats.
+Open your bot → `/start` → **📢 Set channel** and choose one of the three ways:
+
+| Way | What to do |
+|---|---|
+| 🗂 **Pick a channel the bot has joined** | The menu lists every channel the bot was added to — **public and private** — with its link or id under the name. Tap one and it is the price channel. |
+| 🔗 **Add by link** | Tap **🔗 Add by link** and send the channel's link: `t.me/name`, `@name`, `t.me/name/12`, `t.me/s/name`, an invite (`t.me/+hash`), a **private** channel's `t.me/c/1234/5` link (*Copy link* on any post) or its `-100…` id. `/setchannel t.me/name` does the same in one line. |
+| 📲 **Add the bot to a channel** | The deep link makes Telegram add the bot to any channel of yours with the rights it needs, and it registers itself — the way for a channel the bot is **not** in yet. |
+
+*Prefer the terminal?* Add the bot to the channel as an admin yourself, then send
+`/setchannel` inside the channel. That is it: from now on **every price post goes
+to both** chats.
 
 | | |
 |---|---|
 | Independent | The group and the channel each keep their **own** last message — the previous post is deleted in each chat separately, and the ⏰ auto-delete timer applies to both. |
 | Adding later | Setting a channel does **not** repost to the group; only the new chat gets a post. |
-| Removing | Remove the bot from a chat and it is unset automatically. |
-| Permissions | In a channel the bot must be an **admin** with the right to post and delete messages. |
+| Removing | Remove the bot from a chat and it is unset automatically — or tap **🗑 Unset the channel** in that menu (the chat stays in the pick-list). |
+| Permissions | In a channel the bot must be an **admin** with the right to post and delete messages. A channel named by link is checked first: the bot says so when it is not a member yet, or when it is a member that may not post. |
+| Which chats are listed | Every channel or group the bot is added to, plus the ones already in use (the group, the channel, the ↪️ sources) — so a chat registered before this menu existed is listed too. A bot can only see **its own** chats: Telegram has no way to list the channels *you* joined. |
 
 ### ↪️ Forward posts into the group — you pick from where
 
@@ -718,9 +727,10 @@ protected posts) goes out as a real forward instead — Telegram's own
 | Default | Nothing selected → the **configured price channel** is relayed, which is what the bot did before this option existed |
 | Add a channel | **📢 Add a channel** in that menu (a deep link that adds the bot as an admin), or send `/forwardfrom` inside the channel |
 | Add a group | **👥 Add a group** in that menu, or send `/forwardfrom` inside the group |
+| Pick one the bot has joined | **🗂 Pick a chat the bot has joined** in that menu — every channel *and* group the bot was added to, **public and private**, one tap each |
 | Add by link | Send the chat's **public link** to the bot in its private chat — `t.me/name`, `@name`, `t.me/name/12`, `t.me/s/name` or an invite (`t.me/+hash`). The bot looks the chat up and answers with **➕ Forward from …** |
 | Add a private channel | A private channel has **no public link**: send its `t.me/c/…` link (*Copy link* on a post) **or forward any of its posts** to the bot's private chat — the post itself names the channel. The bot answers with the same ➕ button |
-| Confirming | ➕ starts the relay (and switches it ON if it was OFF); **📤 Post it instead** sends the message the classic 📤 way (nothing is selected); **✖️ Nothing** does neither. An offer stays valid for an hour — the message is never posted or dropped without an answer |
+| Confirming | ➕ starts the relay (and switches it ON if it was OFF); **📢 Post prices into channel** (a link to a channel) makes it the [price channel](#-post-to-a-channel-in-addition-to-the-group) instead; **📤 Post it instead** sends the message the classic 📤 way (nothing is selected); **✖️ Nothing** does neither. An offer stays valid for an hour — the message is never posted or dropped without an answer |
 | Stop | `/stopforward` inside that chat, or tap it in the menu |
 | One tap | **📢 Use the price channel** adds the channel the prices go to |
 
@@ -985,7 +995,8 @@ python -m pytest tests -q
 ```
 
 The suite covers the ad-link templates, the Buy/Sell button targets, clickable prices, the
-group/channel destinations, 📤 auto-forward, the ↪️ forward-source selection, the 🛡 anti-scam
+group/channel destinations, 📤 auto-forward, the ↪️ forward-source selection, the 🗂 channel
+picker (adding a channel by link or picking one the bot has joined), the 🛡 anti-scam
 check and the state backends — no Telegram calls are made.
 
 ---
