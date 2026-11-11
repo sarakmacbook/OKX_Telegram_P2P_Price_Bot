@@ -2568,6 +2568,7 @@ def settings_kb():
            callback_data="toggle_joinleft")],
         [B("📝 Edit Header", callback_data="edit_header"), B("📝 Edit Body", callback_data="edit_body")],
         [B("📝 Edit Footer", callback_data="edit_footer"), B("🗑 Clear Custom Msg", callback_data="clear_custom")],
+        [B("🎨 Message templates", callback_data="tmpl_menu")],
         [B(f"🗄 Database: {'connected ✅' if db_is_persistent() else 'connect ⚠️'}", callback_data="database")],
         [B("🖼 Button icons", callback_data="button_icons"),
          B("🖼 Post banner", callback_data="banner_menu")],
@@ -2919,8 +2920,194 @@ def reset_adlinks():
     state["settings"]["btn_link_mode"] = DEFAULT_SETTINGS["btn_link_mode"]
     save()
 
+# ── 🎨 message templates ────────────────────────────────────────────────────
+# Ready-made header/body/footer sets for the group post, applied with one tap.
+# A header/footer may only use the placeholders ``apply_template`` knows
+# ({ASSET} {FIAT} {PAIR}); the body is repeated once per merchant and may use
+# every body placeholder.  Each preset is plain text, so the admin can edit the
+# result afterwards exactly like hand-written custom text.
+MESSAGE_TEMPLATES = {
+    "classic": {
+        "title": "Classic",
+        "about": "the default three-line look — exchange, merchant, sell and buy",
+        "header": "📊 <b>P2P {ASSET}/{FIAT}</b>",
+        "body": ("{ICON} <b>{EXCHANGE}</b> · {LINK}\n"
+                 "🔴 Sell: <b>{SELL}</b> 💧 {SELL_AMOUNT} {ASSET}\n"
+                 "🟢 Buy: <b>{BUY}</b> 💧 {BUY_AMOUNT} {ASSET}"),
+        "footer": "⚡️ Updated automatically · Always check the ad before trading",
+    },
+    "compact": {
+        "title": "Compact",
+        "about": "one line per merchant — a long list stays short",
+        "header": "📊 <b>{PAIR} P2P rates</b>",
+        "body": "{ICON} {LINK} · 🔴 {SELL} · 🟢 {BUY} {FIAT}",
+        "footer": "👆 Tap a button to open the merchant",
+    },
+    "detailed": {
+        "title": "Detailed",
+        "about": "clickable prices, liquidity and the exchange name",
+        "header": "💹 <b>P2P {ASSET}/{FIAT} — live merchant rates</b>",
+        "body": ("{ICON} <b>{EXCHANGE}</b> · {LINK}\n"
+                 "🔴 Sell <b>{SELL_LINK}</b> {FIAT} · 💧 {SELL_AMOUNT} {ASSET}\n"
+                 "🟢 Buy <b>{BUY_LINK}</b> {FIAT} · 💧 {BUY_AMOUNT} {ASSET}"),
+        "footer": "🕒 Updated automatically · 💬 Questions? Contact the admin",
+    },
+    "minimal": {
+        "title": "Minimal",
+        "about": "just the merchant and both prices — no header clutter",
+        "header": "📊 <b>{PAIR}</b>",
+        "body": "{ICON} {NICK} — 🔴 {SELL} / 🟢 {BUY}",
+        "footer": "",
+    },
+    "khmer": {
+        "title": "Khmer · ខ្មែរ",
+        "about": "bilingual Khmer/English labels for a Cambodian audience",
+        "header": "📊 <b>តម្លៃ P2P {ASSET}/{FIAT}</b> · Live rates",
+        "body": ("{ICON} <b>{EXCHANGE}</b> · {LINK}\n"
+                 "🔴 លក់ / Sell: <b>{SELL}</b> {FIAT}\n"
+                 "🟢 ទិញ / Buy: <b>{BUY}</b> {FIAT}"),
+        "footer": "⚡️ តម្លៃធ្វើបច្ចុប្បន្នភាពដោយស្វ័យប្រវត្តិ · Updated automatically",
+    },
+    "promo": {
+        "title": "Promo",
+        "about": "a bold headline for a busy group",
+        "header": "🔥 <b>BEST {ASSET}/{FIAT} RATES</b> 🔥",
+        "body": ("{ICON} <b>{EXCHANGE}</b> · {LINK}\n"
+                 "🔴 SELL <b>{SELL}</b> {FIAT}  |  🟢 BUY <b>{BUY}</b> {FIAT}"),
+        "footer": "✅ Verified merchants · Tap below to trade",
+    },
+}
+
+# Sample values for the preview — every placeholder a preset may use, so the
+# admin sees the real look before anything is applied.
+TEMPLATE_SAMPLE_PROFILE = "https://www.okx.com/p2p/ads-merchant?publicUserId=0dec824eed"
+TEMPLATE_SAMPLE = {
+    "ASSET": ASSET, "asset": ASSET.lower(), "Asset": ASSET.title(),
+    "FIAT": FIAT, "fiat": FIAT.lower(), "Fiat": FIAT.title(),
+    "PAIR": f"{ASSET}/{FIAT}", "pair": f"{ASSET}/{FIAT}",
+    "ICON": ICON.get("okx", "💱"),
+    "EXCHANGE": "OKX", "exchange": "okx", "Exchange": "OKX",
+    "NICK": "Fast_sonic", "nick": "Fast_sonic", "Nick": "Fast_sonic",
+    "URL": TEMPLATE_SAMPLE_PROFILE, "url": TEMPLATE_SAMPLE_PROFILE,
+    "LINK": f'<a href="{TEMPLATE_SAMPLE_PROFILE}">Fast_sonic</a>',
+    "Link": f'<a href="{TEMPLATE_SAMPLE_PROFILE}">Fast_sonic</a>',
+    "SELL": "0.999", "Sell": "0.999", "BUY": "1.001", "Buy": "1.001",
+    "SELL_AMOUNT": "10,645.56", "BUY_AMOUNT": "500.00",
+    "SELL_LIQ": "10,645.56", "BUY_LIQ": "500.00",
+    "SELL_URL": TEMPLATE_SAMPLE_PROFILE, "BUY_URL": TEMPLATE_SAMPLE_PROFILE,
+    "SELL_AD_URL": TEMPLATE_SAMPLE_PROFILE, "BUY_AD_URL": TEMPLATE_SAMPLE_PROFILE,
+    "SELL_AD_ID": "260912150134452", "BUY_AD_ID": "260912150134999",
+    "SELL_LINK": f'<a href="{TEMPLATE_SAMPLE_PROFILE}">0.999</a>',
+    "BUY_LINK": f'<a href="{TEMPLATE_SAMPLE_PROFILE}">1.001</a>',
+    "ERROR": "", "error": "",
+}
+
+
+def message_template(template_id) -> dict | None:
+    """The preset with that id, or ``None`` — ids come from callback_data."""
+    return MESSAGE_TEMPLATES.get(template_id if isinstance(template_id, str) else "")
+
+
+def render_template_sample(text: str) -> str:
+    """Fill a template with sample values for the preview (single pass)."""
+    if not text:
+        return ""
+    keys = sorted(TEMPLATE_SAMPLE, key=len, reverse=True)
+    pattern = re.compile(r"\{(" + "|".join(re.escape(k) for k in keys) + r")\}")
+    return pattern.sub(lambda m: TEMPLATE_SAMPLE[m.group(1)], text)
+
+
+def active_message_template() -> dict | None:
+    """The preset whose header/body/footer are exactly what is set now."""
+    s = get_settings()
+    current = (s.get("custom_header") or "", s.get("custom_body") or "",
+               s.get("custom_footer") or "")
+    for tmpl in MESSAGE_TEMPLATES.values():
+        if current == (tmpl["header"], tmpl["body"], tmpl["footer"]):
+            return tmpl
+    return None
+
+
+def custom_message_is_empty() -> bool:
+    s = get_settings()
+    return not any((s.get(key) or "").strip()
+                   for key in ("custom_header", "custom_body", "custom_footer"))
+
+
+def apply_message_template(tmpl: dict) -> None:
+    """Replace header, body and footer with one preset and persist it."""
+    state["settings"]["custom_header"] = tmpl["header"]
+    state["settings"]["custom_body"] = tmpl["body"]
+    state["settings"]["custom_footer"] = tmpl["footer"]
+    save()
+
+
+def reset_custom_message() -> None:
+    """Go back to the built-in look (no custom header/body/footer)."""
+    for key in ("custom_header", "custom_body", "custom_footer"):
+        state["settings"][key] = ""
+    save()
+
+
+def templates_text():
+    in_use = active_message_template()
+    current = (f"🎨 <b>{html_escape(in_use['title'])}</b> ✅" if in_use
+               else ("↩️ <b>Built-in default</b>" if custom_message_is_empty()
+                     else "✏️ <b>Your own text</b>"))
+    lines = [
+        "🎨 <b>Message templates</b>",
+        "",
+        "Ready-made looks for the group post. Applying one replaces the "
+        "<b>Header</b>, <b>Body</b> and <b>Footer</b> at once; you can still edit "
+        "each of them afterwards with 📝 Edit Header / Body / Footer.",
+        "",
+        f"Now in use: {current}",
+        "",
+        "Tap a template to preview it with sample values, then ✅ Use this template.",
+        "Nothing is posted to the group — the next 📊 Post prices now (or automatic "
+        "update) uses it.",
+    ]
+    return "\n".join(lines)
+
+
+def templates_kb():
+    active = active_message_template()
+    rows = []
+    for template_id, tmpl in MESSAGE_TEMPLATES.items():
+        mark = " ✅" if active is tmpl else ""
+        rows.append([B(f"🎨 {tmpl['title']}{mark}", callback_data=f"tmpl_view:{template_id}")])
+    rows.append([B("↩️ Built-in default", callback_data="tmpl_reset")])
+    rows.append([B("⬅️ Back", callback_data="custom_menu")])
+    return KB(rows)
+
+
+def template_text(tmpl: dict):
+    preview = "\n\n".join(part for part in (
+        render_template_sample(tmpl["header"]),
+        render_template_sample(tmpl["body"]),
+        render_template_sample(tmpl["footer"]),
+    ) if part)
+    return (
+        f"🎨 <b>{html_escape(tmpl['title'])}</b> — {html_escape(tmpl['about'])}\n\n"
+        f"<b>Preview</b> <i>(sample values)</i>\n{preview}\n\n"
+        f"<b>Header</b>\n<code>{html_escape(tmpl['header'])}</code>\n\n"
+        f"<b>Body</b> <i>(once per merchant)</i>\n<code>{html_escape(tmpl['body'])}</code>\n\n"
+        f"<b>Footer</b>\n<code>{html_escape(tmpl['footer']) if tmpl['footer'] else '(none)'}</code>\n\n"
+        f"✅ Use this template replaces your current header, body and footer. "
+        f"Send /cancel at any time while editing by hand."
+    )
+
+
+def template_kb(template_id: str):
+    return KB([
+        [B("✅ Use this template", callback_data=f"tmpl_apply:{template_id}")],
+        [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="tmpl_menu")],
+    ])
+
+
 def custom_menu_kb():
     return KB([
+        [B("🎨 Message templates", callback_data="tmpl_menu")],
         [B("📝 Edit Header", callback_data="edit_header"), B("📝 Edit Body", callback_data="edit_body")],
         [B("📝 Edit Footer", callback_data="edit_footer"), B("🗑 Clear All Custom", callback_data="clear_custom")],
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="panel")]
@@ -3764,6 +3951,8 @@ def custom_menu_text():
         f"📝 <b>Custom Message</b>\n\n"
         f"Customize the full group post. The <b>Header</b> appears once on top, the <b>Body</b> "
         f"is repeated for every merchant, and the <b>Footer</b> appears once at the bottom.\n\n"
+        f"🎨 <b>Message templates</b> has ready-made looks — apply one with a single tap and "
+        f"edit it afterwards if you want.\n\n"
         f"<b>Current Header:</b>\n{header}\n\n"
         f"<b>Current Body (per merchant):</b>\n{body}\n\n"
         f"<b>Current Footer:</b>\n{footer}\n\n"
@@ -4825,6 +5014,21 @@ def cleanup_kb():
 
 
 # ── custom message helpers ──
+# Every placeholder ``apply_body_template`` fills.  A 🎨 template body may only
+# use these names, so a preset can never show a raw ``{…}`` in the group post.
+BODY_PLACEHOLDERS = frozenset({
+    "ASSET", "asset", "Asset", "FIAT", "fiat", "Fiat", "PAIR", "pair",
+    "ICON", "EXCHANGE", "exchange", "Exchange", "NICK", "nick", "Nick",
+    "URL", "url", "LINK", "Link", "SELL", "Sell", "BUY", "Buy",
+    "SELL_AMOUNT", "BUY_AMOUNT", "SELL_LIQ", "BUY_LIQ",
+    "SELL_URL", "BUY_URL", "SELL_AD_URL", "BUY_AD_URL",
+    "SELL_AD_ID", "BUY_AD_ID", "SELL_LINK", "BUY_LINK", "ERROR", "error",
+})
+# What a header/footer may use — ``apply_template`` fills exactly these.
+HEADER_PLACEHOLDERS = frozenset({"ASSET", "asset", "Asset", "FIAT", "fiat",
+                                 "Fiat", "PAIR", "pair"})
+
+
 def apply_template(text: str) -> str:
     if not text:
         return ""
@@ -6102,6 +6306,39 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif d == "custom_menu":
         await q.answer()
         return await q.edit_message_text(custom_menu_text(), parse_mode="HTML", reply_markup=custom_menu_kb())
+
+    elif d == "tmpl_menu":
+        if edit_get(u, "awaiting_custom"):
+            edit_pop(u, "awaiting_custom")
+        await q.answer()
+        return await q.edit_message_text(templates_text(), parse_mode="HTML",
+                                         reply_markup=templates_kb())
+
+    elif d.startswith("tmpl_view:"):
+        tmpl = message_template(d.split(":", 1)[1])
+        if tmpl is None:
+            return await q.answer("Unknown template", show_alert=True)
+        await q.answer()
+        return await q.edit_message_text(template_text(tmpl), parse_mode="HTML",
+                                         reply_markup=template_kb(d.split(":", 1)[1]))
+
+    elif d.startswith("tmpl_apply:"):
+        template_id = d.split(":", 1)[1]
+        tmpl = message_template(template_id)
+        if tmpl is None:
+            return await q.answer("Unknown template", show_alert=True)
+        edit_pop(u, "awaiting_custom")
+        apply_message_template(tmpl)
+        await q.answer(f"✅ {tmpl['title']} applied")
+        return await q.edit_message_text(custom_menu_text(), parse_mode="HTML",
+                                         reply_markup=custom_menu_kb())
+
+    elif d == "tmpl_reset":
+        edit_pop(u, "awaiting_custom")
+        reset_custom_message()
+        await q.answer("↩️ Built-in default restored")
+        return await q.edit_message_text(templates_text(), parse_mode="HTML",
+                                         reply_markup=templates_kb())
 
     elif d == "button_icons":
         if edit_get(u, "awaiting_custom"):
