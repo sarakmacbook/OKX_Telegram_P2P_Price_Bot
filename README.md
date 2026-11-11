@@ -398,7 +398,7 @@ docker compose up -d --build
 | 🛡 **Anti-scam** | Mute newcomers until they type a random word — see [🛡 Anti-scam verification](#-anti-scam-verification) |
 | ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **🧹 group cleanup** (join notices + the useless messages), **📤 private-message forwarding**, **↪️ forwarding into the group + which chats to forward from** (by deep link, by pasting a link, or by forwarding a post — private channels included), **🖼 button icons & post banner** |
 | 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
-| 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer |
+| 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer — or pick a ready-made **🎨 Message template** |
 | 👁 **Preview** | See exactly how the group post will look |
 | 🔄 **Refresh** | Refresh the panel |
 
@@ -435,6 +435,28 @@ HTML (`<b>`, `<i>`, `<code>`, `<a href>`) and new lines are supported. Example 3
 ```
 
 Use **👁 Preview** to check the result before it goes to the group.
+
+### 🎨 Message templates — one tap, ready-made looks
+
+Writing a header, body and footer by hand is optional. **📝 Custom Msg → 🎨 Message templates**
+(or **⚙️ Settings → 🎨 Message templates**) lists ready-made looks for the whole post. Tap one
+to see a preview rendered with sample values and the raw template, then **✅ Use this template**:
+it replaces the header, body and footer at once. Nothing is posted — the next
+**📊 Post prices now** (or the automatic update) uses the new look.
+
+| Template | Look |
+|---|---|
+| 🎨 **Classic** | The default three-line post: exchange · merchant, 🔴 sell and 🟢 buy with liquidity |
+| 🎨 **Compact** | One line per merchant (`{ICON} {LINK} · 🔴 … · 🟢 …`) — a long merchant list stays short |
+| 🎨 **Detailed** | Exchange, merchant, clickable prices and liquidity on separate lines |
+| 🎨 **Minimal** | Just the merchant and both prices, no header clutter, no footer |
+| 🎨 **Khmer · ខ្មែរ** | Bilingual Khmer/English labels (🔴 លក់ / Sell, 🟢 ទិញ / Buy) |
+| 🎨 **Promo** | A bold 🔥 headline for a busy group |
+
+The template that matches the current text is marked **✅**, and **↩️ Built-in default** clears
+the three fields again (same as **🗑 Clear Custom Msg**). Applying a template is not a lock:
+every field stays editable with 📝 Edit Header / Body / Footer, and any custom text of your own
+is reported as **✏️ Your own text** on the templates screen.
 
 ### 🔘 Manage buttons — add, remove, labels & links
 
@@ -994,7 +1016,8 @@ pip install -r requirements.txt pytest
 python -m pytest tests -q
 ```
 
-The suite covers the ad-link templates, the Buy/Sell button targets, clickable prices, the
+The suite covers the ad-link templates, the 🎨 message templates (every preset renders with the
+placeholders the bot actually fills), the Buy/Sell button targets, clickable prices, the
 group/channel destinations, 📤 auto-forward, the ↪️ forward-source selection, the 🗂 channel
 picker (adding a channel by link or picking one the bot has joined), the 🛡 anti-scam
 check and the state backends — no Telegram calls are made.
