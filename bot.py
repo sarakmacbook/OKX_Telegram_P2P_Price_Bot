@@ -1931,7 +1931,9 @@ def empty_state():
             # ↪️ messages the bot itself posted into a source chat ("chat:msg" → ts)
             "own_messages": {},
             # 💾 first /start asked which database type to add (asked once)
-            "db_setup_offered": False}
+            "db_setup_offered": False,
+            # 🚀 the first-start checklist (group/channel + merchant) was shown
+            "setup_offered": False}
 
 
 def load():
@@ -2545,6 +2547,11 @@ def panel():
          B(f"🔘 Buttons: {'ON' if s.get('show_buttons') else 'OFF'}", callback_data="toggle_buttons")],
         [B("🔘 Manage buttons", callback_data="buttons_menu")],
     ]
+    # 🚀 Until the required steps are done the bot cannot post; the checklist is
+    # the fastest way back to them.
+    if not setup_ready():
+        rows.append([B(f"🚀 Finish setup ({len(setup_missing())} left)",
+                       callback_data="setup")])
     # No shared database means this install forgets its group, merchants and
     # prices; put the way to fix that in front of the admin, not in a manual.
     if not db_is_persistent():
@@ -2626,6 +2633,115 @@ def database_provider_text() -> str:
         "Not listed? <b>➕ Add / change database</b> supports any host, or paste the full "
         "connection URI / provider snippet straight into this chat."
     )
+
+# ── 🚀 first-time setup: what must be true before posting works ────────────
+# The bot can start with nothing, but it cannot *post* with nothing: prices need
+# a destination and at least one merchant. Those two are required, so the first
+# start names them and 📊 Post / 🟢 Auto refuse to run until they are done. A
+# database is recommended (a restart forgets everything without one) but the bot
+# is explicitly allowed to run without it.
+SETUP_REQUIRED = ("destination", "merchants")
+
+
+def setup_state() -> dict:
+    """Which first-start requirements are met right now."""
+    return {"destination": bool(state.get("group") or state.get("channel")),
+            "merchants": bool(state.get("merchants")),
+            "database": db_is_persistent()}
+
+
+def setup_missing() -> list[str]:
+    """The required steps still missing, in checklist order."""
+    steps = setup_state()
+    return [name for name in SETUP_REQUIRED if not steps[name]]
+
+
+def setup_ready() -> bool:
+    """Whether the bot has what it needs to post prices."""
+    return not setup_missing()
+
+
+def _setup_where() -> str:
+    """The destination(s) in words — secret-free, HTML-safe."""
+    parts = []
+    if state.get("group"):
+        parts.append(f"group <b>{html_escape(group_label() or str(state['group']))}</b>")
+    if state.get("channel"):
+        parts.append(f"channel <b>{html_escape(channel_label() or str(state['channel']))}</b>")
+    return " + ".join(parts)
+
+
+def setup_text() -> str:
+    """The checklist: required steps first, then the recommended database."""
+    steps = setup_state()
+    count = len(state["merchants"])
+    if setup_ready():
+        head = "✅ <b>Setup complete</b> — the bot has everything it needs to post prices.\n\n"
+    else:
+        left = len(setup_missing())
+        head = (f"🚀 <b>First-time setup</b> — {left} required step"
+                f"{'s' if left != 1 else ''} left before the bot can post prices.\n\n")
+    lines = [
+        f"{'✅' if steps['destination'] else '⬜'} <b>1. Where prices go</b> — " + (
+            _setup_where() if steps["destination"] else
+            "add the bot to your group (or channel), then set it with the buttons below."),
+        f"{'✅' if steps['merchants'] else '⬜'} <b>2. At least one merchant</b> — " + (
+            f"<b>{count}</b> added" if count else
+            "paste a merchant's public link in this chat (OKX, Binance, Bybit, Bitget)."),
+        f"{'✅' if steps['database'] else '⬜'} <b>Database</b> — " + (
+            "connected ✅" if steps["database"] else
+            ("strongly recommended on this host: every restart forgets the group, merchants "
+             "and prices — use ⚡ Quick connect." if on_vercel() else
+             "recommended: without one, a restart forgets the group, merchants and prices.")),
+    ]
+    tail = ("\n\n✅ 📊 Post prices and 🟢 Auto work now." if setup_ready() else
+            "\n\n⚠️ <b>📊 Post prices and 🟢 Auto stay off until steps 1 and 2 are done.</b>")
+    return head + "\n".join(lines) + tail
+
+
+def setup_kb() -> KB:
+    """Buttons that complete the checklist — nothing here needs a typed command."""
+    rows = [[set_group_button(), set_channel_button()],
+            [B("➕ Add merchant", callback_data="setup_merchant"), database_button()],
+            [B("🔄 Re-check", callback_data="setup_refresh")]]
+    if setup_ready():
+        rows.insert(0, [B("📊 Post prices now", callback_data="post")])
+    rows.append([B("🎛 Open panel", callback_data="panel")])
+    return KB(rows)
+
+
+def setup_merchant_text() -> str:
+    """How a merchant is added: there is nothing to type but its public link."""
+    return (
+        "➕ <b>Add a merchant</b>\n\n"
+        "Paste the merchant's <b>public profile link</b> in this chat — for example:\n"
+        "<code>https://www.okx.com/p2p/ads-merchant?publicUserId=…</code>\n\n"
+        "OKX, Binance, Bybit and Bitget links all work. The bot replies with the merchant's "
+        "current sell/buy prices and starts watching them; a second link can be pasted "
+        "straight after the first.\n\n"
+        "📋 <b>Merchants</b> lists them (and removes one); ➕ <b>Add merchant</b> can be used "
+        "again whenever you like."
+    )
+
+
+#: How a missing required step is named in a one-line refusal.
+SETUP_LABELS = {"destination": "a destination for the prices (group or channel)",
+                "merchants": "at least one merchant"}
+
+
+def setup_needed_note() -> str:
+    """One line for a gate: what exactly is still missing."""
+    return " and ".join(SETUP_LABELS[name] for name in setup_missing())
+
+
+async def send_setup_checklist(u: Update) -> None:
+    """Send the first-start checklist (never fatal — the panel still follows)."""
+    try:
+        await u.message.reply_html(setup_text(), reply_markup=setup_kb(),
+                                   disable_web_page_preview=True)
+    except Exception as e:                               # pragma: no cover - defensive
+        log.warning("Could not send the setup checklist: %s", e)
+
 
 def database_type_kb(*, later: bool = False):
     """Every database type the bot can store its state in — one button each.
@@ -2900,10 +3016,12 @@ async def database_field_answer(u: Update, value, reply) -> None:
 async def offer_database_setup(u: Update) -> None:
     """First start with no database: ask the admin to add one (all types offered).
 
-    Asked exactly once per deployment — ``db_setup_offered`` lives in the shared
-    state, so a second ``/start`` does not nag.  The 🗄 button on the panel and
-    ``/database`` remain available afterwards, and the bot keeps working either
-    way.
+    Only reached once the required first-start steps (destination and merchant)
+    are done — without them the bot cannot post, while a database only decides
+    how much it remembers.  Asked exactly once per deployment —
+    ``db_setup_offered`` lives in the shared state, so a second ``/start`` does
+    not nag.  The 🗄 button on the panel and ``/database`` remain available
+    afterwards, and the bot keeps working either way.
     """
     if db_is_persistent() or state.get("db_setup_offered"):
         return
@@ -4165,9 +4283,16 @@ async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     if is_admin(u):
         remember_private_chat(u)          # where a pinned settings copy would live
-        # First start without a database: ask which database type to add before
-        # showing the panel (once per deployment — /database stays available).
-        await offer_database_setup(u)
+        # 🚀 First start: the bot cannot post prices without a destination and a
+        # merchant, so name them once and keep the checklist one tap away on the
+        # panel.  Only after those are done is the (optional) database asked about.
+        if not setup_ready():
+            if not state.get("setup_offered"):
+                state["setup_offered"] = True
+                save()
+                await send_setup_checklist(u)
+        else:
+            await offer_database_setup(u)
         await u.message.reply_html(panel_text(), reply_markup=panel())
     else: await u.message.reply_text("⛔ You are not authorized. Ask the bot admin to add your ID.")
 
@@ -6093,12 +6218,50 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
     d = q.data
 
     if d == "post":
+        # The two required first-start steps are exactly what a post needs.
+        if not setup_ready():
+            await q.answer("⚠️ Finish setup first — the bot needs "
+                           f"{setup_needed_note()}.", show_alert=True)
+            return await q.message.reply_html(setup_text(), reply_markup=setup_kb(),
+                                              disable_web_page_preview=True)
         ok = await post(c.bot, force=True)
-        await q.answer("✅ Posted!" if ok else "⚠️ Set a group/channel and add merchants first",
-                       show_alert=not ok)
+        await q.answer("✅ Posted!" if ok else "⚠️ Nothing to post yet — check the group/channel "
+                                              "and the merchants", show_alert=not ok)
 
     elif d == "auto":
+        if not state["auto"] and not setup_ready():
+            await q.answer("⚠️ Auto needs " + setup_needed_note() + " first.", show_alert=True)
+            return await q.message.reply_html(setup_text(), reply_markup=setup_kb(),
+                                              disable_web_page_preview=True)
         state["auto"] = not state["auto"]; save(); await q.answer(f"Auto {'ON' if state['auto'] else 'OFF'}")
+
+    elif d in ("setup", "setup_refresh"):
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Open a private chat with the bot to finish setup.",
+                                  show_alert=True)
+        remember_private_chat(u)
+        if d == "setup_refresh":
+            await q.answer("✅ All required steps are done" if setup_ready()
+                           else f"{len(setup_missing())} step(s) still to do")
+        else:
+            await q.answer()
+        return await q.edit_message_text(setup_text(), parse_mode="HTML",
+                                         reply_markup=setup_kb(),
+                                         disable_web_page_preview=True)
+
+    elif d == "setup_merchant":
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Open a private chat with the bot to add a merchant.",
+                                  show_alert=True)
+        await q.answer()
+        return await q.edit_message_text(
+            setup_merchant_text(), parse_mode="HTML",
+            reply_markup=KB([[B("📋 Merchants", callback_data="list")],
+                             [B("⬅️ Back to setup", callback_data="setup")],
+                             [B("🎛 Open panel", callback_data="panel")]]),
+            disable_web_page_preview=True)
 
     elif d == "setgroup_help":
         return await q.answer("Add the bot to your group, then send /setgroup there.", show_alert=True)
