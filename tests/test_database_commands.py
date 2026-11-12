@@ -46,7 +46,7 @@ def test_database_menu_offers_custom_database_and_reset(bot, monkeypatch):
 
     callbacks = [button.callback_data for row in bot.database_kb().inline_keyboard for button in row]
 
-    assert callbacks == ["db_types", "db_reset", "db_check", "panel"]
+    assert callbacks == ["db_types", "db_quick", "db_reset", "db_check", "panel"]
     text = bot.database_text()
     assert "custom Redis-compatible REST database" in text
     assert "hidden-token" not in text
@@ -57,8 +57,9 @@ def test_database_type_menu_offers_every_database_type(bot):
     callbacks = [button.callback_data for row in bot.database_type_kb().inline_keyboard
                  for button in row]
 
-    assert callbacks == ["db_type:mysql", "db_type:postgres", "db_type:mongo",
-                         "db_type:redis", "db_type:sqlite", "db_custom", "database"]
+    assert callbacks == ["db_quick", "db_type:mysql", "db_type:postgres",
+                         "db_type:mongo", "db_type:redis", "db_type:sqlite",
+                         "db_custom", "database"]
 
 
 def test_database_command_and_custom_setup_are_admin_private_only(bot):

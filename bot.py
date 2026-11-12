@@ -2583,12 +2583,49 @@ def settings_kb():
     ])
 
 def database_kb():
-    rows = [[B("➕ Add / change database", callback_data="db_types")]]
+    rows = [[B("➕ Add / change database", callback_data="db_types")],
+            [B("⚡ Quick connect (one-tap providers)", callback_data="db_quick")]]
     if storage.custom_redis_config() or storage.custom_database_spec() is not None:
         rows.append([B("↩️ Use deployment database", callback_data="db_reset")])
     rows.append([B("🔄 Check connection", callback_data="db_check")])
     rows.append([B("⬅️ Back", callback_data="panel")])
     return KB(rows)
+
+
+def database_provider_kb():
+    """Preset providers, two per row — the host/port/TLS already known.
+
+    Each button skips the type chooser *and* most of the questions: the preset
+    fills in the port, database name, user and TLS requirement, so only the
+    endpoint host and the password are left to type.
+    """
+    from database_adapters import providers_for
+    rows, row = [], []
+    for preset in providers_for():
+        row.append(B(f"{preset['emoji']} {preset['label']}",
+                     callback_data=f"db_preset:{preset['id']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([B("⚡ Upstash / Vercel KV — REST pair", callback_data="db_custom")])
+    rows.append([B("⬅️ Back", callback_data="db_types")])
+    return KB(rows)
+
+
+def database_provider_text() -> str:
+    """The one-tap provider screen: what a preset answers for you."""
+    return (
+        "⚡ <b>Quick connect</b> — one-tap provider presets: pick the service your database "
+        "runs on.\n\n"
+        "The preset already knows that provider's port, database name, user and TLS setting, "
+        "so you only send the endpoint host (copied from the provider's dashboard) and the "
+        "password. The connection is tested before anything is switched, and your group, "
+        "merchants and settings are carried over.\n\n"
+        "Not listed? <b>➕ Add / change database</b> supports any host, or paste the full "
+        "connection URI / provider snippet straight into this chat."
+    )
 
 def database_type_kb(*, later: bool = False):
     """Every database type the bot can store its state in — one button each.
@@ -2597,6 +2634,7 @@ def database_type_kb(*, later: bool = False):
     without a database, and asking is not the same as insisting).
     """
     rows = [
+        [B("⚡ Quick connect (one-tap providers)", callback_data="db_quick")],
         [B("🐬 MySQL / MariaDB", callback_data="db_type:mysql"),
          B("🐘 PostgreSQL", callback_data="db_type:postgres")],
         [B("🍃 MongoDB", callback_data="db_type:mongo"),
@@ -2620,8 +2658,11 @@ def database_offer_text() -> str:
         "bot instance — forgets it all. All database types are supported:\n"
         "🐬 MySQL / MariaDB · 🐘 PostgreSQL · 🍃 MongoDB · 🔴 Redis · 🗃 SQLite · "
         "⚡ Redis REST (Upstash / Vercel KV)\n\n"
-        "Pick one below and send the connection URI — it is tested before anything is switched, "
-        "and your current data is carried over. You can also do this later with /database."
+        "Tap <b>⚡ Quick connect</b> for a hosted provider (Neon, Supabase, Railway, Atlas, "
+        "Upstash, Redis Cloud) — its port, database, user and TLS are already filled in — or "
+        "pick a type and send its connection URI. The connection is tested before anything is "
+        "switched, and your current data is carried over. You can also do this later with "
+        "/database."
     )
 
 def database_uri_prompt(kind: str) -> str:
@@ -2642,7 +2683,9 @@ def database_uri_prompt(kind: str) -> str:
                f"<code>{EXAMPLES[kind]}</code>")
     hint = driver_hint(kind)
     warning = f"\n\n⚠️ {hint}" if hint else ""
-    tip = ("\n\n🧩 Prefer not to write a URI? Tap <b>Enter details step by step</b> — I ask the server, "
+    tip = ("\n\n⚡ The buttons above are one-tap presets for this type — their port, database, "
+           "user and TLS are already set, so only the endpoint host and the password are asked. "
+           "🧩 Prefer to write nothing? Tap <b>Enter details step by step</b> — I ask the server, "
            "port, database, user and password one at a time." if kind != "sqlite" else "")
     secrecy = ("The password is never shown back" if kind != "sqlite"
                else "Nothing but this bot ever sees the path")
@@ -2659,8 +2702,17 @@ def database_uri_prompt(kind: str) -> str:
     )
 
 def database_uri_kb(kind: str) -> KB:
-    """Buttons under the "send the URI" prompt: step by step, or one-tap SQLite."""
-    rows = []
+    """Buttons under the "send the URI" prompt: presets, step by step, one-tap SQLite."""
+    from database_adapters import providers_for
+    rows, row = [], []
+    for preset in providers_for(kind):           # the presets valid for this type
+        row.append(B(f"{preset['emoji']} {preset['label']}",
+                     callback_data=f"db_preset:{preset['id']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     if kind != "sqlite":
         rows.append([B("🧩 Enter details step by step", callback_data=f"db_fields:{kind}")])
     elif not storage.serverless_host():
@@ -2676,42 +2728,108 @@ def _reply_to(message):
     return reply
 
 
+def _provider_slug(edits: dict) -> str:
+    """The provider preset this draft uses (``""`` when none was tapped)."""
+    return str(edits.get("db_preset") or "")
+
+
+def _asked_fields(edits: dict, kind: str) -> tuple[str, ...]:
+    """The questions still needed: a preset answers the rest from its defaults."""
+    from database_adapters import field_steps, provider_fields
+    fields = field_steps(kind)
+    preset = provider_fields(_provider_slug(edits))
+    if preset:
+        return tuple(field for field in fields if field in preset)
+    return fields
+
+
+def _first_step(edits: dict, kind: str) -> int:
+    """Index of the first question a preset still asks (``len(FIELD_STEPS)`` if none)."""
+    from database_adapters import FIELD_STEPS
+    asked = _asked_fields(edits, kind)
+    for step, field in enumerate(FIELD_STEPS):
+        if field in asked:
+            return step
+    return len(FIELD_STEPS)
+
+
+def _next_step(edits: dict, kind: str, step: int) -> int:
+    """The next question at or after ``step``, skipping preset-filled ones."""
+    from database_adapters import FIELD_STEPS
+    asked = _asked_fields(edits, kind)
+    while step < len(FIELD_STEPS) and FIELD_STEPS[step] not in asked:
+        step += 1
+    return step
+
+
 def _field_current(edits: dict, kind: str, field: str) -> str:
     """The value a step-by-step question suggests: the earlier answer, else the default.
 
     The password is never suggested: it is not kept in the draft at all.
     """
-    from database_adapters import field_default
+    from database_adapters import field_default, provider
     if field == "password":
         return ""
+    preset = provider(_provider_slug(edits))
+    if preset and field not in preset.get("defaults", {}):
+        # A preset only suggests what it actually knows: a hosted endpoint is
+        # never "localhost", and a provider-assigned port is never the standard one.
+        return ""
     drafts = edits.get("db_fields") or {}
-    return str(drafts.get(field, field_default(kind, field)))
+    return str(drafts.get(field, field_default(kind, field, _provider_slug(edits))))
 
 
 def database_field_prompt(u: Update, kind: str, step: int) -> tuple[str, KB]:
     """The question for one step of the step-by-step connection."""
-    from database_adapters import FIELD_LABELS, FIELD_STEPS, KIND_LABELS
+    from database_adapters import (FIELD_LABELS, FIELD_STEPS, KIND_LABELS, provider,
+                                   provider_fixed)
+    edits = edits_of(u)
+    preset = provider(_provider_slug(edits))
     field = FIELD_STEPS[step]
-    current = _field_current(edits_of(u), kind, field)
+    current = _field_current(edits, kind, field)
+    asked = _asked_fields(edits, kind)
+    position = asked.index(field) + 1 if field in asked else step + 1
     hints = {
-        "host": "The address of the database server: <code>localhost</code> when it runs on this "
-                "machine, otherwise its host name or IP address.",
+        "host": (f"Copy {preset['host_hint']}." if preset else
+                 "The address of the database server: <code>localhost</code> when it runs on this "
+                 "machine, otherwise its host name or IP address."),
         "port": "The port the server listens on.",
         "database": "The database that holds the bot's data. It must already exist on the server.",
         "user": "The user the bot logs in as. Leave it empty if the server needs no login.",
         "password": "Sent only here: it is never shown back and never kept in the bot's draft.",
     }
-    if field == "password":
+    # A hosted preset knows every field but the endpoint host (and sometimes the
+    # assigned port) — ask for those plainly instead of offering a shortcut that
+    # could only fail.
+    required = field in ("host", "port") and not current
+    if required:
+        answer = "Send it."
+    elif field == "password":
         answer = "Send the password, or tap <b>⏭ Skip</b> if the server has none."
     elif current:
         answer = f"Send it, or tap <b>⏭ Use suggested</b> to keep <code>{html_escape(current)}</code>."
     else:
         answer = "Send it, or tap <b>⏭ Skip</b> if it is not needed."
-    text = (f"🧩 <b>{KIND_LABELS.get(kind, kind)}</b> — question {step + 1} of {len(FIELD_STEPS)}\n\n"
-            f"<b>{FIELD_LABELS[field]}</b>\n{hints[field]}\n\n{answer}\n\n"
+    if preset:
+        heading = (f"{preset['emoji']} <b>{preset['label']}</b> — question {position} "
+                   f"of {len(asked)}")
+        where = f"\n📋 {preset['where']}"
+        fixed = provider_fixed(preset["id"])
+        known = ("\n⚡ Already set: " + " · ".join(fixed)) if fixed else ""
+    else:
+        heading = f"🧩 <b>{KIND_LABELS.get(kind, kind)}</b> — question {position} of {len(asked)}"
+        where = known = ""
+    text = (f"{heading}{where}\n\n"
+            f"<b>{FIELD_LABELS[field]}</b>\n{hints[field]}{known}\n\n{answer}\n\n"
             "Send /cancel to stop.")
-    skip = B("⏭ Use suggested" if current else "⏭ Skip", callback_data="db_field_default")
-    return text, KB([[skip], [B("❌ Cancel", callback_data="db_cancel")]])
+    rows = []
+    if preset:
+        rows.append([B("⚡ Pick another provider", callback_data="db_quick")])
+    if not required:
+        rows.append([B("⏭ Use suggested" if current else "⏭ Skip",
+                       callback_data="db_field_default")])
+    rows.append([B("❌ Cancel", callback_data="db_cancel")])
+    return text, KB(rows)
 
 
 async def database_field_answer(u: Update, value, reply) -> None:
@@ -2721,7 +2839,8 @@ async def database_field_answer(u: Update, value, reply) -> None:
     Only the non-secret answers are written to the draft; the password exists
     just for this call and is handed straight to the connection test.
     """
-    from database_adapters import FIELD_STEPS, KIND_LABELS, uri_from_fields, validate_field
+    from database_adapters import (FIELD_STEPS, KIND_LABELS, field_default, provider,
+                                   uri_from_fields, validate_field)
     edits = edits_of(u)
     kind = edits.get("db_kind", "")
     step = edits.get("db_field_step", 0)
@@ -2729,6 +2848,7 @@ async def database_field_answer(u: Update, value, reply) -> None:
         _clear_database_edit(u)
         return await reply("❌ That database draft has expired. Open /database and start again.",
                            reply_markup=database_kb())
+    preset = provider(_provider_slug(edits))
     field = FIELD_STEPS[step]
     if value is None:
         value = _field_current(edits, kind, field)
@@ -2741,27 +2861,37 @@ async def database_field_answer(u: Update, value, reply) -> None:
     drafts = edits.setdefault("db_fields", {})
     if field != "password":
         drafts[field] = clean
-        edits["db_field_step"] = step + 1
+        edits["db_field_step"] = _next_step(edits, kind, step + 1)
         save()
-    if step + 1 < len(FIELD_STEPS):
-        text, markup = database_field_prompt(u, kind, step + 1)
+    following = _next_step(edits, kind, step + 1)
+    if following < len(FIELD_STEPS):
+        text, markup = database_field_prompt(u, kind, following)
         return await reply(text, reply_markup=markup, disable_web_page_preview=True)
 
-    uri, error = uri_from_fields(kind, dict(drafts, password=clean))
+    # Preset-filled answers never reach the draft: they are merged in here, just
+    # before the URI is assembled, so a provider change cannot leave stale ones.
+    values = {name: drafts.get(name, field_default(kind, name, _provider_slug(edits)))
+              for name in FIELD_STEPS if name != "password"}
+    # The last answer is the password only when the draft actually asked for
+    # one; a preset that has no password step ends on another field.
+    values["password"] = clean if field == "password" else ""
+    uri, error = uri_from_fields(kind, values,
+                                 scheme=(preset or {}).get("scheme"),
+                                 params=(preset or {}).get("params"))
     if error:
-        edits["db_field_step"] = 0
+        edits["db_field_step"] = _first_step(edits, kind)
         save()
-        text, markup = database_field_prompt(u, kind, 0)
+        text, markup = database_field_prompt(u, kind, edits["db_field_step"])
         return await reply(f"❌ {html_escape(error)}\n\n{text}", reply_markup=markup,
                            disable_web_page_preview=True)
     okay, detail = set_custom_database_uri(kind, uri, update=u)
     if not okay:
         # Keep the non-secret answers as the suggestions and start again at the top.
-        edits["db_field_step"] = 0
+        edits["db_field_step"] = _first_step(edits, kind)
         save()
-        text, markup = database_field_prompt(u, kind, 0)
+        text, markup = database_field_prompt(u, kind, edits["db_field_step"])
         return await reply(f"❌ {html_escape(detail)}\n\nNothing was changed. The answers so far are "
-                           f"kept as suggestions — send the password again.\n\n{text}",
+                           f"kept as suggestions — send them again.\n\n{text}",
                            reply_markup=markup, disable_web_page_preview=True)
     _clear_database_edit(u)              # connected: the draft is no longer needed
     await reply_database_selected(u, reply=reply)
@@ -3368,6 +3498,7 @@ def _clear_database_edit(u: Update) -> None:
     edits = edits_of(u)
     edits.pop("db_custom_url", None)
     edits.pop("db_kind", None)
+    edits.pop("db_preset", None)
     edits.pop("db_fields", None)
     edits.pop("db_field_step", None)
     edits.pop("awaiting_custom", None)
@@ -3518,6 +3649,7 @@ def set_custom_database(url: str, token: str, update: Update | None = None) -> t
         edits = edits_of(update)
         edits.pop("db_custom_url", None)
         edits.pop("db_kind", None)
+        edits.pop("db_preset", None)
         edits.pop("db_fields", None)
         edits.pop("db_field_step", None)
         edits.pop("awaiting_custom", None)
@@ -3581,6 +3713,7 @@ def set_custom_database_uri(kind: str, uri: str, update: Update | None = None) -
         edits = edits_of(update)
         edits.pop("db_custom_url", None)
         edits.pop("db_kind", None)
+        edits.pop("db_preset", None)
         edits.pop("db_fields", None)
         edits.pop("db_field_step", None)
         edits.pop("awaiting_custom", None)
@@ -6488,6 +6621,44 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=database_type_kb(),
             disable_web_page_preview=True)
 
+    elif d == "db_quick":
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Open a private chat with the bot to set up a database.",
+                                  show_alert=True)
+        remember_private_chat(u)
+        _clear_database_edit(u)
+        await q.answer()
+        return await q.edit_message_text(database_provider_text(), parse_mode="HTML",
+                                         reply_markup=database_provider_kb(),
+                                         disable_web_page_preview=True)
+
+    elif d.startswith("db_preset:"):
+        chat = getattr(u, "effective_chat", None)
+        if chat is not None and getattr(chat, "type", "") != "private":
+            return await q.answer("Open a private chat with the bot to set up a database.",
+                                  show_alert=True)
+        from database_adapters import field_steps, provider
+        preset = provider(d.split(":", 1)[1])
+        if preset is None or not field_steps(preset["kind"]):
+            return await q.answer("That provider is not available — pick another one.",
+                                  show_alert=True)
+        remember_private_chat(u)          # a pinned settings copy belongs in this chat
+        edits = edits_of(u)
+        edits.pop("db_custom_url", None)
+        edits["db_kind"] = preset["kind"]
+        edits["db_preset"] = preset["id"]
+        edits["db_fields"] = {}
+        step = _first_step(edits, preset["kind"])
+        edits["db_field_step"] = step
+        edit_set(u, "awaiting_custom", "database_field")
+        await q.answer()
+        text, markup = database_field_prompt(u, preset["kind"], step)
+        return await q.edit_message_text(
+            f"⚡ <b>{preset['label']}</b> — one-tap setup. I already know the port, database, "
+            "user and TLS setting; only what is unique to your instance is asked.\n\n" + text,
+            parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+
     elif d.startswith("db_type:"):
         chat = getattr(u, "effective_chat", None)
         if chat is not None and getattr(chat, "type", "") != "private":
@@ -6500,6 +6671,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         remember_private_chat(u)          # a pinned settings copy belongs in this chat
         edits = edits_of(u)
         edits.pop("db_custom_url", None)
+        edits.pop("db_preset", None)
         edits["db_kind"] = kind
         edit_set(u, "awaiting_custom", "database_uri")
         await q.answer()
@@ -6521,6 +6693,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         remember_private_chat(u)
         edits = edits_of(u)
         edits.pop("db_custom_url", None)
+        edits.pop("db_preset", None)
         edits["db_kind"] = kind
         edits["db_fields"] = {}
         edits["db_field_step"] = 0
@@ -6578,6 +6751,7 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
         edits = edits_of(u)
         edits.pop("db_custom_url", None)
         edits.pop("db_kind", None)
+        edits.pop("db_preset", None)
         edit_set(u, "awaiting_custom", "database_url")
         await q.answer("Send the custom Redis REST URL")
         return await q.edit_message_text(

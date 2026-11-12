@@ -128,7 +128,10 @@ whenever you want from Telegram:
   **🗄 Database: NOT connected ⚠️** and what that costs while nothing is
   connected).
 * `/database` → **➕ Add / change database** opens the same type chooser at any
-  time; nothing has to be redeployed.
+  time; nothing has to be redeployed. **⚡ Quick connect** is the shortcut for the
+  common services (Neon, Supabase, Railway, Atlas, Upstash, Redis Cloud, or a
+  local server): the provider's port, database, user and TLS are pre-filled, so
+  only the endpoint host and the password are left to send.
 
 On a host whose filesystem cannot survive a request (Vercel) the bot keeps the
 values it needs — including the database you connect later — in a **pinned
@@ -171,6 +174,30 @@ database types are supported**:
 3. The bot tests the connection before switching and copies the live group,
    merchants and settings to the new store. Passwords and tokens are never
    repeated in the bot's reply.
+
+**One tap: provider presets.** **⚡ Quick connect** — and, after picking a type,
+the preset buttons above the URI prompt — lists the services people actually use — Neon, Supabase, Railway (PostgreSQL and MySQL), MongoDB Atlas,
+Upstash and Redis Cloud, plus a *local* preset for a server on the same machine or
+Docker network. A preset already knows that provider's port, database name, user
+and TLS requirement (`sslmode=require`, `rediss://`, `mongodb+srv://`), so the bot
+asks only for what is unique to your instance — normally the endpoint host (copied
+from the provider dashboard) and the password:
+
+| Preset | You send | The preset fills in |
+|---|---|---|
+| 🟢 Neon | endpoint host + password | port 5432, `neondb`, user `neondb_owner`, TLS |
+| 🟩 Supabase | direct host + password | port 5432, `postgres`, TLS |
+| 🚂 Railway Postgres / MySQL | host, port, password | database `railway`, user `postgres` / `root` |
+| 🍃 MongoDB Atlas | cluster host, user, password | `mongodb+srv://`, database `p2p` |
+| ⚡ Upstash Redis (TCP) | endpoint host + password | port 6379, user `default`, `rediss://` |
+| 🔴 Redis Cloud | host, port, password | user `default`, `rediss://` |
+| 🖥 Local PostgreSQL / MySQL / MongoDB / Redis | host (or just the password) | standard port, `p2p` database and user |
+
+Tap **⏭ Use suggested** to keep a value the prompt offers, and **⚡ Pick another
+provider** on any question to change your mind. The connection is tested (and
+your current data carried over) before anything is switched, exactly like the
+step-by-step form. Every preset is a shortcut, not a limitation: the full URI
+form below still reaches any host.
 
 **No URI to write? Use the step-by-step form.** Tap **🧩 Enter details step by step**
 instead of pasting a URI (MySQL / MariaDB, PostgreSQL, MongoDB or Redis). The bot asks
@@ -1103,7 +1130,7 @@ cp ~/p2p-bot-backup-*/config.json ~/p2p-bot-backup-*/data.json <install-dir>/
 | `exchanges.py` | Binance / Bybit / OKX / Bitget adapters + URL parser |
 | `adlinks.py` | Exact-ad deep-link templates (Binance / Bybit / OKX / Bitget) |
 | `storage.py` | State backends: `data.json` file, Upstash/Vercel-KV/Redis REST, read-only fallback |
-| `database_adapters.py` | The database types `/database` can connect (SQLite, MySQL/MariaDB, PostgreSQL, MongoDB, Redis) + recognition of pasted URIs and provider env lines |
+| `database_adapters.py` | The database types `/database` can connect (SQLite, MySQL/MariaDB, PostgreSQL, MongoDB, Redis), the one-tap provider presets (Neon, Supabase, Railway, Atlas, Upstash, Redis Cloud, local), and recognition of pasted URIs / provider env lines |
 | `runtime_config.py` | The settings the setup page / `setup_cli.py` store (KV key, pinned chat message, or `runtime_config.json`), validated and applied before `bot.py` starts |
 | `telegram_store.py` | The settings copy in a pinned admin-chat message (sealed with the bot token) that lets a diskless deployment reconnect its database after a restart |
 | `setup_cli.py` | Terminal setup wizard — every question skippable (`--skip`, `--show`, `--clear`, `--vercel-env`) |

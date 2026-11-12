@@ -297,7 +297,7 @@ def test_database_screen_offers_custom_database_management(bot, monkeypatch):
     assert "Add / change database" in text
     assert "MySQL / MariaDB" in text                      # every database type is offered
     assert "console.upstash.com/redis/1" not in text
-    assert [b.callback_data for b in buttons] == ["db_types", "db_check", "panel"]
+    assert [b.callback_data for b in buttons] == ["db_types", "db_quick", "db_check", "panel"]
 
 
 def test_database_screen_never_echoes_the_custom_token(bot, monkeypatch):

@@ -108,6 +108,15 @@ switching. Credentials are stored separately from deployment-managed KV
 variables. **↩️ Use deployment database** verifies the fallback before switching
 back.
 
+**⚡ Quick connect** is the fast path: it lists Neon, Supabase, Railway
+(PostgreSQL / MySQL), MongoDB Atlas, Upstash and Redis Cloud — plus a local
+preset — with each provider's port, database name, user and TLS requirement
+already filled in. You send only what is unique to your instance (usually the
+endpoint host from the provider dashboard and the password), the bot builds the
+URI (`?sslmode=require`, `rediss://`, `mongodb+srv://` included), tests it, and
+carries the current state over. A Vercel Marketplace Postgres (Neon, Supabase)
+or an Upstash/Redis Cloud database all work this way without a redeploy.
+
 Buttons are optional: a connection pasted into that private chat is recognized
 on its own, and the two lines Upstash (or Vercel KV) shows can be pasted
 together in one message — `UPSTASH_REDIS_REST_URL="https://…upstash.io"` plus
