@@ -564,8 +564,9 @@ def test_first_start_offers_database_support_with_all_types(bot):
     assert "Add database support" in offer.args[0]
     callbacks = [button.callback_data for row in offer.kwargs["reply_markup"].inline_keyboard
                  for button in row]
-    assert callbacks == ["db_type:mysql", "db_type:postgres", "db_type:mongo",
-                         "db_type:redis", "db_type:sqlite", "db_custom", "db_skip"]
+    assert callbacks == ["db_quick", "db_type:mysql", "db_type:postgres",
+                         "db_type:mongo", "db_type:redis", "db_type:sqlite",
+                         "db_custom", "db_skip"]
     assert bot.state["db_setup_offered"] is True
 
 

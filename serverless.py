@@ -1143,9 +1143,11 @@ def detect_database(force: bool = False) -> dict:
 NO_DATABASE_DETAIL = (
     "No database yet — the bot runs, but this deployment cannot remember: the group, the "
     "merchants and the prices are forgotten between requests. Connect one whenever you like "
-    "with /database in a private Telegram chat (the bot keeps those credentials in a pinned "
-    "message, so they survive a restart), or set KV_REST_API_URL + KV_REST_API_TOKEN in the "
-    "deployment environment."
+    "with /database → ⚡ Quick connect in a private Telegram chat: the provider presets "
+    "(Neon, Supabase, Railway, Atlas, Upstash, Redis Cloud) fill in the port, database, user "
+    "and TLS, so only the endpoint host and password are left. The bot keeps those "
+    "credentials in a pinned message, so they survive a restart — or set KV_REST_API_URL + "
+    "KV_REST_API_TOKEN in the deployment environment."
 )
 
 

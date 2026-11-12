@@ -167,7 +167,9 @@ def test_the_type_prompt_offers_step_by_step_for_remote_databases(bot):
     markup = bot.database_uri_kb("mysql")
 
     callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
-    assert callbacks == ["db_fields:mysql", "db_cancel"]
+    assert callbacks[-2:] == ["db_fields:mysql", "db_cancel"]
+    assert "db_preset:railway-mysql" in callbacks    # the presets for that type
+    assert "db_preset:neon" not in callbacks         # …and only for that type
     assert "step by step" in bot.database_uri_prompt("mysql")
 
 

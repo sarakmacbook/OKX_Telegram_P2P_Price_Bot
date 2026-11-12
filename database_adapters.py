@@ -49,7 +49,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 log = logging.getLogger("p2p-bot.db-adapters")
 
@@ -123,6 +123,166 @@ EXAMPLES = {
 
 #: What to install when a driver is missing (``sqlite`` is stdlib).
 DRIVER_PACKAGES = {"mysql": "PyMySQL", "postgres": "pg8000", "mongo": "pymongo", "redis": "redis"}
+
+# ── one-tap providers ─────────────────────────────────────────────────────
+# A hosted database hands out five values, and most of them are the same for
+# every instance of that provider (port, database name, user, TLS requirement).
+# A preset carries those, so the admin only answers what is genuinely unique —
+# usually the endpoint host and the password.  ``ask`` names the
+# questions that are still needed; every other field takes its preset default.
+#
+# ``where`` tells the admin which screen the remaining value is copied from;
+# ``host_hint`` describes the shape of that value.  ``scheme`` / ``params``
+# change the connection URI itself (``mongodb+srv``, ``rediss``, ``sslmode=``).
+PROVIDERS = {
+    "neon": {
+        "id": "neon", "kind": "postgres", "label": "Neon", "emoji": "🟢",
+        "where": "console.neon.tech → your project → <b>Connect</b>",
+        "host_hint": "the endpoint host, like "
+                     "<code>ep-cool-name-123456.us-east-2.aws.neon.tech</code>",
+        "defaults": {"port": "5432", "database": "neondb", "user": "neondb_owner"},
+        "params": {"sslmode": "require"},
+        "ask": ("host", "password"),
+    },
+    "supabase": {
+        "id": "supabase", "kind": "postgres", "label": "Supabase", "emoji": "🟩",
+        "where": "Supabase → Project Settings → Database → <b>Connection string</b>",
+        "host_hint": "the direct-connection host, like "
+                     "<code>db.abcdefghijkl.supabase.co</code>",
+        "defaults": {"port": "5432", "database": "postgres", "user": "postgres"},
+        "params": {"sslmode": "require"},
+        "ask": ("host", "password"),
+    },
+    "railway-postgres": {
+        "id": "railway-postgres", "kind": "postgres", "label": "Railway Postgres",
+        "emoji": "🚂",
+        "where": "Railway → your Postgres service → <b>Connect</b> → Public Networking",
+        "host_hint": "the public host, like "
+                     "<code>containers-us-west-12.railway.app</code>",
+        "defaults": {"database": "railway", "user": "postgres"},
+        "ask": ("host", "port", "password"),
+    },
+    "local-postgres": {
+        "id": "local-postgres", "kind": "postgres", "label": "Local PostgreSQL",
+        "emoji": "🖥",
+        "where": "the PostgreSQL server on this machine (or the Docker service name)",
+        "host_hint": "the address of that server — <code>localhost</code>, or the "
+                     "service name such as <code>db</code> inside Docker",
+        "defaults": {"host": "localhost", "port": "5432", "database": "p2p", "user": "p2p"},
+        "ask": ("host", "password"),
+    },
+    "railway-mysql": {
+        "id": "railway-mysql", "kind": "mysql", "label": "Railway MySQL", "emoji": "🚂",
+        "where": "Railway → your MySQL service → <b>Connect</b> → Public Networking",
+        "host_hint": "the public host, like "
+                     "<code>containers-us-west-12.railway.app</code>",
+        "defaults": {"database": "railway", "user": "root"},
+        "ask": ("host", "port", "password"),
+    },
+    "local-mysql": {
+        "id": "local-mysql", "kind": "mysql", "label": "Local MySQL / MariaDB",
+        "emoji": "🖥",
+        "where": "the MySQL/MariaDB server on this machine (or the Docker service name)",
+        "host_hint": "the address of that server — <code>localhost</code>, or the "
+                     "service name such as <code>db</code> inside Docker",
+        "defaults": {"host": "localhost", "port": "3306", "database": "p2p", "user": "p2p"},
+        "ask": ("host", "password"),
+    },
+    "atlas": {
+        "id": "atlas", "kind": "mongo", "label": "MongoDB Atlas", "emoji": "🍃",
+        "where": "Atlas → Database → <b>Connect</b> → Drivers",
+        "host_hint": "the cluster host without a port, like "
+                     "<code>cluster0.abcde.mongodb.net</code>",
+        "defaults": {"database": "p2p"},
+        "scheme": "mongodb+srv",
+        "ask": ("host", "user", "password"),
+    },
+    "local-mongo": {
+        "id": "local-mongo", "kind": "mongo", "label": "Local MongoDB", "emoji": "🖥",
+        "where": "the MongoDB server on this machine (or the Docker service name)",
+        "host_hint": "the address of that server — <code>localhost</code>, or the "
+                     "service name such as <code>db</code> inside Docker",
+        "defaults": {"host": "localhost", "port": "27017", "database": "p2p"},
+        "ask": ("host",),
+    },
+    "upstash-tcp": {
+        "id": "upstash-tcp", "kind": "redis", "label": "Upstash Redis (TCP)",
+        "emoji": "⚡",
+        "where": "Upstash console → your database → <b>Connect</b> → TLS",
+        "host_hint": "the endpoint without a port, like "
+                     "<code>superb-otter-12345.upstash.io</code>",
+        "defaults": {"port": "6379", "database": "0", "user": "default"},
+        "scheme": "rediss",
+        "ask": ("host", "password"),
+    },
+    "redis-cloud": {
+        "id": "redis-cloud", "kind": "redis", "label": "Redis Cloud", "emoji": "🔴",
+        "where": "Redis Cloud → your database → <b>Connect</b>",
+        "host_hint": "the endpoint host, like "
+                     "<code>redis-12345.c1.us-east-1-2.ec2.redns.redis-cloud.com</code>",
+        "defaults": {"port": "6379", "database": "0", "user": "default"},
+        "scheme": "rediss",
+        "ask": ("host", "port", "password"),
+    },
+    "local-redis": {
+        "id": "local-redis", "kind": "redis", "label": "Local Redis", "emoji": "🖥",
+        "where": "the Redis server on this machine (or the Docker service name)",
+        "host_hint": "the address of that server — <code>localhost</code>, or the "
+                     "service name such as <code>db</code> inside Docker",
+        "defaults": {"host": "localhost", "port": "6379", "database": "0"},
+        "ask": ("host",),
+    },
+}
+
+#: Menu order: grouped by database type, hosted providers before local ones.
+PROVIDER_ORDER = (
+    "neon", "supabase", "railway-postgres", "local-postgres",
+    "railway-mysql", "local-mysql",
+    "atlas", "local-mongo",
+    "upstash-tcp", "redis-cloud", "local-redis",
+)
+
+
+def provider(slug: str) -> dict | None:
+    """The preset called ``slug`` (``"neon"``), or ``None``."""
+    return PROVIDERS.get(str(slug or "").strip().lower())
+
+
+def providers_for(kind: str | None = None) -> tuple[dict, ...]:
+    """Every preset, or only those for one database type, in menu order."""
+    wanted = normalize_kind(kind) if kind else None
+    return tuple(PROVIDERS[slug] for slug in PROVIDER_ORDER
+                 if wanted is None or PROVIDERS[slug]["kind"] == wanted)
+
+
+def provider_fields(slug: str) -> tuple[str, ...]:
+    """The questions a preset still asks, in step-by-step order (empty if unknown).
+
+    Every other field is filled from the preset's defaults, which is what makes
+    a hosted database two or three answers instead of five.
+    """
+    preset = provider(slug)
+    if preset is None:
+        return ()
+    ask = preset.get("ask") or FIELD_STEPS
+    return tuple(field for field in FIELD_STEPS if field in ask)
+
+
+def provider_fixed(slug: str) -> tuple[str, ...]:
+    """Secret-free lines describing what a preset already knows (for the prompt)."""
+    preset = provider(slug)
+    if preset is None:
+        return ()
+    titles = {"port": "port", "database": "database", "user": "user"}
+    lines = [f"{titles[field]} <b>{value}</b>"
+             for field, value in preset.get("defaults", {}).items()
+             if field in titles]
+    if (preset.get("scheme") or "").startswith("rediss"):
+        lines.append("<b>TLS</b> on")
+    for key, value in (preset.get("params") or {}).items():
+        if key == "sslmode" and value != "disable":
+            lines.append("<b>TLS</b> on")
+    return tuple(lines)
 
 UNSUPPORTED_URI_ERROR = (
     "That is not a supported connection URI. Send one like "
@@ -336,9 +496,17 @@ def field_steps(kind: str) -> tuple[str, ...]:
     return FIELD_STEPS if kind in KIND_PORTS else ()
 
 
-def field_default(kind: str, field: str) -> str:
-    """The value a question suggests when the admin just presses Enter."""
+def field_default(kind: str, field: str, preset: str | None = None) -> str:
+    """The value a question suggests when the admin just presses Enter.
+
+    With ``preset`` (a provider slug) the preset's known values win, so a Neon
+    connection suggests ``neondb`` / ``neondb_owner`` instead of the generic
+    ``p2p``.
+    """
     kind = normalize_kind(kind) or ""
+    known = (provider(preset) or {}).get("defaults", {})
+    if field in known:
+        return str(known[field])
     if field == "host":
         return "localhost"
     if field == "port":
@@ -376,16 +544,21 @@ def validate_field(kind: str, field: str, value) -> tuple[str, str]:
 
 
 def build_uri(kind: str, *, host: str, port: str = "", database: str = "",
-              user: str = "", password: str = "") -> str:
+              user: str = "", password: str = "", scheme: str | None = None,
+              params: dict | None = None) -> str:
     """One connection URI assembled from its parts (the reverse of the parsers).
 
     User and password are percent-encoded, so ``p@ss/word#1`` survives the trip.
-    Use :func:`uri_from_fields` for answers that still need checking.
+    ``scheme`` overrides the usual one (``mongodb+srv`` for Atlas, ``rediss`` for
+    a TLS Redis) and ``params`` become the ``?sslmode=…`` style query options a
+    provider asks for.  Use :func:`uri_from_fields` for answers that still need
+    checking.
     """
     kind = normalize_kind(kind) or ""
     if kind not in KIND_PORTS:
         raise ValueError(f"no connection URI for {kind!r}")
-    scheme = {"mysql": "mysql", "postgres": "postgres", "mongo": "mongodb", "redis": "redis"}[kind]
+    scheme = scheme or {
+        "mysql": "mysql", "postgres": "postgres", "mongo": "mongodb", "redis": "redis"}[kind]
     host = str(host or "").strip()
     if ":" in host and not host.startswith("["):   # an IPv6 literal needs brackets
         host = f"[{host}]"
@@ -395,12 +568,15 @@ def build_uri(kind: str, *, host: str, port: str = "", database: str = "",
         if password:
             auth += ":" + quote(str(password), safe="")
         auth += "@"
-    port_part = f":{port}" if port else ""
+    # MongoDB's SRV scheme must not carry a port: the DNS record names them.
+    port_part = f":{port}" if port and not scheme.endswith("+srv") else ""
     name = str(database or "") or ("0" if kind == "redis" else DEFAULT_DATABASE_NAME)
-    return f"{scheme}://{auth}{host}{port_part}/{name}"
+    query = "?" + urlencode(sorted(params.items())) if params else ""
+    return f"{scheme}://{auth}{host}{port_part}/{name}{query}"
 
 
-def uri_from_fields(kind: str, values: dict) -> tuple[str, str]:
+def uri_from_fields(kind: str, values: dict, *, scheme: str | None = None,
+                    params: dict | None = None) -> tuple[str, str]:
     """``(uri, "")`` built from step-by-step answers — or ``("", problem)``.
 
     Missing answers take their defaults. The result is parsed again with
@@ -418,7 +594,8 @@ def uri_from_fields(kind: str, values: dict) -> tuple[str, str]:
             return "", error
         clean[field] = value
     uri = build_uri(kind, host=clean["host"], port=clean["port"], database=clean["database"],
-                    user=clean["user"], password=clean["password"])
+                    user=clean["user"], password=clean["password"], scheme=scheme,
+                    params=params)
     spec, error = parse_database_uri(kind, uri)
     if error or spec is None:
         return "", error or "That connection could not be assembled — start again."
