@@ -234,9 +234,18 @@ every screen still looks healthy. See §9.
 
 ## 4. Use it from Telegram
 
-1. Open your bot → `/start` → tap **👥 Set group** and pick your group.
+1. Open your bot → `/start`. A first start opens the **🚀 First-time setup** checklist:
+   it names the two steps the bot must have before it can post — a destination
+   (👥 **Set group** / 📢 **Set channel**) and at least one merchant.
 2. Paste a merchant URL (`p2p.binance.com/…`, `bybit.com/…`, `okx.com/…`, `bitget.com/…`).
 3. Tap **🟢 Auto: ON**. From then on every cron run posts the prices when they changed.
+
+Until step 1 (destination) and step 2 (merchant) are done, **📊 Post prices** and
+**🟢 Auto** refuse to start and re-open the checklist with the missing item named;
+the panel keeps a **🚀 Finish setup (N left)** button. A database is *recommended*
+rather than required — but on Vercel without one, every cold start forgets the
+group and merchants, so connect one with ⚡ **Quick connect** (or Vercel → Storage
+→ Upstash for Redis) before adding many merchants.
 
 To inspect or manage the active store, send `/database` in a private chat with
 the bot or open **⚙️ Settings → 🗄 Database**. The panel no longer offers an

@@ -553,13 +553,38 @@ def test_mysql_require_and_authentication_errors_surface(monkeypatch):
     assert len(denied) == 1                            # never retried in the clear
 
 
-def test_first_start_offers_database_support_with_all_types(bot):
+def _ready_for_posting(bot):
+    """A destination and one merchant — the two required first-start steps."""
+    bot.state["group"] = -100555
+    bot.state["group_title"] = "Prices"
+    bot.state["merchants"]["okx:test"] = {"sell": 1.0}
+
+
+def test_first_start_asks_for_the_required_steps_before_the_database(bot):
+    """"Where prices go" and "a merchant" come first — the database is optional."""
     message = SimpleNamespace(reply_html=AsyncMock(), reply_text=AsyncMock())
     update = _private_update(message)
 
     asyncio.run(bot.start(update, SimpleNamespace()))
 
-    assert message.reply_html.await_count == 2      # the offer, then the panel
+    assert message.reply_html.await_count == 2      # the checklist, then the panel
+    offer = message.reply_html.await_args_list[0]
+    assert "First-time setup" in offer.args[0]
+    assert "Where prices go" in offer.args[0] and "At least one merchant" in offer.args[0]
+    callbacks = [button.callback_data for row in offer.kwargs["reply_markup"].inline_keyboard
+                 for button in row]
+    assert "setup_merchant" in callbacks and "setup_refresh" in callbacks
+    assert bot.state["setup_offered"] is True
+    assert bot.state.get("db_setup_offered") is not True   # asked after the required steps
+
+
+def test_the_database_offer_comes_once_the_required_steps_are_done(bot):
+    _ready_for_posting(bot)
+    message = SimpleNamespace(reply_html=AsyncMock(), reply_text=AsyncMock())
+
+    asyncio.run(bot.start(_private_update(message), SimpleNamespace()))
+
+    assert message.reply_html.await_count == 2      # the database offer, then the panel
     offer = message.reply_html.await_args_list[0]
     assert "Add database support" in offer.args[0]
     callbacks = [button.callback_data for row in offer.kwargs["reply_markup"].inline_keyboard
@@ -571,7 +596,7 @@ def test_first_start_offers_database_support_with_all_types(bot):
 
 
 def test_first_start_is_asked_only_once(bot):
-    bot.state["db_setup_offered"] = True
+    bot.state["setup_offered"] = True
     message = SimpleNamespace(reply_html=AsyncMock(), reply_text=AsyncMock())
 
     asyncio.run(bot.start(_private_update(message), SimpleNamespace()))
@@ -579,14 +604,27 @@ def test_first_start_is_asked_only_once(bot):
     assert message.reply_html.await_count == 1      # the panel only
 
 
-def test_the_ask_is_skipped_when_a_database_is_already_connected(bot, monkeypatch):
+def test_a_connected_database_does_not_skip_the_required_steps(bot, monkeypatch):
+    """A store remembers state; it cannot post prices without a destination."""
+    monkeypatch.setattr(bot, "db_is_persistent", lambda: True)
+    message = SimpleNamespace(reply_html=AsyncMock(), reply_text=AsyncMock())
+
+    asyncio.run(bot.start(_private_update(message), SimpleNamespace()))
+
+    assert message.reply_html.await_count == 2      # the checklist, then the panel
+    assert "First-time setup" in message.reply_html.await_args_list[0].args[0]
+    assert bot.state.get("db_setup_offered") is not True
+
+
+def test_a_fully_configured_bot_gets_the_panel_only(bot, monkeypatch):
+    _ready_for_posting(bot)
     monkeypatch.setattr(bot, "db_is_persistent", lambda: True)
     message = SimpleNamespace(reply_html=AsyncMock(), reply_text=AsyncMock())
 
     asyncio.run(bot.start(_private_update(message), SimpleNamespace()))
 
     assert message.reply_html.await_count == 1      # the panel only
-    assert bot.state.get("db_setup_offered") is not True
+    assert bot.state.get("setup_offered") is not True
 
 
 def test_database_skip_keeps_the_bot_running(bot):

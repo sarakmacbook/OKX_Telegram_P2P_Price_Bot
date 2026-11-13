@@ -114,19 +114,42 @@ Redis REST pair in `.env` / deployment environment; for Vercel, the terminal
 wizard can push provided values with `--vercel-env` (then redeploy). The
 `P2P_STORAGE_BACKEND` alias is accepted.
 
+#### First start: the two steps the bot needs
+
+The bot can start with almost nothing, but it cannot **post prices** with
+nothing — so the first `/start` in a private chat with an admin opens a short
+checklist of what must be done before it works properly:
+
+1. **⬜ Where prices go** — add the bot to your group (or channel), then tap
+   👥 **Set group** / 📢 **Set channel**. Either destination is enough; the bot
+   posts to both when both are set.
+2. **⬜ At least one merchant** — paste the merchant's **public profile link**
+   in the chat (OKX, Binance, Bybit or Bitget); ➕ **Add merchant** shows the
+   example. Prices come from the merchants you add this way.
+3. **⬜ Database** — *recommended, not required*: without one a restart forgets
+   the group, merchants and prices. Connect one with ⚡ **Quick connect** (or
+   `/database`); on Vercel this is the difference between remembering and not.
+
+The checklist is sent once. Until steps 1 and 2 are done the panel shows
+**🚀 Finish setup (N left)**, and **📊 Post prices now** / **🟢 Auto** refuse to
+start — they answer with the checklist and name the exact missing step instead of
+doing nothing. **🔄 Re-check** refreshes it after a step is completed elsewhere
+(for example after `/setgroup` inside the group). The optional database question
+is asked only after those two required steps are complete.
+
 #### Start with no database at all
 
 A database is **not required to start**. With only `BOT_TOKEN` and `ADMIN_IDS`
 the bot comes up on every host, including Vercel, and a store is connected
 whenever you want from Telegram:
 
-* `/start` (first start) → the bot **asks you to add database support** and
-  offers every database type as a button: MySQL / MariaDB, PostgreSQL, MongoDB,
-  Redis, SQLite, or a Redis REST endpoint (Upstash / Vercel KV). Tap one, send
-  the connection URI, and the bot tests it before switching — or tap **⏳ Later**
-  and the bot keeps running as it is (the ask is made once; the panel shows
-  **🗄 Database: NOT connected ⚠️** and what that costs while nothing is
-  connected).
+* once the required first-start steps above are done, `/start` → the bot **asks
+  you to add database support** and offers every database type as a button:
+  MySQL / MariaDB, PostgreSQL, MongoDB, Redis, SQLite, or a Redis REST endpoint
+  (Upstash / Vercel KV). Tap one, send the connection URI, and the bot tests it
+  before switching — or tap **⏳ Later** and the bot keeps running as it is (the
+  ask is made once; the panel shows **🗄 Database: NOT connected ⚠️** and what
+  that costs while nothing is connected).
 * `/database` → **➕ Add / change database** opens the same type chooser at any
   time; nothing has to be redeployed. **⚡ Quick connect** is the shortcut for the
   common services (Neon, Supabase, Railway, Atlas, Upstash, Redis Cloud, or a
