@@ -117,8 +117,9 @@ wizard can push provided values with `--vercel-env` (then redeploy). The
 #### First start: the two steps the bot needs
 
 The bot can start with almost nothing, but it cannot **post prices** with
-nothing — so the first `/start` in a private chat with an admin opens a short
-checklist of what must be done before it works properly:
+nothing — so while that is still true, `/start` in a private chat with an admin
+opens a short checklist **instead of** the panel. It is the whole reply: two
+required steps and one optional store, with nothing else on screen to read past.
 
 1. **⬜ Where prices go** — add the bot to your group (or channel), then tap
    👥 **Set group** / 📢 **Set channel**. Either destination is enough; the bot
@@ -130,12 +131,15 @@ checklist of what must be done before it works properly:
    the group, merchants and prices. Connect one with ⚡ **Quick connect** (or
    `/database`); on Vercel this is the difference between remembering and not.
 
-The checklist is sent once. Until steps 1 and 2 are done the panel shows
-**🚀 Finish setup (N left)**, and **📊 Post prices now** / **🟢 Auto** refuse to
-start — they answer with the checklist and name the exact missing step instead of
-doing nothing. **🔄 Re-check** refreshes it after a step is completed elsewhere
-(for example after `/setgroup` inside the group). The optional database question
-is asked only after those two required steps are complete.
+The checklist is the start screen until steps 1 and 2 are done: every `/start`
+re-opens it (so a half-finished setup is always one command away, and nothing is
+missed on a host that forgot the state). **🎛 Open panel** at the bottom is the way
+to the full panel, which also keeps a **🚀 Finish setup (N left)** button, and
+**📊 Post prices now** / **🟢 Auto** refuse to start — they answer with the
+checklist and name the exact missing step instead of doing nothing. **🔄 Re-check**
+refreshes it after a step is completed elsewhere (for example after `/setgroup`
+inside the group). Once the two required steps are complete `/start` answers with
+the panel again, and the optional database question is asked ahead of it — once.
 
 #### Start with no database at all
 

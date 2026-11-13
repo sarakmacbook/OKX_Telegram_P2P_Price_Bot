@@ -234,9 +234,11 @@ every screen still looks healthy. See §9.
 
 ## 4. Use it from Telegram
 
-1. Open your bot → `/start`. A first start opens the **🚀 First-time setup** checklist:
-   it names the two steps the bot must have before it can post — a destination
-   (👥 **Set group** / 📢 **Set channel**) and at least one merchant.
+1. Open your bot → `/start`. A first start opens the **🚀 First-time setup** checklist
+   *instead of* the panel, and repeats it on every `/start` until it is done: it names
+   the two steps the bot must have before it can post — a destination
+   (👥 **Set group** / 📢 **Set channel**) and at least one merchant. 🎛 **Open panel**
+   at the bottom leads to the rest.
 2. Paste a merchant URL (`p2p.binance.com/…`, `bybit.com/…`, `okx.com/…`, `bitget.com/…`).
 3. Tap **🟢 Auto: ON**. From then on every cron run posts the prices when they changed.
 
