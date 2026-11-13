@@ -292,7 +292,12 @@ So on the free plan the bot posts **once a day** by default. Two ways around it:
   ```
 
 Every run posts only when a price (or the ad behind it) actually changed, so a
-1-minute cron does not spam the group. Each run is remembered in the state store
+1-minute cron does not spam the group. If you set a **⛔ minimum move**
+(⚙️ Settings → 📈 Price movement → *≥ 0.25% … ≥ 2%*), a smaller move posts
+nothing and waits for a run that clears the bar — worth knowing on the free plan,
+where the single daily run is easily spent on a 0.01% wobble. The ▲▼ badge in
+the post always measures from the last post the group actually received, so the
+skipped moves are still visible once something bigger happens. Each run is remembered in the state store
 (`tick`), and that is what the status page row **Last cron run** and the
 `🕒 Cron:` line in the Telegram panel show — `never`, or how long ago the last
 run was with how many runs so far. A cron that never ran, or stopped more than a

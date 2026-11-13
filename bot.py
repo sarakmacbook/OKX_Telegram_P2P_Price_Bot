@@ -277,6 +277,16 @@ MAX_KNOWN_LABEL = 46              # a button label, icon and ✅ marker included
 #: a bare ``-1001234567890`` names a chat just like a link does
 CHAT_ID_RE = re.compile(r"^-\d{6,20}$")
 
+# ── 📈 price movement ───────────────────────────────────────────────────────
+# The post can say how far each price moved since the group last saw one, and
+# it can stay quiet while the move is smaller than the owner allows.
+# 0 = "any change", which is what every install did before this existed.
+MOVE_CHOICES = (0.0, 0.25, 0.5, 1.0, 2.0)          # percent
+MOVE_TITLES = {0.0: "any change", 0.25: "≥ 0.25%", 0.5: "≥ 0.5%",
+               1.0: "≥ 1%", 2.0: "≥ 2%"}
+# below this the badge says "➖" instead of a hair-thin ±0.00%
+MOVE_FLAT = 0.005
+
 # ── anti-scam verification (captcha) ────────────────────────────────────────
 # A new member is muted and has to type a random word.  While pending they may
 # only send plain text (no links, media or stickers), so a scammer cannot post
@@ -403,6 +413,12 @@ LINK_PATTERN = re.compile(
 
 DEFAULT_SETTINGS = {
     "show_liquidity": False,
+    # ── 📈 price movement: what the post says, and when it is sent ──
+    # show_change puts the move since the last post next to every price
+    # (📈 +0.42%); min_move suppresses a repost unless a price moved at least
+    # that much (0 = post on any change, the behaviour every install had).
+    "show_change": True,
+    "min_move": 0.0,
     "show_buttons": True,
     "custom_header": "",
     "custom_body": "",     # per-merchant line template for the group post
@@ -1721,6 +1737,17 @@ def _clean_choice(value, choices, default):
         return default
     return number if number in choices else default
 
+def clean_min_move(value) -> float:
+    """📈 Only the offered steps are valid; anything else means "any change"."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SETTINGS["min_move"]
+    for choice in MOVE_CHOICES:
+        if abs(choice - number) < 1e-9:
+            return choice
+    return DEFAULT_SETTINGS["min_move"]
+
 def captcha_message() -> str:
     return clean_captcha_message(get_settings().get("captcha_message")) or DEFAULT_CAPTCHA_MESSAGE
 
@@ -1913,6 +1940,9 @@ def empty_state():
     return {"group": None, "group_title": "", "channel": None, "channel_title": "",
             "auto": False, "merchants": {}, "last": {}, "channel_last": {}, "edits": {},
             "settings": deepcopy(DEFAULT_SETTINGS), "link_target_version": LINK_TARGET_VERSION,
+            # 📈 what the audience last saw, per merchant — the reference the
+            # ▲/▼ badge and the "only post on a move of ≥ x%" rule compare to
+            "last_prices": {},
             "last_msg_id": None, "last_msg_time": None,
             "channel_last_msg_id": None, "channel_last_msg_time": None,
             # anti-scam: {chat_id:user_id → {word, tries, msg_id, expires, …}}
@@ -1956,6 +1986,13 @@ def load():
     for k, v in DEFAULT_SETTINGS.items():
         if k not in data["settings"]:
             data["settings"][k] = deepcopy(v)
+    # 📈 price movement: one boolean and one choice, anything else back to default
+    if not isinstance(data["settings"].get("show_change"), bool):
+        data["settings"]["show_change"] = DEFAULT_SETTINGS["show_change"]
+    data["settings"]["min_move"] = clean_min_move(data["settings"].get("min_move"))
+    # the prices of the last post the audience saw (badge + minimum-move rule)
+    if not isinstance(data.get("last_prices"), dict):
+        data["last_prices"] = {}
     # sanitise the settings that are read as structured values
     data["settings"]["extra_buttons"] = normalize_extra_buttons(data["settings"].get("extra_buttons"))
     for key in ("btn_buy_enabled", "btn_sell_enabled"):
@@ -2195,6 +2232,105 @@ def fmt_amount(a):
         return s
     except:
         return str(a)
+
+# ── 📈 price movement: the badge and the "big enough" rule ──────────────────
+def min_move() -> float:
+    """The configured minimum move, as one of ``MOVE_CHOICES``."""
+    return clean_min_move(get_settings().get("min_move", 0.0))
+
+
+def min_move_label() -> str:
+    return MOVE_TITLES.get(min_move(), MOVE_TITLES[0.0])
+
+
+def show_change() -> bool:
+    """Whether the stock post carries the ▲/▼ badge (a custom body asks itself)."""
+    return bool(get_settings().get("show_change", True))
+
+
+def move_pct(new, old):
+    """Percent move from ``old`` to ``new``, or ``None`` when it cannot be told.
+
+    A missing side — the merchant had no price last time, or this is the very
+    first post — has no percentage, so callers treat it as a real change.
+    """
+    try:
+        new, old = float(new), float(old)
+    except (TypeError, ValueError):
+        return None
+    if new <= 0 or old <= 0:
+        return None
+    return (new - old) / old * 100.0
+
+
+def format_move(pct, *, arrow: bool = True) -> str:
+    """``0.42`` → ``"📈 +0.42%"``, ``0.0`` → ``"➖ 0.00%"``, ``None`` → ``""``."""
+    if pct is None:
+        return ""
+    if abs(pct) < MOVE_FLAT:
+        badge = "➖ 0.00%"
+    else:
+        badge = f"{'📈' if pct > 0 else '📉'} {pct:+.2f}%"
+    return badge if arrow else badge.split(" ", 1)[1]
+
+
+def last_price(key: str, side: str):
+    """A price from the last post the audience saw, or ``None``."""
+    entry = (state.get("last_prices") or {}).get(key)
+    return entry.get(side) if isinstance(entry, dict) else None
+
+
+def change_badge(key: str, side: str, value) -> str:
+    """``"  📈 +0.42%"`` for one price, or ``""`` when there is nothing to compare."""
+    if not show_change():
+        return ""
+    pct = move_pct(value, last_price(key, side))
+    return f"  {format_move(pct)}" if pct is not None else ""
+
+
+def remember_posted_prices(prices: dict) -> None:
+    """Record what this post showed — the reference for the next badge and gate."""
+    state["last_prices"] = {key: {"sell": r.get("sell"), "buy": r.get("buy")}
+                            for key, r in (prices or {}).items()
+                            if isinstance(r, dict)}
+
+
+def _snap_structure(snap: dict) -> dict:
+    """A snapshot without its price numbers: wording, buttons, banner."""
+    return {k: v for k, v in (snap or {}).items() if k.startswith("_")}
+
+
+def _snap_merchants(snap: dict) -> set:
+    return {k for k in (snap or {}) if not k.startswith("_")}
+
+
+def big_enough_move(snap: dict, shown: dict) -> bool:
+    """Whether ``snap`` differs from ``shown`` by enough to be posted.
+
+    ``shown`` is the snapshot that went to *that* destination last. Any wording,
+    button, banner or merchant change always counts; when only prices differ,
+    the biggest relative move has to reach the configured minimum.
+    """
+    if _snap_structure(snap) != _snap_structure(shown):
+        return True
+    if _snap_merchants(snap) != _snap_merchants(shown):
+        return True
+    threshold = min_move()
+    for key in _snap_merchants(snap):
+        before_row = shown.get(key) or []
+        after_row = snap.get(key) or []
+        for index in (0, 1):                       # 0 = sell, 1 = buy
+            before = before_row[index] if len(before_row) > index else None
+            after = after_row[index] if len(after_row) > index else None
+            if before is None or after is None:
+                if before != after:
+                    return True                    # a price appeared or vanished
+                continue
+            pct = move_pct(after, before)
+            if pct is None or abs(pct) >= threshold:
+                return True
+    return False
+
 
 def get_settings():
     return state.get("settings", DEFAULT_SETTINGS)
@@ -2564,6 +2700,7 @@ def settings_kb():
     return KB([
         [B(f"💧 Liquidity: {'ON ✅' if s.get('show_liquidity') else 'OFF ❌'}", callback_data="toggle_liquidity"),
          B(f"🔘 All buttons: {'ON ✅' if s.get('show_buttons') else 'OFF ❌'}", callback_data="toggle_buttons")],
+        [B(f"📈 Price movement: {min_move_label()}", callback_data="move_menu")],
         [B("🔘 Manage buttons", callback_data="buttons_menu")],
         [B(f"🎯 Exact ad links: {'ON ✅' if link_mode() == 'ad' else 'OFF ❌'}", callback_data="toggle_link_mode"),
          B(f"🔗 Link prices: {'ON ✅' if s.get('price_links', True) else 'OFF ❌'}", callback_data="toggle_price_links")],
@@ -2588,6 +2725,35 @@ def settings_kb():
          B(f"↪️ Forward from: {forward_source_summary()}", callback_data="forward_sources")],
         [B("👁 Preview", callback_data="preview"), B("⬅️ Back", callback_data="panel")]
     ])
+
+def move_menu_text():
+    """📈 Price movement — the badge in the post and the minimum-move rule."""
+    return (
+        "📈 <b>Price movement</b>\n\n"
+        f"▲▼ badge in the post: <b>{'ON ✅' if show_change() else 'OFF ❌'}</b>\n"
+        "   Every price carries its move since the last post — 📈 up, 📉 down,\n"
+        "   ➖ unchanged. The first post of an install, and a price that was not\n"
+        "   there before, show no badge: there is nothing to compare yet.\n\n"
+        f"Repost only on a move of: <b>{min_move_label()}</b>\n"
+        "   A smaller move does not make a message of its own. It stays pending\n"
+        "   and appears in the next post that is big enough, so the badge always\n"
+        "   measures from the last post the group really received.\n"
+        "   Buttons, wording, a banner, added or removed merchants and 📊 Post\n"
+        "   prices now always post, whatever the minimum says.\n\n"
+        "<i>Custom Msg: write {SELL_CHANGE} / {BUY_CHANGE} for 📈 +0.42%, or\n"
+        "{SELL_MOVE} / {BUY_MOVE} for the bare +0.42%. The placeholders are shown\n"
+        "whenever the template asks for them, badge on or off.</i>"
+    )
+
+
+def move_menu_kb():
+    return KB([
+        [B(f"📈 Show change: {'ON ✅' if show_change() else 'OFF ❌'}",
+           callback_data="toggle_change")],
+        [B(f"⛔ Min move: {min_move_label()}", callback_data="cycle_min_move")],
+        [B("⬅️ Back", callback_data="settings")],
+    ])
+
 
 def database_kb():
     rows = [[B("➕ Add / change database", callback_data="db_types")],
@@ -4070,6 +4236,10 @@ def settings_text():
         f"⚙️ <b>Settings</b>\n\n"
         f"💧 Show liquidity amount: <b>{liq}</b>\n"
         f"   When ON, shows available amount next to price.\n\n"
+        f"📈 Price movement: <b>{'▲▼ badge ✅' if show_change() else 'badge ❌'}</b>"
+        f" · repost on <b>{min_move_label()}</b>\n"
+        f"   Each price can show its move since the last post, and a move smaller\n"
+        f"   than the minimum can stay out of the group. Tap 📈 Price movement.\n\n"
         f"🔘 Show buttons in group: <b>{btns}</b>\n"
         f"   When ON, group messages include the buttons you have configured.\n"
         f"   Order: <b>{order_label()}</b> — tap 🔘 Manage buttons to add or remove\n"
@@ -5310,6 +5480,10 @@ def apply_body_template(tpl: str, m: Merchant, r: dict) -> str:
     sell_links, buy_links = side_links("sell", m, r), side_links("buy", m, r)
     sell_link = f'<a href="{sell_links["best"]}">{sell}</a>' if sell_links["best"] else sell
     buy_link = f'<a href="{buy_links["best"]}">{buy}</a>' if buy_links["best"] else buy
+    # 📈 the move since the last post — a template asks for it, so the
+    # show_change switch does not hide it here
+    sell_pct = move_pct(r.get("sell"), last_price(m.key, "sell"))
+    buy_pct = move_pct(r.get("buy"), last_price(m.key, "buy"))
     mapping = {
         "ASSET": ASSET, "asset": ASSET.lower(), "Asset": ASSET.title(),
         "FIAT": FIAT, "fiat": FIAT.lower(), "Fiat": FIAT.title(),
@@ -5327,6 +5501,10 @@ def apply_body_template(tpl: str, m: Merchant, r: dict) -> str:
         "SELL_AD_URL": sell_links["ad"], "BUY_AD_URL": buy_links["ad"],
         "SELL_AD_ID": sell_links["ad_id"], "BUY_AD_ID": buy_links["ad_id"],
         "SELL_LINK": sell_link, "BUY_LINK": buy_link,
+        # 📈 price movement: with the arrow, and the bare percentage
+        "SELL_CHANGE": format_move(sell_pct), "BUY_CHANGE": format_move(buy_pct),
+        "SELL_MOVE": format_move(sell_pct, arrow=False),
+        "BUY_MOVE": format_move(buy_pct, arrow=False),
         "ERROR": err, "error": err,
     }
     keys = sorted(mapping, key=len, reverse=True)
@@ -5939,9 +6117,11 @@ def report(prices):
                 buy_price = f'<a href="{buy_url}">{buy_price}</a>'
 
         sell_line = f"   🔴 Best SELL (you buy): <b>{sell_price}</b>"
+        sell_line += change_badge(m.key, "sell", r.get("sell"))
         if sell_amt:
             sell_line += f"  💧 {sell_amt} {m.asset}"
         buy_line = f"   🟢 Best BUY  (you sell): <b>{buy_price}</b>"
+        buy_line += change_badge(m.key, "buy", r.get("buy"))
         if buy_amt:
             buy_line += f"  💧 {buy_amt} {m.asset}"
 
@@ -6098,6 +6278,7 @@ async def post(bot, force=False):
     snap["_body"] = s.get("custom_body","")
     snap["_footer"] = s.get("custom_footer","")
     snap["_liq"] = s.get("show_liquidity")
+    snap["_change"] = show_change()      # the ▲/▼ badge is part of the text
     snap["_btn"] = s.get("show_buttons")
     snap["_btn_order"] = buttons_order()
     snap["_btn_buy"] = s.get("btn_buy_label", "")
@@ -6116,8 +6297,18 @@ async def post(bot, force=False):
     snap["_button_icons"] = button_icons()
     # The group and the channel each keep their own copy of the snapshot, so a
     # channel added later gets its own post without reposting to the group.
-    due = [kind for kind, _ in targets
-           if force or snap != state.get(SNAPSHOT[kind])]
+    # A move smaller than the owner's minimum is not worth a message: it stays
+    # pending and rides along with the next post that is.
+    due = []
+    for kind, _ in targets:
+        shown = state.get(SNAPSHOT[kind])
+        if not (force or snap != shown):
+            continue
+        if force or min_move() <= 0 or big_enough_move(snap, shown):
+            due.append(kind)
+        else:
+            log.info("%s: price move is under the %.2f%% minimum — not reposting",
+                     kind, min_move())
     if not due: return False
 
     text = report(prices)
@@ -6145,6 +6336,10 @@ async def post(bot, force=False):
             ok = True
         except Exception as e:
             log.warning("Failed to post to %s %s: %s", kind, chat_id, e)
+    if ok:
+        # what the audience now sees — the next badge and gate compare to this
+        remember_posted_prices(prices)
+        save()
     return ok
 
 async def auto_post_task(bot) -> bool:
@@ -6598,6 +6793,28 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif d == "settings":
         await q.answer()
         return await q.edit_message_text(settings_text(), parse_mode="HTML", reply_markup=settings_kb())
+
+    elif d == "move_menu":
+        await q.answer()
+        return await q.edit_message_text(move_menu_text(), parse_mode="HTML",
+                                         reply_markup=move_menu_kb())
+
+    elif d == "toggle_change":
+        state["settings"]["show_change"] = not show_change()
+        save()
+        await q.answer(f"▲▼ badge {'ON' if show_change() else 'OFF'}")
+        return await q.edit_message_text(move_menu_text(), parse_mode="HTML",
+                                         reply_markup=move_menu_kb())
+
+    elif d == "cycle_min_move":
+        current = min_move()
+        index = MOVE_CHOICES.index(current) if current in MOVE_CHOICES else 0
+        nxt = MOVE_CHOICES[(index + 1) % len(MOVE_CHOICES)]
+        state["settings"]["min_move"] = nxt
+        save()
+        await q.answer(f"Repost on {MOVE_TITLES[nxt]}")
+        return await q.edit_message_text(move_menu_text(), parse_mode="HTML",
+                                         reply_markup=move_menu_kb())
 
     elif d == "custom_menu":
         await q.answer()
