@@ -446,7 +446,7 @@ docker compose up -d --build
 | 👥 **Set group** | One click: choose the group that receives updates |
 | 📢 **Set channel** | The price channel: **pick one the bot has joined** (public or private), **add one by link** (`t.me/name`, `@name`, `t.me/+hash`, a private `t.me/c/…` link or a `-100…` id), or use **📲** to let Telegram add the bot with the rights it needs — see [📢 Post to a channel](#-post-to-a-channel-in-addition-to-the-group) |
 | 🛡 **Anti-scam** | Mute newcomers until they type a random word — see [🛡 Anti-scam verification](#-anti-scam-verification) |
-| ⚙️ **Settings** | Liquidity, Buy/Sell buttons, auto-delete timers, **🧹 group cleanup** (join notices + the useless messages), **📤 private-message forwarding**, **↪️ forwarding into the group + which chats to forward from** (by deep link, by pasting a link, or by forwarding a post — private channels included), **🖼 button icons & post banner** |
+| ⚙️ **Settings** | Liquidity, **📈 price movement** (▲▼ badge + minimum move), Buy/Sell buttons, auto-delete timers, **🧹 group cleanup** (join notices + the useless messages), **📤 private-message forwarding**, **↪️ forwarding into the group + which chats to forward from** (by deep link, by pasting a link, or by forwarding a post — private channels included), **🖼 button icons & post banner** |
 | 🔘 **Manage buttons** | Add custom buttons, remove/restore Buy or Sell, and edit labels + links |
 | 📝 **Custom Msg** | Customize the **full** post: header, body (per-merchant template), footer — or pick a ready-made **🎨 Message template** |
 | 👁 **Preview** | See exactly how the group post will look |
@@ -474,6 +474,8 @@ Tap **📝 Custom Msg** (or ⚙️ Settings → Edit) to fully customize the gro
 | `{SELL_URL}` / `{BUY_URL}` | Selected link target: merchant profile by default, or optional ad link |
 | `{SELL_LINK}` / `{BUY_LINK}` | The price itself as a clickable link |
 | `{SELL_AD_ID}` / `{BUY_AD_ID}` | The ad ids the prices came from |
+| `{SELL_CHANGE}` / `{BUY_CHANGE}` | Move since the last post, e.g. `📈 +0.42%` (`➖ 0.00%` when flat) |
+| `{SELL_MOVE}` / `{BUY_MOVE}` | The same move without the arrow, e.g. `+0.42%` — handy in a sentence |
 | `{ERROR}` | Fetch error text, if any |
 
 HTML (`<b>`, `<i>`, `<code>`, `<a href>`) and new lines are supported. Example 3-line body:
@@ -485,6 +487,40 @@ HTML (`<b>`, `<i>`, `<code>`, `<a href>`) and new lines are supported. Example 3
 ```
 
 Use **👁 Preview** to check the result before it goes to the group.
+
+### 📈 Price movement — how far it moved, and when it is worth a post
+
+Two related settings live under **⚙️ Settings → 📈 Price movement**.
+
+**▲▼ badge** — every price in the post can carry its move since the last post the group received:
+
+```
+🟡 Binance · <a href="…">Fast_sonic</a>
+   🟢 Best BUY  (you sell): 1.0012  📈 +0.31%
+   🔴 Best SELL (you buy): 0.9991  📉 -0.24%
+```
+
+📈 up, 📉 down, ➖ unchanged. The first post of an install — and a merchant that
+had no price before — shows no badge, because there is nothing to compare yet.
+In a **custom body** the badge is not automatic: ask for it with `{SELL_CHANGE}` /
+`{BUY_CHANGE}` (with the arrow) or `{SELL_MOVE}` / `{BUY_MOVE}` (bare percentage).
+
+**⛔ Minimum move** — by default any change is posted, which is what the bot always did.
+Set it to *≥ 0.25%*, *≥ 0.5%*, *≥ 1%* or *≥ 2%* and a smaller move stops making a message
+of its own: it **stays pending** and appears in the next post that is big enough. That
+keeps a busy group readable when a price wobbles by a fraction of a cent, and it saves
+your daily Vercel cron from spending itself on a 0.01% move.
+
+The badge always measures from the **last post the group really received**, not from the
+last check — so three suppressed 0.4% moves show up as `📈 +1.20%` in the fourth post,
+wherever the prices happen to be. What is **never** held back, whatever the minimum says:
+
+- a new merchant, a removed merchant, or a price that appeared / disappeared;
+- any wording change (header, body, footer), the buttons, the banner, button icons;
+- **📊 Post prices now** — an explicit order always posts.
+
+The group and the channel are judged separately: a channel added later gets its own post
+even while the group is quiet.
 
 ### 🎨 Message templates — one tap, ready-made looks
 
