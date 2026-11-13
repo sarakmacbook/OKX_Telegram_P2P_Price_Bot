@@ -567,14 +567,15 @@ def test_first_start_asks_for_the_required_steps_before_the_database(bot):
 
     asyncio.run(bot.start(update, SimpleNamespace()))
 
-    assert message.reply_html.await_count == 2      # the checklist, then the panel
-    offer = message.reply_html.await_args_list[0]
-    assert "First-time setup" in offer.args[0]
-    assert "Where prices go" in offer.args[0] and "At least one merchant" in offer.args[0]
-    callbacks = [button.callback_data for row in offer.kwargs["reply_markup"].inline_keyboard
+    assert message.reply_html.await_count == 1      # the checklist alone — no panel
+    offer = message.reply_html.await_args.args[0]
+    assert "First-time setup" in offer
+    assert "Where prices go" in offer and "At least one merchant" in offer
+    callbacks = [button.callback_data
+                 for row in message.reply_html.await_args.kwargs["reply_markup"].inline_keyboard
                  for button in row]
     assert "setup_merchant" in callbacks and "setup_refresh" in callbacks
-    assert bot.state["setup_offered"] is True
+    assert "panel" in callbacks                     # the way to the panel, one tap away
     assert bot.state.get("db_setup_offered") is not True   # asked after the required steps
 
 
@@ -595,13 +596,17 @@ def test_the_database_offer_comes_once_the_required_steps_are_done(bot):
     assert bot.state["db_setup_offered"] is True
 
 
-def test_first_start_is_asked_only_once(bot):
-    bot.state["setup_offered"] = True
+def test_the_checklist_is_the_start_screen_until_setup_is_done(bot):
+    """/start is not a one-shot: an unfinished bot opens the checklist every time."""
     message = SimpleNamespace(reply_html=AsyncMock(), reply_text=AsyncMock())
 
     asyncio.run(bot.start(_private_update(message), SimpleNamespace()))
+    asyncio.run(bot.start(_private_update(message), SimpleNamespace()))
 
-    assert message.reply_html.await_count == 1      # the panel only
+    assert message.reply_html.await_count == 2      # two checklists, no panel in between
+    for call in message.reply_html.await_args_list:
+        assert "First-time setup" in call.args[0]
+        assert "P2P Price Bot" not in call.args[0]   # the panel header
 
 
 def test_a_connected_database_does_not_skip_the_required_steps(bot, monkeypatch):
@@ -611,8 +616,8 @@ def test_a_connected_database_does_not_skip_the_required_steps(bot, monkeypatch)
 
     asyncio.run(bot.start(_private_update(message), SimpleNamespace()))
 
-    assert message.reply_html.await_count == 2      # the checklist, then the panel
-    assert "First-time setup" in message.reply_html.await_args_list[0].args[0]
+    assert message.reply_html.await_count == 1      # the checklist alone
+    assert "First-time setup" in message.reply_html.await_args.args[0]
     assert bot.state.get("db_setup_offered") is not True
 
 
@@ -624,7 +629,7 @@ def test_a_fully_configured_bot_gets_the_panel_only(bot, monkeypatch):
     asyncio.run(bot.start(_private_update(message), SimpleNamespace()))
 
     assert message.reply_html.await_count == 1      # the panel only
-    assert bot.state.get("setup_offered") is not True
+    assert "P2P Price Bot" in message.reply_html.await_args.args[0]
 
 
 def test_database_skip_keeps_the_bot_running(bot):

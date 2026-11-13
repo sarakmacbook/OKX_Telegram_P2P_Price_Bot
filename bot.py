@@ -1961,9 +1961,7 @@ def empty_state():
             # ↪️ messages the bot itself posted into a source chat ("chat:msg" → ts)
             "own_messages": {},
             # 💾 first /start asked which database type to add (asked once)
-            "db_setup_offered": False,
-            # 🚀 the first-start checklist (group/channel + merchant) was shown
-            "setup_offered": False}
+            "db_setup_offered": False}
 
 
 def load():
@@ -2901,12 +2899,21 @@ def setup_needed_note() -> str:
 
 
 async def send_setup_checklist(u: Update) -> None:
-    """Send the first-start checklist (never fatal — the panel still follows)."""
+    """Send the first-start checklist — the only screen a fresh bot starts with.
+
+    Until the two required steps are done this stands in for the panel, so a
+    failure here would leave the admin with nothing at all: the panel is the
+    fallback, not a second message.
+    """
     try:
         await u.message.reply_html(setup_text(), reply_markup=setup_kb(),
                                    disable_web_page_preview=True)
     except Exception as e:                               # pragma: no cover - defensive
         log.warning("Could not send the setup checklist: %s", e)
+        try:
+            await u.message.reply_html(panel_text(), reply_markup=panel())
+        except Exception:                                # pragma: no cover - defensive
+            log.warning("Could not send the panel either")
 
 
 def database_type_kb(*, later: bool = False):
@@ -4454,15 +4461,14 @@ async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if is_admin(u):
         remember_private_chat(u)          # where a pinned settings copy would live
         # 🚀 First start: the bot cannot post prices without a destination and a
-        # merchant, so name them once and keep the checklist one tap away on the
-        # panel.  Only after those are done is the (optional) database asked about.
+        # merchant, so until those are done the checklist *is* the start screen —
+        # sent on its own, with the panel one tap away behind 🎛 Open panel.
+        # Showing the full panel here would bury the two steps that matter (and
+        # its Post/Auto buttons cannot run yet anyway).  Only once they are done
+        # is the (optional) database asked about, ahead of the panel.
         if not setup_ready():
-            if not state.get("setup_offered"):
-                state["setup_offered"] = True
-                save()
-                await send_setup_checklist(u)
-        else:
-            await offer_database_setup(u)
+            return await send_setup_checklist(u)
+        await offer_database_setup(u)
         await u.message.reply_html(panel_text(), reply_markup=panel())
     else: await u.message.reply_text("⛔ You are not authorized. Ask the bot admin to add your ID.")
 
